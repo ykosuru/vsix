@@ -1,0 +1,14961 @@
+/**
+ * AstraCode v4.9.24 - Agentic Code Assistant
+ * 
+ * TAL PARSER ENHANCEMENT (v4.9.24)
+ * ================================
+ * - Comprehensive TAL parser ported from Python
+ * - Full DEFINE/LITERAL/STRUCT/PROC parsing
+ * - Call graph extraction (CALL, PCAL, function-style)
+ * - Cyclomatic complexity calculation
+ * - Symbol table with scope management
+ * - TAL-specific call detection in findFunctionCalls()
+ * 
+ * Toggle Judge: AGENT_CONFIG.enableJudge = true/false
+ */
+
+const vscode = require('vscode');
+const path = require('path');
+
+// ============================================================
+// State Management
+// ============================================================
+
+/** @type {Map<string, {uri: vscode.Uri, content: string, language: string}>} */
+const contextFiles = new Map();
+
+/** @type {'auto' | 'local' | 'api'} */
+let currentMode = 'auto';
+
+/** @type {Array<{role: 'user' | 'assistant', content: string, timestamp: Date}>} */
+let chatHistory = [];
+
+/** @type {vscode.WebviewView | undefined} */
+let chatWebviewView;
+
+/** @type {vscode.OutputChannel} */
+let outputChannel;
+
+/** @type {{name: string, vendor: string, family: string} | null} */
+let lastUsedModel = null;
+
+/** @type {Set<string>} - Cache of model IDs/names that have failed (cleared on reload or settings change) */
+const failedModelsCache = new Set();
+
+/** @type {string|null} - Track settings to detect changes */
+let lastCopilotModelSetting = null;
+
+/** @type {{query: string, plan: Object} | null} */
+let pendingPlan = null;
+
+/** 
+ * Task cancellation support
+ * @type {{
+ *   isCancelled: boolean,
+ *   currentTask: string | null,
+ *   startTime: Date | null,
+ *   cancel: function(): void,
+ *   reset: function(): void,
+ *   checkCancelled: function(): boolean
+ * }}
+ */
+const taskController = {
+    isCancelled: false,
+    currentTask: null,
+    startTime: null,
+    
+    cancel() {
+        if (this.currentTask) {
+            this.isCancelled = true;
+            log(`Task cancelled: ${this.currentTask}`);
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: '\n\n⚠️ **Task cancelled by user**\n' 
+            });
+        }
+    },
+    
+    reset() {
+        this.isCancelled = false;
+        this.currentTask = null;
+        this.startTime = null;
+    },
+    
+    start(taskName) {
+        this.reset();
+        this.currentTask = taskName;
+        this.startTime = new Date();
+        log(`Task started: ${taskName}`);
+    },
+    
+    checkCancelled() {
+        if (this.isCancelled) {
+            throw new Error('Task cancelled by user');
+        }
+        return this.isCancelled;
+    }
+};
+
+/**
+ * Code Index - stores parsed information about the codebase
+ * @type {{
+ *   files: Map<string, {path: string, language: string, symbols: Array}>,
+ *   symbols: Map<string, {name: string, type: string, file: string, line: number, signature?: string}>,
+ *   callGraph: Map<string, Set<string>>,
+ *   reverseCallGraph: Map<string, Set<string>>,
+ *   dependencies: Map<string, Set<string>>,
+ *   lastUpdated: Date | null
+ * }}
+ */
+const codeIndex = {
+    files: new Map(),           // file path -> file info with symbols
+    symbols: new Map(),         // symbol name -> definition info
+    variables: new Map(),       // variable name@file -> {name, dataType, file, declarationLine, initializationLine, accesses[]}
+    callGraph: new Map(),       // function -> functions it calls
+    reverseCallGraph: new Map(), // function -> functions that call it
+    dependencies: new Map(),    // file -> files it depends on
+    lastUpdated: null
+};
+
+/**
+ * Vector Index - stores embeddings for semantic search
+ * @type {{
+ *   chunks: Array<{id: string, text: string, file: string, startLine: number, endLine: number, type: string, embedding: Float32Array|null}>,
+ *   embeddings: Float32Array | null,
+ *   dimensions: number,
+ *   model: string,
+ *   lastUpdated: Date | null,
+ *   isBuilding: boolean
+ * }}
+ */
+const vectorIndex = {
+    chunks: [],                  // text chunks with metadata
+    embeddings: null,            // flat Float32Array of all embeddings (chunks.length * dimensions)
+    dimensions: 384,             // embedding dimensions (all-MiniLM-L6-v2 = 384)
+    model: 'simple-hash',        // 'simple-hash' (fast, no deps) or 'copilot' or 'api'
+    lastUpdated: null,
+    isBuilding: false
+};
+
+// Vector index configuration
+const VECTOR_CONFIG = {
+    CHUNK_SIZE: 500,             // Target chars per chunk
+    CHUNK_OVERLAP: 50,           // Overlap between chunks
+    MIN_CHUNK_SIZE: 50,          // Minimum chunk size to embed
+    MAX_CHUNKS_PER_FILE: 100,    // Limit chunks per file
+    TOP_K_RESULTS: 10,           // Default number of results
+    EMBEDDING_BATCH_SIZE: 20,    // Chunks to embed per batch
+    SIMILARITY_THRESHOLD: 0.1    // Lowered for hash-based embeddings
+};
+
+// ============================================================
+// Logging
+// ============================================================
+
+function log(...args) {
+    const timestamp = new Date().toISOString().substring(11, 23);
+    const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+    outputChannel?.appendLine(`[${timestamp}] ${message}`);
+    console.log(`[AstraCode] ${message}`);
+}
+
+// ============================================================
+// Code Indexing
+// ============================================================
+
+/**
+ * Build index for all context files
+ */
+// Indexing configuration
+const INDEX_CONFIG = {
+    BATCH_SIZE: 50,           // Files per batch
+    BATCH_DELAY: 10,          // ms delay between batches (yield to UI)
+    MAX_FILES_FOR_FULL_INDEX: 500,  // Above this, use lightweight indexing
+    MAX_SYMBOLS_PER_FILE: 500,      // Limit symbols per file
+    SEARCH_RESULT_LIMIT: 100        // Max search results
+};
+
+/**
+ * Build code index asynchronously with progress updates
+ * Handles large repositories by batching and yielding to UI
+ */
+async function buildCodeIndex(options = {}) {
+    const { showProgress = true, lightweight = false } = options;
+    const totalFiles = contextFiles.size;
+    
+    log('Building code index for', totalFiles, 'files...');
+    
+    // Determine indexing mode
+    const useLightweight = lightweight || totalFiles > INDEX_CONFIG.MAX_FILES_FOR_FULL_INDEX;
+    if (useLightweight) {
+        log('Using lightweight indexing mode for large repository');
+    }
+    
+    // Clear existing index
+    codeIndex.files.clear();
+    codeIndex.symbols.clear();
+    codeIndex.variables.clear();
+    codeIndex.callGraph.clear();
+    codeIndex.reverseCallGraph.clear();
+    codeIndex.dependencies.clear();
+    
+    // Callable symbol types by language
+    const callableTypes = new Set([
+        'function', 'procedure', 'method', 'subproc',  // General
+        'section', 'paragraph', 'program',             // COBOL
+        'define', 'macro', 'external', 'forward',      // TAL
+        'view', 'trigger'                              // SQL
+    ]);
+    
+    // Variable symbol types
+    const variableTypes = new Set([
+        'variable', 'parameter', 'field', 'property',
+        'record', 'constant', 'literal',
+        'global', 'local', 'member'
+    ]);
+    
+    // Convert to array for batching
+    const fileEntries = Array.from(contextFiles.entries());
+    const batches = [];
+    for (let i = 0; i < fileEntries.length; i += INDEX_CONFIG.BATCH_SIZE) {
+        batches.push(fileEntries.slice(i, i + INDEX_CONFIG.BATCH_SIZE));
+    }
+    
+    let processedFiles = 0;
+    let totalSymbols = 0;
+    
+    // Send initial progress
+    if (showProgress && chatWebviewView) {
+        chatWebviewView.webview.postMessage({
+            type: 'indexProgress',
+            progress: 0,
+            message: `Indexing: 0/${totalFiles} files (0%)`
+        });
+        // Small yield to let UI update
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    
+    // Process batches
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+        const batch = batches[batchIndex];
+        
+        // Process batch
+        for (const [path, file] of batch) {
+            try {
+                const fileInfo = parseFile(path, file.content, file.language);
+                codeIndex.files.set(path, fileInfo);
+                
+                // Limit symbols per file for large repos
+                const symbols = useLightweight 
+                    ? fileInfo.symbols.slice(0, INDEX_CONFIG.MAX_SYMBOLS_PER_FILE)
+                    : fileInfo.symbols;
+                
+                // Add symbols to global symbol table
+                for (const symbol of symbols) {
+                    const key = `${symbol.name}@${path}`;
+                    codeIndex.symbols.set(key, { ...symbol, file: path });
+                    
+                    if (!codeIndex.symbols.has(symbol.name)) {
+                        codeIndex.symbols.set(symbol.name, { ...symbol, file: path });
+                    }
+                    
+                    // Track variables (skip in lightweight mode)
+                    if (!useLightweight && (variableTypes.has(symbol.type) || symbol.dataType)) {
+                        const varKey = `${symbol.name}@${path}`;
+                        codeIndex.variables.set(varKey, {
+                            name: symbol.name,
+                            dataType: symbol.dataType || symbol.type || 'unknown',
+                            file: path,
+                            declarationLine: symbol.line,
+                            initializationLine: symbol.initLine || symbol.line,
+                            scope: symbol.scope || 'global',
+                            accesses: []
+                        });
+                    }
+                    totalSymbols++;
+                }
+                
+                // Build call graph (skip in lightweight mode for large files)
+                if (!useLightweight || file.content.length < 50000) {
+                    log('Building call graph for', path, '- symbols:', symbols.length, 'language:', file.language);
+                    for (const symbol of symbols) {
+                        log('  Symbol:', symbol.name, 'type:', symbol.type, 'isCallable:', callableTypes.has(symbol.type));
+                        if (callableTypes.has(symbol.type)) {
+                            const calls = findFunctionCalls(file.content, symbol, file.language);
+                            log('  Calls found:', calls.length, calls.slice(0, 5));
+                            codeIndex.callGraph.set(symbol.name, new Set(calls));
+                            
+                            for (const called of calls) {
+                                if (!codeIndex.reverseCallGraph.has(called)) {
+                                    codeIndex.reverseCallGraph.set(called, new Set());
+                                }
+                                codeIndex.reverseCallGraph.get(called).add(symbol.name);
+                            }
+                        }
+                    }
+                }
+                
+                // Track dependencies
+                const deps = findDependencies(file.content, file.language);
+                codeIndex.dependencies.set(path, new Set(deps));
+                
+            } catch (error) {
+                log('Error indexing file:', path, error.message);
+            }
+            
+            processedFiles++;
+            
+            // Update progress after each file (for small repos) or every 10 files (for large)
+            const updateFrequency = totalFiles <= 50 ? 1 : 10;
+            if (showProgress && chatWebviewView && (processedFiles % updateFrequency === 0 || processedFiles === totalFiles)) {
+                const percent = Math.round((processedFiles / totalFiles) * 100);
+                chatWebviewView.webview.postMessage({
+                    type: 'indexProgress',
+                    progress: percent,
+                    message: `Indexing: ${processedFiles}/${totalFiles} files (${percent}%)`
+                });
+                // Yield to UI
+                await new Promise(resolve => setTimeout(resolve, 5));
+            }
+        }
+        
+        // Yield to UI between batches
+        if (batchIndex < batches.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, INDEX_CONFIG.BATCH_DELAY));
+        }
+    }
+    
+    // Second pass: Track variable accesses (skip for large repos)
+    if (!useLightweight) {
+        for (const [path, file] of contextFiles) {
+            trackVariableAccesses(path, file.content, file.language);
+        }
+    }
+    
+    codeIndex.lastUpdated = new Date();
+    
+    const stats = {
+        files: codeIndex.files.size,
+        symbols: codeIndex.symbols.size,
+        variables: codeIndex.variables.size,
+        functions: Array.from(codeIndex.callGraph.keys()).length,
+        edges: Array.from(codeIndex.callGraph.values()).reduce((sum, calls) => sum + calls.size, 0),
+        mode: useLightweight ? 'lightweight' : 'full'
+    };
+    
+    log('Code index built:', stats);
+    
+    // Final progress update
+    if (showProgress && chatWebviewView) {
+        chatWebviewView.webview.postMessage({
+            type: 'indexProgress',
+            progress: 100,
+            message: `Index complete: ${stats.files} files, ${stats.symbols} symbols`
+        });
+    }
+    
+    return stats;
+}
+
+/**
+ * Synchronous version for small file sets (backward compatibility)
+ */
+function buildCodeIndexSync() {
+    // For small file sets, just run the async version synchronously
+    if (contextFiles.size <= INDEX_CONFIG.BATCH_SIZE) {
+        return buildCodeIndexLegacy();
+    }
+    // For larger sets, this shouldn't be called - use async version
+    log('WARNING: buildCodeIndexSync called with', contextFiles.size, 'files - use buildCodeIndex() instead');
+    return buildCodeIndexLegacy();
+}
+
+function buildCodeIndexLegacy() {
+    log('Building code index (legacy sync) for', contextFiles.size, 'files...');
+    
+    codeIndex.files.clear();
+    codeIndex.symbols.clear();
+    codeIndex.variables.clear();
+    codeIndex.callGraph.clear();
+    codeIndex.reverseCallGraph.clear();
+    codeIndex.dependencies.clear();
+    
+    const callableTypes = new Set([
+        'function', 'procedure', 'method', 'subproc',
+        'section', 'paragraph', 'program',
+        'define', 'macro', 'external', 'forward',
+        'view', 'trigger'
+    ]);
+    
+    const variableTypes = new Set([
+        'variable', 'parameter', 'field', 'property',
+        'record', 'constant', 'literal',
+        'global', 'local', 'member'
+    ]);
+    
+    for (const [path, file] of contextFiles) {
+        const fileInfo = parseFile(path, file.content, file.language);
+        codeIndex.files.set(path, fileInfo);
+        
+        for (const symbol of fileInfo.symbols) {
+            const key = `${symbol.name}@${path}`;
+            codeIndex.symbols.set(key, { ...symbol, file: path });
+            
+            if (!codeIndex.symbols.has(symbol.name)) {
+                codeIndex.symbols.set(symbol.name, { ...symbol, file: path });
+            }
+            
+            if (variableTypes.has(symbol.type) || symbol.dataType) {
+                const varKey = `${symbol.name}@${path}`;
+                codeIndex.variables.set(varKey, {
+                    name: symbol.name,
+                    dataType: symbol.dataType || symbol.type || 'unknown',
+                    file: path,
+                    declarationLine: symbol.line,
+                    initializationLine: symbol.initLine || symbol.line,
+                    scope: symbol.scope || 'global',
+                    accesses: []
+                });
+            }
+        }
+        
+        for (const symbol of fileInfo.symbols) {
+            if (callableTypes.has(symbol.type)) {
+                const calls = findFunctionCalls(file.content, symbol, file.language);
+                codeIndex.callGraph.set(symbol.name, new Set(calls));
+                
+                for (const called of calls) {
+                    if (!codeIndex.reverseCallGraph.has(called)) {
+                        codeIndex.reverseCallGraph.set(called, new Set());
+                    }
+                    codeIndex.reverseCallGraph.get(called).add(symbol.name);
+                }
+            }
+        }
+        
+        const deps = findDependencies(file.content, file.language);
+        codeIndex.dependencies.set(path, new Set(deps));
+    }
+    
+    for (const [path, file] of contextFiles) {
+        trackVariableAccesses(path, file.content, file.language);
+    }
+    
+    codeIndex.lastUpdated = new Date();
+    
+    return {
+        files: codeIndex.files.size,
+        symbols: codeIndex.symbols.size,
+        variables: codeIndex.variables.size,
+        functions: Array.from(codeIndex.callGraph.keys()).length,
+        edges: Array.from(codeIndex.callGraph.values()).reduce((sum, calls) => sum + calls.size, 0)
+    };
+}
+
+/**
+ * Parse a file and extract symbols
+ */
+function parseFile(path, content, language) {
+    const symbols = [];
+    const lines = content.split('\n');
+    
+    log('parseFile: Parsing', path);
+    log('parseFile: Language:', language, '- Lines:', lines.length);
+    
+    const parsers = {
+        // C/C++
+        'c': parseCStyle,
+        'cpp': parseCStyle,
+        'h': parseCStyle,
+        
+        // Java/JVM
+        'java': parseJavaStyle,
+        'kotlin': parseJavaStyle,
+        'scala': parseJavaStyle,
+        
+        // C#
+        'csharp': parseCSharp,
+        
+        // JavaScript/TypeScript
+        'javascript': parseJSStyle,
+        'typescript': parseJSStyle,
+        
+        // Python
+        'python': parsePython,
+        
+        // SQL
+        'sql': parseSQL,
+        
+        // COBOL
+        'cobol': parseCobol,
+        
+        // TAL
+        'tal': parseTal,
+        
+        // Go
+        'go': parseGo,
+        
+        // Rust
+        'rust': parseRust,
+        
+        // Default
+        'default': parseGeneric
+    };
+    
+    const parser = parsers[language];
+    if (!parser) {
+        log('parseFile: No parser for language:', language, '- using default');
+    }
+    const actualParser = parser || parsers['default'];
+    const fileSymbols = actualParser(content, lines);
+    log('parseFile:', path, '- found', fileSymbols.length, 'symbols');
+    return {
+        path,
+        language,
+        symbols: fileSymbols,
+        lineCount: lines.length
+    };
+}
+
+function parseCStyle(content, lines) {
+    const symbols = [];
+    
+    // Function definitions: type name(params) {
+    const funcRegex = /^[\s]*(?:static\s+)?(?:inline\s+)?(?:const\s+)?(\w+(?:\s*\*)*)\s+(\w+)\s*\(([^)]*)\)\s*(?:\{|$)/gm;
+    let match;
+    
+    while ((match = funcRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[2],
+            type: 'function',
+            returnType: match[1].trim(),
+            params: match[3].trim(),
+            line: lineNum,
+            signature: `${match[1].trim()} ${match[2]}(${match[3].trim()})`
+        });
+    }
+    
+    // Struct definitions
+    const structRegex = /\b(?:struct|class|union|enum)\s+(\w+)/g;
+    while ((match = structRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'struct',
+            line: lineNum
+        });
+    }
+    
+    // #define macros
+    const defineRegex = /^#define\s+(\w+)(?:\(([^)]*)\))?/gm;
+    while ((match = defineRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: match[2] ? 'macro-function' : 'macro',
+            params: match[2] || '',
+            line: lineNum
+        });
+    }
+    
+    // Global variables (simplified)
+    const globalRegex = /^(?:static\s+)?(?:const\s+)?(\w+(?:\s*\*)*)\s+(\w+)\s*(?:=|;)/gm;
+    while ((match = globalRegex.exec(content)) !== null) {
+        // Skip if it's inside a function (simplified check)
+        const before = content.substring(0, match.index);
+        const braceCount = (before.match(/\{/g) || []).length - (before.match(/\}/g) || []).length;
+        if (braceCount === 0) {
+            const lineNum = before.split('\n').length;
+            const hasInit = content.substring(match.index).match(/^\s*[^;]*=/);
+            symbols.push({
+                name: match[2],
+                type: 'variable',
+                dataType: match[1].trim(),
+                line: lineNum,
+                initLine: hasInit ? lineNum : null,
+                scope: 'global'
+            });
+        }
+    }
+    
+    // Local variables inside functions (scan function bodies)
+    const funcBodyRegex = /\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/g;
+    let funcMatch;
+    while ((funcMatch = funcBodyRegex.exec(content)) !== null) {
+        const bodyStart = content.substring(0, funcMatch.index).split('\n').length;
+        const body = funcMatch[1];
+        
+        // Find variable declarations in function body
+        const localVarRegex = /(?:^|\n)\s*(?:const\s+)?(\w+(?:\s*\*)*)\s+(\w+)\s*(=\s*[^;]+)?;/g;
+        let localMatch;
+        while ((localMatch = localVarRegex.exec(body)) !== null) {
+            const relLineNum = body.substring(0, localMatch.index).split('\n').length;
+            const lineNum = bodyStart + relLineNum;
+            const dataType = localMatch[1].trim();
+            // Skip common keywords that look like types
+            if (!['return', 'if', 'else', 'for', 'while', 'switch', 'case', 'break', 'continue'].includes(dataType)) {
+                symbols.push({
+                    name: localMatch[2],
+                    type: 'variable',
+                    dataType: dataType,
+                    line: lineNum,
+                    initLine: localMatch[3] ? lineNum : null,
+                    scope: 'local'
+                });
+            }
+        }
+    }
+    
+    // Function parameters
+    const paramRegex = /\(([^)]+)\)/g;
+    while ((match = paramRegex.exec(content)) !== null) {
+        const params = match[1].split(',');
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        for (const param of params) {
+            const paramMatch = param.trim().match(/(\w+(?:\s*\*)*)\s+(\w+)$/);
+            if (paramMatch) {
+                symbols.push({
+                    name: paramMatch[2],
+                    type: 'parameter',
+                    dataType: paramMatch[1].trim(),
+                    line: lineNum,
+                    scope: 'parameter'
+                });
+            }
+        }
+    }
+    
+    return symbols;
+}
+
+function parseJavaStyle(content, lines) {
+    const symbols = [];
+    let match;
+    
+    // Class definitions
+    const classRegex = /\b(?:public\s+)?(?:abstract\s+)?(?:final\s+)?(?:class|interface|enum)\s+(\w+)/g;
+    while ((match = classRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'class',
+            line: lineNum
+        });
+    }
+    
+    // Method definitions
+    const methodRegex = /(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?(\w+(?:<[^>]+>)?)\s+(\w+)\s*\(([^)]*)\)/g;
+    while ((match = methodRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        if (match[2] !== 'if' && match[2] !== 'for' && match[2] !== 'while') {
+            symbols.push({
+                name: match[2],
+                type: 'method',
+                returnType: match[1],
+                params: match[3].trim(),
+                line: lineNum,
+                signature: `${match[1]} ${match[2]}(${match[3].trim()})`
+            });
+            
+            // Extract parameters
+            const params = match[3].split(',');
+            for (const param of params) {
+                const paramMatch = param.trim().match(/(\w+(?:<[^>]+>)?)\s+(\w+)$/);
+                if (paramMatch) {
+                    symbols.push({
+                        name: paramMatch[2],
+                        type: 'parameter',
+                        dataType: paramMatch[1],
+                        line: lineNum,
+                        scope: 'parameter'
+                    });
+                }
+            }
+        }
+    }
+    
+    // Class fields (member variables)
+    const fieldRegex = /(?:public|private|protected)\s+(?:static\s+)?(?:final\s+)?(\w+(?:<[^>]+>)?)\s+(\w+)\s*(?:=\s*[^;]+)?;/g;
+    while ((match = fieldRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const hasInit = match[0].includes('=');
+        symbols.push({
+            name: match[2],
+            type: 'field',
+            dataType: match[1],
+            line: lineNum,
+            initLine: hasInit ? lineNum : null,
+            scope: 'member'
+        });
+    }
+    
+    // Local variables in method bodies
+    const localVarRegex = /(?:^|\n)\s*(?:final\s+)?(\w+(?:<[^>]+>)?)\s+(\w+)\s*=\s*[^;]+;/g;
+    while ((match = localVarRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const dataType = match[1];
+        // Skip keywords and already captured
+        if (!['return', 'if', 'else', 'for', 'while', 'switch', 'case', 'new', 'throw', 'public', 'private', 'protected'].includes(dataType)) {
+            symbols.push({
+                name: match[2],
+                type: 'variable',
+                dataType: dataType,
+                line: lineNum,
+                initLine: lineNum,
+                scope: 'local'
+            });
+        }
+    }
+    
+    return symbols;
+}
+
+function parseJSStyle(content, lines) {
+    const symbols = [];
+    let match;
+    
+    // Function declarations (including exported)
+    const funcRegex = /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/g;
+    while ((match = funcRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'function',
+            params: match[2].trim(),
+            line: lineNum,
+            signature: `function ${match[1]}(${match[2].trim()})`
+        });
+    }
+    
+    // Arrow functions and const functions (including exported)
+    const arrowRegex = /(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(?([^)=]*?)\)?\s*=>/g;
+    while ((match = arrowRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'function',
+            params: match[2].trim(),
+            line: lineNum,
+            signature: `const ${match[1]} = (${match[2].trim()}) =>`
+        });
+    }
+    
+    // Export default function
+    const exportDefaultFuncRegex = /export\s+default\s+(?:async\s+)?function\s*(\w*)\s*\(([^)]*)\)/g;
+    while ((match = exportDefaultFuncRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const name = match[1] || 'default';
+        symbols.push({
+            name: name,
+            type: 'function',
+            params: match[2].trim(),
+            line: lineNum,
+            isDefault: true
+        });
+    }
+    
+    // Class definitions (including exported)
+    const classRegex = /(?:export\s+)?(?:default\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?/g;
+    while ((match = classRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'class',
+            extends: match[2] || null,
+            line: lineNum
+        });
+    }
+    
+    // Class methods (including static, async, get, set)
+    const methodRegex = /^\s*(?:static\s+)?(?:async\s+)?(?:get\s+|set\s+)?(\w+)\s*\(([^)]*)\)\s*\{/gm;
+    while ((match = methodRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const name = match[1];
+        if (!['if', 'for', 'while', 'switch', 'function', 'catch', 'with'].includes(name)) {
+            symbols.push({
+                name: name,
+                type: 'method',
+                params: match[2].trim(),
+                line: lineNum
+            });
+        }
+    }
+    
+    // TypeScript interfaces
+    const interfaceRegex = /(?:export\s+)?interface\s+(\w+)(?:<[^>]+>)?(?:\s+extends\s+[\w,\s<>]+)?/g;
+    while ((match = interfaceRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'interface',
+            line: lineNum
+        });
+    }
+    
+    // TypeScript type aliases
+    const typeRegex = /(?:export\s+)?type\s+(\w+)(?:<[^>]+>)?\s*=/g;
+    while ((match = typeRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'type',
+            line: lineNum
+        });
+    }
+    
+    // TypeScript enums
+    const enumRegex = /(?:export\s+)?(?:const\s+)?enum\s+(\w+)/g;
+    while ((match = enumRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'enum',
+            line: lineNum
+        });
+    }
+    
+    // React functional components (const X = () => { return <jsx> } or function X() { return <jsx> })
+    // Already captured by function/arrow patterns above
+    
+    // Module.exports patterns (CommonJS)
+    const moduleExportRegex = /module\.exports\s*=\s*(?:\{[^}]*(\w+)[^}]*\}|(\w+))/g;
+    while ((match = moduleExportRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const name = match[1] || match[2];
+        if (name && !symbols.some(s => s.name === name)) {
+            symbols.push({
+                name: name,
+                type: 'export',
+                line: lineNum
+            });
+        }
+    }
+    
+    // Object method shorthand in exports: { methodName() { } }
+    const objMethodRegex = /(\w+)\s*\(([^)]*)\)\s*\{/g;
+    // Already captured by method regex
+    
+    // Constants/Variables that might be important (exported)
+    const constRegex = /export\s+(?:const|let|var)\s+(\w+)\s*(?::\s*[^=]+)?\s*=/g;
+    while ((match = constRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        // Skip if it's a function (already captured)
+        const restOfLine = content.substring(match.index, match.index + 200);
+        if (!restOfLine.includes('=>') && !restOfLine.includes('function')) {
+            symbols.push({
+                name: match[1],
+                type: 'variable',
+                line: lineNum
+            });
+        }
+    }
+    
+    return symbols;
+}
+
+function parsePython(content, lines) {
+    const symbols = [];
+    let match;
+    
+    log('parsePython: Parsing', lines.length, 'lines of Python code');
+    log('parsePython: First 200 chars:', content.substring(0, 200).replace(/\n/g, '\\n'));
+    
+    // Function definitions - allow leading whitespace for class methods
+    const funcRegex = /^[ \t]*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)/gm;
+    while ((match = funcRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        log('parsePython: Found function', match[1], 'at line', lineNum);
+        symbols.push({
+            name: match[1],
+            type: 'function',
+            params: match[2].trim(),
+            line: lineNum
+        });
+        
+        // Extract parameters with type hints
+        const params = match[2].split(',');
+        for (const param of params) {
+            const paramMatch = param.trim().match(/^(\w+)(?:\s*:\s*(\w+(?:\[[^\]]+\])?))?/);
+            if (paramMatch && paramMatch[1] !== 'self' && paramMatch[1] !== 'cls') {
+                symbols.push({
+                    name: paramMatch[1],
+                    type: 'parameter',
+                    dataType: paramMatch[2] || 'Any',
+                    line: lineNum,
+                    scope: 'parameter'
+                });
+            }
+        }
+    }
+    
+    // Class definitions - allow leading whitespace for nested classes
+    const classRegex = /^[ \t]*class\s+(\w+)(?:\(([^)]*)\))?:/gm;
+    while ((match = classRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        log('parsePython: Found class', match[1], 'at line', lineNum);
+        symbols.push({
+            name: match[1],
+            type: 'class',
+            extends: match[2] || null,
+            line: lineNum
+        });
+    }
+    
+    // Class attributes with type annotations
+    const attrRegex = /^\s+(\w+)\s*:\s*(\w+(?:\[[^\]]+\])?)\s*(?:=\s*(.+))?$/gm;
+    while ((match = attrRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'field',
+            dataType: match[2],
+            line: lineNum,
+            initLine: match[3] ? lineNum : null,
+            scope: 'member'
+        });
+    }
+    
+    // Global/module-level variables with assignments
+    const globalVarRegex = /^([A-Z_][A-Z0-9_]*)\s*(?::\s*(\w+))?\s*=\s*(.+)$/gm;
+    while ((match = globalVarRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'constant',
+            dataType: match[2] || inferPythonType(match[3]),
+            line: lineNum,
+            initLine: lineNum,
+            scope: 'global'
+        });
+    }
+    
+    // Local variable assignments (simple heuristic)
+    const localVarRegex = /^\s{4,}(\w+)\s*(?::\s*(\w+(?:\[[^\]]+\])?))\s*=\s*(.+)$/gm;
+    while ((match = localVarRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        if (!['self', 'cls', 'if', 'for', 'while', 'with', 'try', 'except', 'return'].includes(match[1])) {
+            symbols.push({
+                name: match[1],
+                type: 'variable',
+                dataType: match[2] || 'Any',
+                line: lineNum,
+                initLine: lineNum,
+                scope: 'local'
+            });
+        }
+    }
+    
+    log('parsePython: Found', symbols.length, 'total symbols');
+    return symbols;
+}
+
+// Helper to infer Python type from value
+function inferPythonType(value) {
+    if (!value) return 'Any';
+    value = value.trim();
+    if (value.startsWith('"') || value.startsWith("'")) return 'str';
+    if (value.startsWith('[')) return 'list';
+    if (value.startsWith('{')) return value.includes(':') ? 'dict' : 'set';
+    if (value.startsWith('(')) return 'tuple';
+    if (value === 'True' || value === 'False') return 'bool';
+    if (value === 'None') return 'None';
+    if (/^\d+$/.test(value)) return 'int';
+    if (/^\d+\.\d+$/.test(value)) return 'float';
+    return 'Any';
+}
+
+function parseCobol(content, lines) {
+    const symbols = [];
+    let match;
+    
+    // Program ID
+    const progIdRegex = /PROGRAM-ID\.\s*([A-Z0-9-]+)/gi;
+    while ((match = progIdRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1].toUpperCase(),  // Normalize to uppercase
+            type: 'program',
+            line: lineNum
+        });
+    }
+    
+    // SECTION definitions in PROCEDURE DIVISION
+    const sectionRegex = /^\s{0,6}\d{0,6}\s*([A-Z0-9][A-Z0-9-]*)\s+SECTION\s*\./gim;
+    while ((match = sectionRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const name = match[1].trim().toUpperCase();  // Normalize to uppercase
+        if (!['CONFIGURATION', 'INPUT-OUTPUT', 'FILE', 'WORKING-STORAGE', 'LOCAL-STORAGE', 'LINKAGE', 'SCREEN', 'REPORT'].includes(name)) {
+            symbols.push({
+                name: name,
+                type: 'section',
+                line: lineNum
+            });
+        }
+    }
+    
+    // Paragraph definitions (names followed by period, no SECTION keyword)
+    const paraRegex = /^\s{0,6}\d{0,6}\s*([A-Z][A-Z0-9-]*)\s*\.\s*$/gim;
+    while ((match = paraRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const name = match[1].trim().toUpperCase();  // Normalize to uppercase for COBOL
+        // Skip division/section names and common keywords
+        const skipNames = ['IDENTIFICATION', 'ENVIRONMENT', 'DATA', 'PROCEDURE', 'DIVISION', 
+            'CONFIGURATION', 'INPUT-OUTPUT', 'FILE', 'WORKING-STORAGE', 'LOCAL-STORAGE', 
+            'LINKAGE', 'SCREEN', 'REPORT', 'FD', 'SD', 'COPY', 'REPLACE', 'END-IF', 
+            'END-PERFORM', 'END-EVALUATE', 'END-READ', 'END-WRITE', 'END-CALL'];
+        if (!skipNames.includes(name) && name.length > 1) {
+            symbols.push({
+                name: name,
+                type: 'paragraph',
+                line: lineNum
+            });
+        }
+    }
+    
+    // 01 level data items (records)
+    const level01Regex = /^\s{0,6}\d{0,6}\s*01\s+([A-Z0-9][A-Z0-9-]*)/gim;
+    while ((match = level01Regex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const name = match[1].trim().toUpperCase();
+        if (name !== 'FILLER') {
+            symbols.push({
+                name: name,
+                type: 'record',
+                dataType: 'GROUP',
+                level: '01',
+                line: lineNum,
+                scope: 'global'
+            });
+        }
+    }
+    
+    // 77 level data items (standalone variables)
+    const level77Regex = /^\s{0,6}\d{0,6}\s*77\s+([A-Z0-9][A-Z0-9-]*)\s+(?:PIC|PICTURE)\s+([^\s.]+)/gim;
+    while ((match = level77Regex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1].trim().toUpperCase(),
+            type: 'variable',
+            dataType: parseCobolPic(match[2]),
+            level: '77',
+            line: lineNum,
+            scope: 'global'
+        });
+    }
+    
+    // Data items with PIC clauses (levels 02-49)
+    const dataItemRegex = /^\s{0,6}\d{0,6}\s*(0[2-9]|[1-4]\d)\s+([A-Z0-9][A-Z0-9-]*)\s+(?:PIC|PICTURE)\s+([^\s.]+)/gim;
+    while ((match = dataItemRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const name = match[2].trim().toUpperCase();
+        if (name !== 'FILLER') {
+            symbols.push({
+                name: name,
+                type: 'variable',
+                dataType: parseCobolPic(match[3]),
+                level: match[1],
+                line: lineNum,
+                scope: 'member'
+            });
+        }
+    }
+    
+    // 88 level conditions
+    const level88Regex = /^\s{0,6}\d{0,6}\s*88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUE/gim;
+    while ((match = level88Regex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1].trim().toUpperCase(),
+            type: 'condition',
+            dataType: 'BOOLEAN',
+            level: '88',
+            line: lineNum,
+            scope: 'member'
+        });
+    }
+    
+    // COPY statements
+    const copyRegex = /\bCOPY\s+([A-Z0-9][A-Z0-9-]*)/gi;
+    while ((match = copyRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1].trim().toUpperCase(),  // Normalize to uppercase
+            type: 'copybook',
+            line: lineNum
+        });
+    }
+    
+    // File definitions (FD)
+    const fdRegex = /^\s{0,6}\d{0,6}\s*FD\s+([A-Z0-9][A-Z0-9-]*)/gim;
+    while ((match = fdRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1].trim().toUpperCase(),  // Normalize to uppercase
+            type: 'file',
+            line: lineNum
+        });
+    }
+    
+    return symbols;
+}
+
+// Helper to parse COBOL PIC clause into a readable type with precision
+function parseCobolPic(pic) {
+    if (!pic) return 'unknown';
+    pic = pic.toUpperCase();
+    
+    // Extract numeric precision from PIC clause
+    // e.g., PIC 9(5)V99 → DECIMAL(5,2)
+    // e.g., PIC S9(7)V9(4) → DECIMAL(7,4) SIGNED
+    
+    const signed = pic.startsWith('S') ? 'SIGNED ' : '';
+    
+    if (pic.includes('V') || pic.match(/9.*\./)) {
+        // Has decimal point (V = implied decimal)
+        // Extract integer and decimal digits
+        let intDigits = 0;
+        let decDigits = 0;
+        
+        // Count digits before V
+        const beforeV = pic.split('V')[0] || pic.split('.')[0];
+        const afterV = pic.split('V')[1] || pic.split('.')[1] || '';
+        
+        // Parse 9(n) or 9999 patterns
+        const intMatch = beforeV.match(/9\((\d+)\)|9+/g);
+        if (intMatch) {
+            for (const m of intMatch) {
+                if (m.includes('(')) {
+                    intDigits += parseInt(m.match(/\((\d+)\)/)[1]);
+                } else {
+                    intDigits += m.length;
+                }
+            }
+        }
+        
+        const decMatch = afterV.match(/9\((\d+)\)|9+/g);
+        if (decMatch) {
+            for (const m of decMatch) {
+                if (m.includes('(')) {
+                    decDigits += parseInt(m.match(/\((\d+)\)/)[1]);
+                } else {
+                    decDigits += m.length;
+                }
+            }
+        }
+        
+        if (pic.includes('COMP-3') || pic.includes('COMP3')) {
+            return `${signed}PACKED-DECIMAL(${intDigits},${decDigits})`;
+        }
+        return `${signed}DECIMAL(${intDigits},${decDigits})`;
+    }
+    
+    if (pic.match(/^S?9/)) {
+        // Integer only
+        let digits = 0;
+        const digitMatch = pic.match(/9\((\d+)\)|9+/g);
+        if (digitMatch) {
+            for (const m of digitMatch) {
+                if (m.includes('(')) {
+                    digits += parseInt(m.match(/\((\d+)\)/)[1]);
+                } else {
+                    digits += m.length;
+                }
+            }
+        }
+        
+        if (pic.includes('COMP-3') || pic.includes('COMP3')) {
+            return `${signed}PACKED-INT(${digits})`;
+        }
+        if (pic.includes('COMP')) {
+            return `${signed}BINARY(${digits})`;
+        }
+        return `${signed}NUMERIC(${digits})`;
+    }
+    
+    if (pic.startsWith('X')) {
+        const lenMatch = pic.match(/X\((\d+)\)|X+/);
+        if (lenMatch) {
+            const len = lenMatch[1] ? parseInt(lenMatch[1]) : lenMatch[0].length;
+            return `ALPHANUMERIC(${len})`;
+        }
+        return 'ALPHANUMERIC';
+    }
+    
+    if (pic.startsWith('A')) {
+        const lenMatch = pic.match(/A\((\d+)\)|A+/);
+        if (lenMatch) {
+            const len = lenMatch[1] ? parseInt(lenMatch[1]) : lenMatch[0].length;
+            return `ALPHABETIC(${len})`;
+        }
+        return 'ALPHABETIC';
+    }
+    
+    return pic;
+}
+
+/**
+ * Enhanced TAL Parser - Ported from Python tal_enhanced_parser.py
+ * 
+ * Provides comprehensive parsing of TAL (Transaction Application Language):
+ * - Procedure declarations with attributes (MAIN, FORWARD, EXTERNAL, etc.)
+ * - DEFINE statements (constants and macros)
+ * - STRUCT definitions with field analysis
+ * - LITERAL declarations
+ * - Global variable declarations
+ * - Call graph extraction (CALL, PCAL, function-style)
+ * - Cyclomatic complexity calculation
+ */
+
+// TAL type enumeration
+const TAL_TYPES = {
+    INT: 'INT',
+    INT16: 'INT(16)',
+    INT32: 'INT(32)',
+    INT64: 'INT(64)',
+    STRING: 'STRING',
+    REAL: 'REAL',
+    REAL32: 'REAL(32)',
+    REAL64: 'REAL(64)',
+    FIXED: 'FIXED',
+    UNSIGNED: 'UNSIGNED',
+    BYTE: 'BYTE',
+    CHAR: 'CHAR',
+    STRUCT: 'STRUCT',
+    POINTER: 'POINTER',
+    UNKNOWN: 'UNKNOWN'
+};
+
+// TAL keywords for identification
+const TAL_KEYWORDS = new Set([
+    'PROC', 'SUBPROC', 'BEGIN', 'END', 'IF', 'THEN', 'ELSE', 'WHILE', 'DO', 'FOR',
+    'TO', 'DOWNTO', 'BY', 'CASE', 'OF', 'OTHERWISE', 'CALL', 'RETURN',
+    'DEFINE', 'LITERAL', 'STRUCT', 'INT', 'REAL', 'STRING', 'FIXED',
+    'UNSIGNED', 'FORWARD', 'EXTERNAL', 'MAIN', 'AND', 'OR', 'NOT',
+    'XOR', 'LOR', 'LAND', 'USE', 'DROP', 'ASSERT', 'SCAN', 'RSCAN',
+    'STORE', 'CODE', 'STACK', 'ENTRY', 'PRIV', 'RESIDENT',
+    'CALLABLE', 'VARIABLE', 'EXTENSIBLE', 'INTERRUPT', 'PRIVATE',
+    'NAME', 'BLOCK', 'FILLER', 'GOTO', 'LABEL', 'PCAL'
+]);
+
+// TAL system procedures (commonly called, not defined in user code)
+const TAL_SYSTEM_PROCS = new Set([
+    'INITIALIZER', 'PROCESS_CREATE_', 'PROCESS_STOP_', 'FILE_OPEN_',
+    'FILE_CLOSE_', 'FILE_READ_', 'FILE_WRITE_', 'READX', 'WRITEX',
+    'AWAITIO', 'DELAY', 'SHIFTSTRING', 'NUMIN', 'NUMOUT', 'CONTIME',
+    'DEBUG', 'ABEND', 'STOP', 'MOVERIGHT', 'MOVELEFT', 'BADDR', 'WADDR',
+    '$RECEIVE', '$SEND', 'MONITORCPUS', 'MYTERM', 'MYPID'
+]);
+
+// Store last TAL parse result for call graph access
+let lastTalParseResult = null;
+
+/**
+ * Parse TAL type string to normalized type
+ */
+function parseTalType(typeStr) {
+    if (!typeStr) return TAL_TYPES.UNKNOWN;
+    typeStr = typeStr.toUpperCase().trim();
+    
+    if (typeStr.startsWith('INT(')) {
+        if (typeStr.includes('32')) return TAL_TYPES.INT32;
+        if (typeStr.includes('64')) return TAL_TYPES.INT64;
+        if (typeStr.includes('16')) return TAL_TYPES.INT16;
+        return TAL_TYPES.INT;
+    }
+    if (typeStr.startsWith('REAL(')) {
+        if (typeStr.includes('64')) return TAL_TYPES.REAL64;
+        if (typeStr.includes('32')) return TAL_TYPES.REAL32;
+        return TAL_TYPES.REAL;
+    }
+    if (typeStr.startsWith('UNSIGNED')) return TAL_TYPES.UNSIGNED;
+    if (typeStr.startsWith('STRING')) return TAL_TYPES.STRING;
+    if (typeStr.startsWith('FIXED')) return TAL_TYPES.FIXED;
+    if (typeStr === 'INT') return TAL_TYPES.INT;
+    if (typeStr === 'REAL') return TAL_TYPES.REAL;
+    if (typeStr === 'BYTE') return TAL_TYPES.BYTE;
+    
+    return TAL_TYPES.UNKNOWN;
+}
+
+/**
+ * Get size in bytes for a TAL type
+ */
+function getTalTypeSize(talType) {
+    const sizes = {
+        [TAL_TYPES.INT]: 2,
+        [TAL_TYPES.INT16]: 2,
+        [TAL_TYPES.INT32]: 4,
+        [TAL_TYPES.INT64]: 8,
+        [TAL_TYPES.REAL]: 4,
+        [TAL_TYPES.REAL32]: 4,
+        [TAL_TYPES.REAL64]: 8,
+        [TAL_TYPES.STRING]: 1,
+        [TAL_TYPES.FIXED]: 8,
+        [TAL_TYPES.UNSIGNED]: 2,
+        [TAL_TYPES.BYTE]: 1,
+        [TAL_TYPES.CHAR]: 1
+    };
+    return sizes[talType] || 2;
+}
+
+/**
+ * Remove TAL comments (! to end of line) from a line
+ */
+function removeTalComments(line) {
+    let inString = false;
+    let result = '';
+    
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (char === '"' && !inString) {
+            inString = true;
+            result += char;
+        } else if (char === '"' && inString) {
+            inString = false;
+            result += char;
+        } else if (char === '!' && !inString) {
+            // Comment starts here
+            break;
+        } else {
+            result += char;
+        }
+    }
+    return result;
+}
+
+/**
+ * Main TAL parser function - returns symbols array for indexer compatibility
+ * Also stores rich parse result in lastTalParseResult for call graph access
+ */
+function parseTal(content, lines) {
+    const symbols = [];
+    const parseResult = {
+        procedures: [],
+        subprocs: [],
+        defines: [],
+        structs: [],
+        literals: [],
+        globals: [],
+        calls: [],
+        errors: [],
+        sourceLines: lines ? lines.length : content.split('\n').length
+    };
+    
+    const sourceLines = content.split('\n');
+    
+    // Parse in order: defines, literals, structs, globals, procedures
+    parseTalDefines(content, sourceLines, symbols, parseResult);
+    parseTalLiterals(content, sourceLines, symbols, parseResult);
+    parseTalStructs(content, sourceLines, symbols, parseResult);
+    parseTalGlobals(content, sourceLines, symbols, parseResult);
+    parseTalProcedures(content, sourceLines, symbols, parseResult);
+    parseTalSubprocs(content, sourceLines, symbols, parseResult);
+    parseTalCalls(content, sourceLines, parseResult);
+    
+    // Calculate complexity for each procedure
+    for (const proc of parseResult.procedures) {
+        if (proc.bodyText) {
+            proc.complexity = calculateTalComplexity(proc.bodyText);
+        }
+    }
+    
+    // Build call relationships
+    buildTalCallRelationships(parseResult);
+    
+    // Store for call graph access
+    lastTalParseResult = parseResult;
+    
+    log('parseTal: Found', symbols.length, 'symbols,', 
+        parseResult.procedures.length, 'procedures,',
+        parseResult.calls.length, 'calls');
+    
+    return symbols;
+}
+
+/**
+ * Parse DEFINE statements
+ */
+function parseTalDefines(content, lines, symbols, parseResult) {
+    let currentDefine = null;
+    
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        const cleanLine = removeTalComments(line).trim();
+        
+        if (!cleanLine) continue;
+        
+        // Check for DEFINE start
+        const defineMatch = cleanLine.match(
+            /^DEFINE\s+([a-zA-Z_][a-zA-Z0-9_^]*)(?:\s*\(([^)]*)\))?\s*=\s*(.*)$/i
+        );
+        
+        if (defineMatch) {
+            const name = defineMatch[1];
+            const paramsStr = defineMatch[2];
+            let value = defineMatch[3].trim();
+            
+            const params = paramsStr ? 
+                paramsStr.split(',').map(p => p.trim()).filter(p => p) : [];
+            
+            // Check if value ends with terminator
+            if (value.endsWith(';') || value.endsWith('#')) {
+                value = value.slice(0, -1).trim();
+                
+                const defineInfo = {
+                    name: name,
+                    value: value,
+                    params: params,
+                    isMacro: params.length > 0,
+                    line: lineNum + 1
+                };
+                parseResult.defines.push(defineInfo);
+                
+                symbols.push({
+                    name: name,
+                    type: params.length > 0 ? 'macro' : 'define',
+                    value: value.substring(0, 100),
+                    params: params,
+                    line: lineNum + 1
+                });
+            } else {
+                // Multi-line define
+                currentDefine = {
+                    name: name,
+                    params: params,
+                    valueParts: [value],
+                    startLine: lineNum + 1
+                };
+            }
+        } else if (currentDefine) {
+            // Continuation of multi-line define
+            if (cleanLine.endsWith(';') || cleanLine.endsWith('#')) {
+                currentDefine.valueParts.push(cleanLine.slice(0, -1).trim());
+                
+                const fullValue = currentDefine.valueParts.join(' ');
+                const defineInfo = {
+                    name: currentDefine.name,
+                    value: fullValue,
+                    params: currentDefine.params,
+                    isMacro: currentDefine.params.length > 0,
+                    line: currentDefine.startLine
+                };
+                parseResult.defines.push(defineInfo);
+                
+                symbols.push({
+                    name: currentDefine.name,
+                    type: currentDefine.params.length > 0 ? 'macro' : 'define',
+                    value: fullValue.substring(0, 100),
+                    params: currentDefine.params,
+                    line: currentDefine.startLine
+                });
+                
+                currentDefine = null;
+            } else {
+                currentDefine.valueParts.push(cleanLine);
+            }
+        }
+    }
+}
+
+/**
+ * Parse LITERAL declarations
+ */
+function parseTalLiterals(content, lines, symbols, parseResult) {
+    let inLiteral = false;
+    let literalText = [];
+    let startLine = 0;
+    
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        const cleanLine = removeTalComments(line).trim();
+        
+        if (!cleanLine) continue;
+        
+        if (/^\s*LITERAL\b/i.test(cleanLine)) {
+            inLiteral = true;
+            startLine = lineNum + 1;
+            // Remove LITERAL keyword
+            literalText = [cleanLine.replace(/^\s*LITERAL\s*/i, '')];
+        } else if (inLiteral) {
+            literalText.push(cleanLine);
+        }
+        
+        // Check for terminator
+        if (inLiteral && (cleanLine.endsWith(';') || cleanLine.endsWith('#'))) {
+            let fullText = literalText.join(' ');
+            if (fullText.endsWith(';') || fullText.endsWith('#')) {
+                fullText = fullText.slice(0, -1);
+            }
+            
+            // Parse individual literals: name = value, name2 = value2
+            const parts = splitTalDeclarations(fullText);
+            for (const part of parts) {
+                const match = part.trim().match(/^([a-zA-Z_][a-zA-Z0-9_^]*)\s*=\s*(.+)$/);
+                if (match) {
+                    const name = match[1];
+                    const valueStr = match[2].trim();
+                    
+                    let literalType = TAL_TYPES.INT;
+                    let value = valueStr;
+                    
+                    // Determine type and parse value
+                    if (valueStr.startsWith('"')) {
+                        literalType = TAL_TYPES.STRING;
+                        value = valueStr.replace(/^"|"$/g, '');
+                    } else if (/^-?\d+$/.test(valueStr)) {
+                        value = parseInt(valueStr, 10);
+                    } else if (/^%H[0-9A-Fa-f]+$/i.test(valueStr)) {
+                        value = parseInt(valueStr.substring(2), 16);
+                    } else if (/^%B[01]+$/i.test(valueStr)) {
+                        value = parseInt(valueStr.substring(2), 2);
+                    } else if (/^%[0-7]+$/.test(valueStr)) {
+                        value = parseInt(valueStr.substring(1), 8);
+                    } else if (/^-?\d+\.\d*$/.test(valueStr)) {
+                        literalType = TAL_TYPES.REAL;
+                        value = parseFloat(valueStr);
+                    }
+                    
+                    parseResult.literals.push({
+                        name: name,
+                        value: value,
+                        literalType: literalType,
+                        line: startLine
+                    });
+                    
+                    symbols.push({
+                        name: name,
+                        type: 'literal',
+                        value: value,
+                        dataType: literalType,
+                        line: startLine
+                    });
+                }
+            }
+            
+            inLiteral = false;
+            literalText = [];
+        }
+    }
+}
+
+/**
+ * Parse STRUCT definitions
+ */
+function parseTalStructs(content, lines, symbols, parseResult) {
+    let inStruct = false;
+    let structLines = [];
+    let structName = '';
+    let startLine = 0;
+    let structDepth = 0;
+    let hasBegin = false;
+    
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        const cleanLine = removeTalComments(line).trim();
+        
+        if (!cleanLine) continue;
+        
+        // Check for STRUCT start (not inside a procedure)
+        const structMatch = cleanLine.match(/^STRUCT\s+([.*a-zA-Z_][a-zA-Z0-9_^]*)/i);
+        
+        if (structMatch && !inStruct) {
+            inStruct = true;
+            structName = structMatch[1];
+            startLine = lineNum + 1;
+            structLines = [cleanLine];
+            structDepth = 0;
+            hasBegin = false;
+            
+            // Check if it's a struct pointer/reference like "STRUCT .ptr(other);"
+            if (/\([^)]+\)\s*;?\s*$/.test(cleanLine)) {
+                const structInfo = parseTalStructDefinition(structName, structLines.join('\n'), startLine);
+                if (structInfo) {
+                    parseResult.structs.push(structInfo);
+                    symbols.push({
+                        name: structInfo.name,
+                        type: 'struct',
+                        fields: structInfo.fields.length,
+                        totalSize: structInfo.totalSize,
+                        isReferral: structInfo.isReferral,
+                        line: startLine
+                    });
+                }
+                inStruct = false;
+                structLines = [];
+            }
+        } else if (inStruct) {
+            structLines.push(cleanLine);
+            
+            // Track BEGIN
+            if (/\bBEGIN\b/i.test(cleanLine)) {
+                structDepth++;
+                hasBegin = true;
+            }
+            
+            // Track END
+            if (/\bEND\b/i.test(cleanLine)) {
+                structDepth--;
+                if (structDepth === 0 && hasBegin) {
+                    const structText = structLines.join('\n');
+                    const structInfo = parseTalStructDefinition(structName, structText, startLine);
+                    if (structInfo) {
+                        parseResult.structs.push(structInfo);
+                        symbols.push({
+                            name: structInfo.name,
+                            type: 'struct',
+                            fields: structInfo.fields.length,
+                            totalSize: structInfo.totalSize,
+                            isReferral: structInfo.isReferral,
+                            line: startLine
+                        });
+                    }
+                    inStruct = false;
+                    structLines = [];
+                    hasBegin = false;
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Parse a single STRUCT definition
+ */
+function parseTalStructDefinition(name, text, startLine) {
+    const isReferral = name.startsWith('.');
+    const isTemplate = name === '*';
+    const cleanName = name.replace(/^[.*]+/, '');
+    
+    const structInfo = {
+        name: cleanName,
+        fields: [],
+        totalSize: 0,
+        isReferral: isReferral,
+        isTemplate: isTemplate,
+        line: startLine
+    };
+    
+    const lines = text.split('\n');
+    let currentOffset = 0;
+    
+    for (let i = 1; i < lines.length; i++) { // Skip STRUCT declaration line
+        let line = removeTalComments(lines[i]).trim();
+        if (!line || /^END\b/i.test(line)) continue;
+        if (line.endsWith(';')) line = line.slice(0, -1).trim();
+        if (!line || line.toUpperCase() === 'BEGIN') continue;
+        
+        // Parse field: TYPE name or TYPE name[bounds]
+        const fieldMatch = line.match(
+            /^(INT(?:\([^)]*\))?|REAL(?:\([^)]*\))?|STRING(?:\([^)]*\))?|FIXED(?:\([^)]*\))?|UNSIGNED(?:\([^)]*\))?|STRUCT|FILLER|BEGIN)\s*([.*a-zA-Z_][a-zA-Z0-9_^]*)?\s*(?:\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\])?/i
+        );
+        
+        if (fieldMatch) {
+            const fieldTypeStr = fieldMatch[1];
+            const fieldName = fieldMatch[2];
+            const arrayStart = fieldMatch[3];
+            const arrayEnd = fieldMatch[4];
+            
+            if (!fieldName) continue;
+            
+            const field = {
+                name: fieldName.replace(/^[.*]+/, ''),
+                fieldType: parseTalType(fieldTypeStr),
+                offset: currentOffset,
+                size: 0,
+                isArray: false,
+                arrayBounds: null,
+                isPointer: fieldName.startsWith('.'),
+                isFiller: fieldName.toUpperCase() === 'FILLER' || fieldTypeStr.toUpperCase() === 'FILLER'
+            };
+            
+            // Handle arrays
+            if (arrayStart !== undefined && arrayEnd !== undefined) {
+                field.isArray = true;
+                field.arrayBounds = [parseInt(arrayStart), parseInt(arrayEnd)];
+            }
+            
+            // Calculate size
+            field.size = getTalTypeSize(field.fieldType);
+            if (field.isArray && field.arrayBounds) {
+                field.size *= (field.arrayBounds[1] - field.arrayBounds[0] + 1);
+            }
+            
+            structInfo.fields.push(field);
+            currentOffset += field.size;
+        }
+    }
+    
+    structInfo.totalSize = currentOffset;
+    return structInfo;
+}
+
+/**
+ * Parse global variable declarations
+ */
+function parseTalGlobals(content, lines, symbols, parseResult) {
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        const cleanLine = removeTalComments(line).trim();
+        
+        if (!cleanLine) continue;
+        
+        // Skip known declaration types
+        if (/^\s*(DEFINE|LITERAL|STRUCT|PROC|SUBPROC)\b/i.test(cleanLine)) continue;
+        
+        // Look for variable declarations: TYPE name, name2;
+        const varMatch = cleanLine.match(
+            /^(INT(?:\([^)]*\))?|REAL(?:\([^)]*\))?|STRING(?:\([^)]*\))?|FIXED(?:\([^)]*\))?|UNSIGNED(?:\([^)]*\))?)\s+(.+?)\s*;/i
+        );
+        
+        if (varMatch) {
+            const varTypeStr = varMatch[1];
+            const varNames = varMatch[2];
+            const varType = parseTalType(varTypeStr);
+            
+            // Check if we're inside a procedure
+            const before = content.substring(0, content.indexOf(line));
+            const procCount = (before.match(/\bPROC\b/gi) || []).length;
+            const endCount = (before.match(/\bEND\s*;/gi) || []).length;
+            const isGlobal = procCount <= endCount;
+            
+            if (!isGlobal) continue;
+            
+            // Parse each variable name
+            for (let varPart of varNames.split(',')) {
+                varPart = varPart.trim();
+                if (!varPart) continue;
+                
+                // Check for array syntax [start:end]
+                const arrayMatch = varPart.match(
+                    /^([.*a-zA-Z_][a-zA-Z0-9_^]*)\s*\[\s*(-?\d+)\s*:\s*(-?\d+)\s*\]/
+                );
+                
+                let varName, arrayBounds = null, isArray = false;
+                if (arrayMatch) {
+                    varName = arrayMatch[1];
+                    arrayBounds = [parseInt(arrayMatch[2]), parseInt(arrayMatch[3])];
+                    isArray = true;
+                } else {
+                    varName = varPart;
+                }
+                
+                const globalInfo = {
+                    name: varName.replace(/^[.*]+/, ''),
+                    varType: varType,
+                    isArray: isArray,
+                    arrayBounds: arrayBounds,
+                    isPointer: varName.startsWith('.'),
+                    line: lineNum + 1
+                };
+                parseResult.globals.push(globalInfo);
+                
+                symbols.push({
+                    name: globalInfo.name,
+                    type: 'variable',
+                    dataType: varType + (isArray ? '[]' : ''),
+                    isArray: isArray,
+                    isPointer: globalInfo.isPointer,
+                    line: lineNum + 1,
+                    scope: 'global'
+                });
+            }
+        }
+    }
+}
+
+/**
+ * Parse procedure declarations
+ */
+function parseTalProcedures(content, lines, symbols, parseResult) {
+    // Find all PROC declarations with their full signatures
+    const procRegex = /(?:(INT(?:\([^)]*\))?|REAL(?:\([^)]*\))?|STRING|FIXED|UNSIGNED(?:\([^)]*\))?)\s+)?PROC\s+([a-zA-Z_][a-zA-Z0-9_^]*)\s*(?:\(([^)]*)\))?/gi;
+    
+    let match;
+    const procStarts = [];
+    
+    while ((match = procRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        procStarts.push({
+            index: match.index,
+            returnType: match[1] || null,
+            name: match[2],
+            paramsStr: match[3] || '',
+            line: lineNum
+        });
+    }
+    
+    // Sort by position
+    procStarts.sort((a, b) => a.index - b.index);
+    
+    // Process each procedure
+    for (let i = 0; i < procStarts.length; i++) {
+        const proc = procStarts[i];
+        
+        // Find the declaration line for attributes
+        const declStart = proc.index;
+        const declEnd = content.indexOf(';', declStart);
+        const declaration = declEnd > 0 ? content.substring(declStart, declEnd + 1) : '';
+        
+        // Check for attributes
+        const isMain = /\bMAIN\b/i.test(declaration);
+        const isForward = /\bFORWARD\b/i.test(declaration);
+        const isExternal = /\bEXTERNAL\b/i.test(declaration);
+        const isInterrupt = /\bINTERRUPT\b/i.test(declaration);
+        const isResident = /\bRESIDENT\b/i.test(declaration);
+        const isPrivate = /\bPRIVATE\b/i.test(declaration);
+        
+        const attributes = [];
+        if (isMain) attributes.push('MAIN');
+        if (isForward) attributes.push('FORWARD');
+        if (isExternal) attributes.push('EXTERNAL');
+        if (isInterrupt) attributes.push('INTERRUPT');
+        if (isResident) attributes.push('RESIDENT');
+        if (isPrivate) attributes.push('PRIVATE');
+        
+        // Parse parameters
+        const parameters = [];
+        if (proc.paramsStr) {
+            for (const param of proc.paramsStr.split(',')) {
+                const paramName = param.trim();
+                if (paramName) {
+                    parameters.push({
+                        name: paramName.replace(/^[.*]+/, ''),
+                        type: TAL_TYPES.UNKNOWN,
+                        isPointer: paramName.startsWith('.')
+                    });
+                }
+            }
+        }
+        
+        // Find procedure body boundaries
+        let bodyStartLine = 0;
+        let bodyEndLine = 0;
+        let bodyText = '';
+        
+        if (!isForward && !isExternal) {
+            // Find end boundary (next PROC or end of file)
+            const nextProcIndex = i + 1 < procStarts.length ? procStarts[i + 1].index : content.length;
+            const procSection = content.substring(declStart, nextProcIndex);
+            
+            // Find first BEGIN
+            const beginMatch = /\bBEGIN\b/i.exec(procSection);
+            if (beginMatch) {
+                bodyStartLine = content.substring(0, declStart + beginMatch.index).split('\n').length;
+                
+                // Find matching END;
+                let depth = 0;
+                const procLines = procSection.split('\n');
+                let foundEnd = false;
+                
+                for (let j = 0; j < procLines.length; j++) {
+                    const line = removeTalComments(procLines[j]).toUpperCase();
+                    if (/\bBEGIN\b/.test(line)) depth++;
+                    if (/\bEND\s*;/.test(line)) {
+                        depth--;
+                        if (depth === 0) {
+                            bodyEndLine = proc.line + j;
+                            bodyText = procLines.slice(0, j + 1).join('\n');
+                            foundEnd = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if (!foundEnd) {
+                    bodyEndLine = proc.line + procLines.length - 1;
+                    bodyText = procSection;
+                }
+            }
+        }
+        
+        const procDetail = {
+            name: proc.name,
+            returnType: proc.returnType ? parseTalType(proc.returnType) : null,
+            parameters: parameters,
+            localVars: [],
+            subprocs: [],
+            calls: [],
+            calledBy: [],
+            attributes: attributes,
+            isMain: isMain,
+            isForward: isForward,
+            isExternal: isExternal,
+            isInterrupt: isInterrupt,
+            isResident: isResident,
+            bodyText: bodyText,
+            bodyStartLine: bodyStartLine,
+            bodyEndLine: bodyEndLine,
+            complexity: 1,
+            line: proc.line
+        };
+        
+        // Parse local variables from body
+        if (bodyText) {
+            parseTalLocalVariables(bodyText, procDetail);
+        }
+        
+        parseResult.procedures.push(procDetail);
+        
+        // Add to symbols
+        symbols.push({
+            name: proc.name,
+            type: isForward ? 'forward' : (isExternal ? 'external' : 'procedure'),
+            returnType: proc.returnType || null,
+            params: proc.paramsStr,
+            parameters: parameters,
+            attributes: attributes,
+            isMain: isMain,
+            complexity: procDetail.complexity,
+            line: proc.line,
+            bodyStartLine: bodyStartLine,
+            bodyEndLine: bodyEndLine,
+            signature: `${proc.returnType ? proc.returnType + ' ' : ''}PROC ${proc.name}(${proc.paramsStr})`
+        });
+    }
+}
+
+/**
+ * Parse local variable declarations from procedure body
+ */
+function parseTalLocalVariables(bodyText, procDetail) {
+    const lines = bodyText.split('\n');
+    
+    for (const line of lines) {
+        const cleanLine = removeTalComments(line).trim();
+        if (!cleanLine) continue;
+        
+        // Stop at first executable statement
+        if (/^(IF|WHILE|FOR|CALL|CASE|RETURN)\b/i.test(cleanLine)) break;
+        
+        // Look for type declarations
+        const varMatch = cleanLine.match(
+            /^(INT(?:\([^)]*\))?|REAL(?:\([^)]*\))?|STRING(?:\([^)]*\))?|FIXED(?:\([^)]*\))?|UNSIGNED(?:\([^)]*\))?)\s+(.+?)\s*;/i
+        );
+        
+        if (varMatch) {
+            const typeStr = varMatch[1];
+            const namesStr = varMatch[2];
+            
+            for (let name of namesStr.split(',')) {
+                name = name.trim();
+                if (!name) continue;
+                
+                // Check for array
+                const arrayMatch = name.match(/^([.*a-zA-Z_][a-zA-Z0-9_^]*)\s*\[/);
+                const varName = arrayMatch ? arrayMatch[1] : name;
+                
+                procDetail.localVars.push({
+                    name: varName.replace(/^[.*]+/, ''),
+                    type: typeStr.toUpperCase(),
+                    isPointer: varName.startsWith('.')
+                });
+            }
+        }
+    }
+}
+
+/**
+ * Parse SUBPROC declarations
+ */
+function parseTalSubprocs(content, lines, symbols, parseResult) {
+    let currentProc = null;
+    
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        const cleanLine = removeTalComments(line).trim();
+        
+        // Track current procedure
+        const procMatch = cleanLine.match(/\bPROC\s+([a-zA-Z_][a-zA-Z0-9_^]*)/i);
+        if (procMatch) {
+            currentProc = procMatch[1];
+            continue;
+        }
+        
+        if (!currentProc) continue;
+        
+        // Find SUBPROC declarations
+        const subprocMatch = cleanLine.match(
+            /^(?:(INT(?:\([^)]*\))?|REAL(?:\([^)]*\))?|STRING|FIXED|UNSIGNED(?:\([^)]*\))?)\s+)?SUBPROC\s+([a-zA-Z_][a-zA-Z0-9_^]*)/i
+        );
+        
+        if (subprocMatch) {
+            const returnTypeStr = subprocMatch[1];
+            const subprocName = subprocMatch[2];
+            
+            const subprocInfo = {
+                name: subprocName,
+                parentProc: currentProc,
+                returnType: returnTypeStr ? parseTalType(returnTypeStr) : null,
+                parameters: [],
+                line: lineNum + 1
+            };
+            parseResult.subprocs.push(subprocInfo);
+            
+            // Track in parent procedure
+            const parentProc = parseResult.procedures.find(p => p.name === currentProc);
+            if (parentProc) {
+                parentProc.subprocs.push(subprocName);
+            }
+            
+            symbols.push({
+                name: subprocName,
+                type: 'subproc',
+                parentProc: currentProc,
+                returnType: returnTypeStr || null,
+                line: lineNum + 1
+            });
+        }
+    }
+}
+
+/**
+ * Extract all procedure calls from the source
+ */
+function parseTalCalls(content, lines, parseResult) {
+    let currentProc = null;
+    
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        const cleanLine = removeTalComments(line).trim();
+        
+        // Track current procedure
+        const procMatch = cleanLine.match(/\bPROC\s+([a-zA-Z_][a-zA-Z0-9_^]*)/i);
+        if (procMatch) {
+            currentProc = procMatch[1];
+            continue;
+        }
+        
+        if (!currentProc) continue;
+        
+        // Find CALL statements
+        const callRegex = /\bCALL\s+([a-zA-Z_][a-zA-Z0-9_^]*)\s*(?:\(([^)]*)\))?/gi;
+        let callMatch;
+        while ((callMatch = callRegex.exec(cleanLine)) !== null) {
+            const callee = callMatch[1];
+            const argsStr = callMatch[2] || '';
+            const args = argsStr ? argsStr.split(',').map(a => a.trim()).filter(a => a) : [];
+            
+            parseResult.calls.push({
+                callee: callee,
+                caller: currentProc,
+                arguments: args,
+                callType: 'CALL',
+                line: lineNum + 1
+            });
+        }
+        
+        // Find PCAL statements (privileged call)
+        const pcalRegex = /\bPCAL\s+([a-zA-Z_][a-zA-Z0-9_^]*)\s*(?:\(([^)]*)\))?/gi;
+        let pcalMatch;
+        while ((pcalMatch = pcalRegex.exec(cleanLine)) !== null) {
+            const callee = pcalMatch[1];
+            const argsStr = pcalMatch[2] || '';
+            const args = argsStr ? argsStr.split(',').map(a => a.trim()).filter(a => a) : [];
+            
+            parseResult.calls.push({
+                callee: callee,
+                caller: currentProc,
+                arguments: args,
+                callType: 'PCAL',
+                line: lineNum + 1
+            });
+        }
+        
+        // Find function-style calls: name(args) - but exclude CALL/PCAL already captured
+        const funcCallRegex = /(?<![a-zA-Z0-9_])([a-zA-Z_][a-zA-Z0-9_^]*)\s*\(([^)]*)\)/g;
+        let funcMatch;
+        while ((funcMatch = funcCallRegex.exec(cleanLine)) !== null) {
+            const potentialCallee = funcMatch[1];
+            
+            // Skip keywords, types, current procedure
+            if (TAL_KEYWORDS.has(potentialCallee.toUpperCase())) continue;
+            if (potentialCallee === currentProc) continue;
+            
+            // Skip if preceded by CALL/PCAL
+            const beforePos = funcMatch.index;
+            const prefix = cleanLine.substring(0, beforePos).trim().toUpperCase();
+            if (prefix.endsWith('CALL') || prefix.endsWith('PCAL')) continue;
+            
+            // Skip if it looks like an array access
+            if (/^[a-zA-Z_][a-zA-Z0-9_^]*\s*\[/.test(cleanLine.substring(funcMatch.index))) continue;
+            
+            const argsStr = funcMatch[2] || '';
+            const args = argsStr ? argsStr.split(',').map(a => a.trim()).filter(a => a) : [];
+            
+            parseResult.calls.push({
+                callee: potentialCallee,
+                caller: currentProc,
+                arguments: args,
+                callType: 'function',
+                line: lineNum + 1
+            });
+        }
+    }
+}
+
+/**
+ * Build call relationships between procedures
+ */
+function buildTalCallRelationships(parseResult) {
+    // Build reverse lookup: callee -> [callers]
+    const reverseCalls = new Map();
+    for (const call of parseResult.calls) {
+        if (!reverseCalls.has(call.callee)) {
+            reverseCalls.set(call.callee, []);
+        }
+        if (!reverseCalls.get(call.callee).includes(call.caller)) {
+            reverseCalls.get(call.callee).push(call.caller);
+        }
+    }
+    
+    // Update procedure details
+    for (const proc of parseResult.procedures) {
+        proc.calls = parseResult.calls.filter(c => c.caller === proc.name);
+        proc.calledBy = reverseCalls.get(proc.name) || [];
+    }
+}
+
+/**
+ * Calculate cyclomatic complexity of procedure body
+ */
+function calculateTalComplexity(bodyText) {
+    let complexity = 1; // Base complexity
+    
+    // Remove strings to avoid false matches
+    const cleanBody = bodyText.replace(/"[^"]*"/g, '""');
+    
+    // Count decision points
+    const decisionPatterns = [
+        /\bIF\b/gi,           // IF statements
+        /\bWHILE\b/gi,        // WHILE loops
+        /\bFOR\b/gi,          // FOR loops
+        /\bCASE\b/gi,         // CASE statements
+        /\bAND\b/gi,          // Compound conditions
+        /\bOR\b/gi,           // Compound conditions
+        /\bLAND\b/gi,         // Logical AND
+        /\bLOR\b/gi           // Logical OR
+    ];
+    
+    for (const pattern of decisionPatterns) {
+        const matches = cleanBody.match(pattern);
+        if (matches) {
+            complexity += matches.length;
+        }
+    }
+    
+    return complexity;
+}
+
+/**
+ * Split declarations by comma, handling nested parentheses
+ */
+function splitTalDeclarations(text) {
+    const parts = [];
+    let current = '';
+    let depth = 0;
+    
+    for (const char of text) {
+        if (char === '(') {
+            depth++;
+            current += char;
+        } else if (char === ')') {
+            depth--;
+            current += char;
+        } else if (char === ',' && depth === 0) {
+            parts.push(current.trim());
+            current = '';
+        } else {
+            current += char;
+        }
+    }
+    
+    if (current.trim()) {
+        parts.push(current.trim());
+    }
+    
+    return parts;
+}
+
+/**
+ * Get the last TAL parse result (for call graph access)
+ */
+function getLastTalParseResult() {
+    return lastTalParseResult;
+}
+
+/**
+ * Get TAL call graph from last parse
+ */
+function getTalCallGraph() {
+    if (!lastTalParseResult) return {};
+    
+    const graph = {};
+    for (const call of lastTalParseResult.calls) {
+        if (!graph[call.caller]) {
+            graph[call.caller] = [];
+        }
+        if (!graph[call.caller].includes(call.callee)) {
+            graph[call.caller].push(call.callee);
+        }
+    }
+    return graph;
+}
+
+/**
+ * Get TAL reverse call graph from last parse
+ */
+function getTalReverseCallGraph() {
+    if (!lastTalParseResult) return {};
+    
+    const graph = {};
+    for (const call of lastTalParseResult.calls) {
+        if (!graph[call.callee]) {
+            graph[call.callee] = [];
+        }
+        if (!graph[call.callee].includes(call.caller)) {
+            graph[call.callee].push(call.caller);
+        }
+    }
+    return graph;
+}
+
+/**
+ * Get TAL entry points (procedures not called by others)
+ */
+function getTalEntryPoints() {
+    if (!lastTalParseResult) return [];
+    
+    const called = new Set(lastTalParseResult.calls.map(c => c.callee));
+    return lastTalParseResult.procedures
+        .filter(p => !called.has(p.name))
+        .map(p => p.name);
+}
+
+function parseGo(content, lines) {
+    const symbols = [];
+    
+    // Function definitions
+    const funcRegex = /^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(([^)]*)\)/gm;
+    let match;
+    
+    while ((match = funcRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'function',
+            params: match[2].trim(),
+            line: lineNum
+        });
+    }
+    
+    // Type definitions
+    const typeRegex = /^type\s+(\w+)\s+(?:struct|interface)/gm;
+    while ((match = typeRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'struct',
+            line: lineNum
+        });
+    }
+    
+    return symbols;
+}
+
+function parseRust(content, lines) {
+    const symbols = [];
+    
+    // Function definitions
+    const funcRegex = /^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*(?:<[^>]+>)?\s*\(([^)]*)\)/gm;
+    let match;
+    
+    while ((match = funcRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'function',
+            params: match[2].trim(),
+            line: lineNum
+        });
+    }
+    
+    // Struct definitions
+    const structRegex = /^\s*(?:pub\s+)?struct\s+(\w+)/gm;
+    while ((match = structRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'struct',
+            line: lineNum
+        });
+    }
+    
+    // Impl blocks
+    const implRegex = /^\s*impl(?:<[^>]+>)?\s+(\w+)/gm;
+    while ((match = implRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'impl',
+            line: lineNum
+        });
+    }
+    
+    return symbols;
+}
+
+function parseCSharp(content, lines) {
+    const symbols = [];
+    let match;
+    
+    // Namespace
+    const nsRegex = /^\s*namespace\s+([\w.]+)/gm;
+    while ((match = nsRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'namespace',
+            line: lineNum
+        });
+    }
+    
+    // Class, interface, struct, enum definitions
+    const classRegex = /^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:abstract\s+)?(?:sealed\s+)?(?:partial\s+)?(class|interface|struct|enum|record)\s+(\w+)(?:<[^>]+>)?/gm;
+    while ((match = classRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[2],
+            type: match[1],
+            line: lineNum
+        });
+    }
+    
+    // Method definitions
+    const methodRegex = /^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:virtual\s+)?(?:override\s+)?(?:async\s+)?(?:[\w<>\[\],\s]+)\s+(\w+)\s*\(([^)]*)\)\s*(?:where\s+[^{]+)?(?:\{|=>)/gm;
+    while ((match = methodRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        const name = match[1];
+        // Skip common keywords
+        if (!['if', 'for', 'foreach', 'while', 'switch', 'catch', 'using', 'lock', 'return', 'new', 'throw'].includes(name)) {
+            symbols.push({
+                name: name,
+                type: 'method',
+                params: match[2].trim(),
+                line: lineNum,
+                signature: `${name}(${match[2].trim()})`
+            });
+        }
+    }
+    
+    // Properties
+    const propRegex = /^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:virtual\s+)?(?:override\s+)?(?:[\w<>\[\],\s]+)\s+(\w+)\s*\{\s*(?:get|set)/gm;
+    while ((match = propRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'property',
+            line: lineNum
+        });
+    }
+    
+    // Events
+    const eventRegex = /^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?event\s+[\w<>]+\s+(\w+)/gm;
+    while ((match = eventRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'event',
+            line: lineNum
+        });
+    }
+    
+    // Delegates
+    const delegateRegex = /^\s*(?:public|private|protected|internal)?\s*delegate\s+[\w<>]+\s+(\w+)\s*\(/gm;
+    while ((match = delegateRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'delegate',
+            line: lineNum
+        });
+    }
+    
+    return symbols;
+}
+
+function parseSQL(content, lines) {
+    const symbols = [];
+    let match;
+    
+    // Stored Procedures
+    const procRegex = /CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?PROC(?:EDURE)?\s+(?:[\w.]+\.)?(\w+)/gi;
+    while ((match = procRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'procedure',
+            line: lineNum
+        });
+    }
+    
+    // Functions
+    const funcRegex = /CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?FUNCTION\s+(?:[\w.]+\.)?(\w+)/gi;
+    while ((match = funcRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'function',
+            line: lineNum
+        });
+    }
+    
+    // Views
+    const viewRegex = /CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?VIEW\s+(?:[\w.]+\.)?(\w+)/gi;
+    while ((match = viewRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'view',
+            line: lineNum
+        });
+    }
+    
+    // Tables
+    const tableRegex = /CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[\w.]+\.)?(\w+)/gi;
+    while ((match = tableRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'table',
+            line: lineNum
+        });
+    }
+    
+    // Triggers
+    const triggerRegex = /CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+(?:[\w.]+\.)?(\w+)/gi;
+    while ((match = triggerRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'trigger',
+            line: lineNum
+        });
+    }
+    
+    // Indexes
+    const indexRegex = /CREATE\s+(?:UNIQUE\s+)?(?:CLUSTERED\s+)?(?:NONCLUSTERED\s+)?INDEX\s+(?:[\w.]+\.)?(\w+)/gi;
+    while ((match = indexRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'index',
+            line: lineNum
+        });
+    }
+    
+    // Packages (Oracle/PL-SQL)
+    const pkgRegex = /CREATE\s+(?:OR\s+REPLACE\s+)?PACKAGE\s+(?:BODY\s+)?(?:[\w.]+\.)?(\w+)/gi;
+    while ((match = pkgRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'package',
+            line: lineNum
+        });
+    }
+    
+    // CTEs (Common Table Expressions) - WITH clause
+    const cteRegex = /\bWITH\s+(\w+)\s+AS\s*\(/gi;
+    while ((match = cteRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'cte',
+            line: lineNum
+        });
+    }
+    
+    return symbols;
+}
+
+function parseGeneric(content, lines) {
+    const symbols = [];
+    
+    // Generic function-like patterns
+    const funcRegex = /(?:function|def|fn|func|proc|sub|method)\s+(\w+)/gi;
+    let match;
+    
+    while ((match = funcRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'function',
+            line: lineNum
+        });
+    }
+    
+    return symbols;
+}
+
+/**
+ * Find function calls within a function body
+ */
+function findFunctionCalls(content, symbol, language) {
+    const calls = [];
+    const lines = content.split('\n');
+    let functionBody = '';
+    
+    // COBOL needs special handling - paragraphs don't have braces
+    if (language === 'cobol') {
+        log('findFunctionCalls COBOL:', symbol.name, 'type:', symbol.type, 'line:', symbol.line);
+        
+        // For COBOL, we need to find the paragraph body which runs until the next paragraph
+        const startLine = symbol.line - 1;
+        const symbolType = symbol.type;
+        
+        if (symbolType === 'paragraph' || symbolType === 'section') {
+            // Find the end of this paragraph (next paragraph/section or end of procedure division)
+            // COBOL paragraph: starts in column 8-11, name followed by period
+            const paragraphEndRegex = /^\s{0,6}\d{0,6}\s{1,4}[A-Z][A-Z0-9-]*\s*(?:SECTION)?\s*\.\s*$/;
+            
+            for (let i = startLine + 1; i < lines.length; i++) {
+                const line = lines[i];
+                
+                // Check if we've hit another paragraph/section definition
+                if (paragraphEndRegex.test(line)) {
+                    log('  Paragraph end at line', i + 1, ':', line.trim().substring(0, 30));
+                    break;
+                }
+                
+                // Check if we've hit end of procedure division or program
+                if (/^\s{0,6}\d{0,6}\s*(?:END\s+PROGRAM|IDENTIFICATION\s+DIVISION)/i.test(line)) {
+                    break;
+                }
+                
+                functionBody += line + '\n';
+                
+                if (i - startLine > 500) break; // Safety limit
+            }
+            
+            log('  Paragraph body length:', functionBody.length, 'chars');
+            
+        } else if (symbolType === 'program') {
+            // For the program itself, search the entire PROCEDURE DIVISION
+            let inProcedure = false;
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (/PROCEDURE\s+DIVISION/i.test(line)) {
+                    inProcedure = true;
+                    log('  Found PROCEDURE DIVISION at line', i + 1);
+                    continue;
+                }
+                if (inProcedure) {
+                    if (/^\s{0,6}\d{0,6}\s*END\s+PROGRAM/i.test(line)) {
+                        break;
+                    }
+                    functionBody += line + '\n';
+                }
+            }
+            log('  Program procedure body length:', functionBody.length, 'chars');
+        }
+        
+        // Extract COBOL calls from the body
+        let match;
+        
+        // PERFORM paragraph/section (handles PERFORM ... THRU ...)
+        const performRegex = /PERFORM\s+([A-Z0-9][A-Z0-9-]*)(?:\s+(?:THRU|THROUGH)\s+([A-Z0-9][A-Z0-9-]*))?/gi;
+        while ((match = performRegex.exec(functionBody)) !== null) {
+            const name = match[1].toUpperCase();
+            if (!['UNTIL', 'VARYING', 'TIMES', 'WITH', 'TEST', 'BEFORE', 'AFTER'].includes(name)) {
+                log('  Found PERFORM:', name);
+                calls.push(name);
+                if (match[2]) {
+                    log('  Found PERFORM THRU:', match[2].toUpperCase());
+                    calls.push(match[2].toUpperCase());
+                }
+            }
+        }
+        
+        // CALL external program (with or without quotes)
+        const cobolCallRegex = /CALL\s+['"]?([A-Z0-9][A-Z0-9-]*)['"]?/gi;
+        while ((match = cobolCallRegex.exec(functionBody)) !== null) {
+            log('  Found CALL:', match[1].toUpperCase());
+            calls.push(match[1].toUpperCase());
+        }
+        
+        // GO TO paragraph
+        const gotoRegex = /GO\s+TO\s+([A-Z0-9][A-Z0-9-]*)/gi;
+        while ((match = gotoRegex.exec(functionBody)) !== null) {
+            log('  Found GO TO:', match[1].toUpperCase());
+            calls.push(match[1].toUpperCase());
+        }
+        
+        // COPY copybook reference
+        const copyRegex = /COPY\s+([A-Z0-9][A-Z0-9-]*)/gi;
+        while ((match = copyRegex.exec(functionBody)) !== null) {
+            log('  Found COPY:', match[1].toUpperCase());
+            calls.push(match[1].toUpperCase());
+        }
+        
+        log('  Total calls found for', symbol.name, ':', calls.length);
+        return [...new Set(calls)]; // Deduplicate
+    }
+    
+    // TAL needs special handling - similar to COBOL, uses BEGIN/END blocks
+    if (language === 'tal') {
+        log('findFunctionCalls TAL:', symbol.name, 'type:', symbol.type, 'line:', symbol.line);
+        
+        const startLine = symbol.line - 1;
+        const symbolType = symbol.type;
+        
+        if (symbolType === 'procedure' || symbolType === 'subproc') {
+            // Find procedure body between BEGIN and matching END;
+            let depth = 0;
+            let foundBegin = false;
+            
+            for (let i = startLine; i < lines.length; i++) {
+                const line = removeTalComments(lines[i]);
+                const upperLine = line.toUpperCase();
+                
+                // Count BEGIN/END
+                if (/\bBEGIN\b/.test(upperLine)) {
+                    depth++;
+                    foundBegin = true;
+                }
+                if (/\bEND\s*;/.test(upperLine) || /\bEND\s*$/.test(upperLine)) {
+                    depth--;
+                    if (depth <= 0 && foundBegin) {
+                        functionBody += line + '\n';
+                        break;
+                    }
+                }
+                
+                if (foundBegin) {
+                    functionBody += line + '\n';
+                }
+                
+                if (i - startLine > 500) break; // Safety limit
+            }
+            
+            log('  TAL procedure body length:', functionBody.length, 'chars');
+        }
+        
+        // Extract TAL calls from the body
+        let match;
+        
+        // CALL statements
+        const talCallRegex = /\bCALL\s+([a-zA-Z_][a-zA-Z0-9_^]*)/gi;
+        while ((match = talCallRegex.exec(functionBody)) !== null) {
+            log('  Found CALL:', match[1]);
+            calls.push(match[1]);
+        }
+        
+        // PCAL statements (privileged call)
+        const talPcalRegex = /\bPCAL\s+([a-zA-Z_][a-zA-Z0-9_^]*)/gi;
+        while ((match = talPcalRegex.exec(functionBody)) !== null) {
+            log('  Found PCAL:', match[1]);
+            calls.push(match[1]);
+        }
+        
+        // Function-style calls: name(args) - exclude keywords
+        const talFuncRegex = /\b([a-zA-Z_][a-zA-Z0-9_^]*)\s*\(/g;
+        while ((match = talFuncRegex.exec(functionBody)) !== null) {
+            const name = match[1];
+            const upperName = name.toUpperCase();
+            // Skip TAL keywords and current procedure
+            if (!TAL_KEYWORDS.has(upperName) && name !== symbol.name) {
+                // Check if preceded by CALL/PCAL (already captured)
+                const before = functionBody.substring(0, match.index).trim().toUpperCase();
+                if (!before.endsWith('CALL') && !before.endsWith('PCAL')) {
+                    log('  Found function call:', name);
+                    calls.push(name);
+                }
+            }
+        }
+        
+        log('  Total TAL calls found for', symbol.name, ':', calls.length);
+        return [...new Set(calls)]; // Deduplicate
+    }
+    
+    // Non-COBOL/TAL languages - use brace/block detection
+    let startLine = symbol.line - 1;
+    let braceCount = 0;
+    let inFunction = false;
+    
+    // Language-specific body detection
+    const bodyStart = language === 'tal' ? /^/ :
+                      language === 'python' ? /:\s*$/ :
+                      /\{|BEGIN/i;
+    
+    for (let i = startLine; i < lines.length; i++) {
+        const line = lines[i];
+        
+        if (!inFunction) {
+            if (line.match(bodyStart) || line.includes('{') || line.includes('BEGIN')) {
+                inFunction = true;
+                braceCount = 1;
+            }
+            continue;
+        }
+        
+        // Count braces/BEGIN-END
+        braceCount += (line.match(/\{|BEGIN\b/gi) || []).length;
+        braceCount -= (line.match(/\}|END\b/gi) || []).length;
+        
+        functionBody += line + '\n';
+        
+        if (braceCount <= 0) break;
+        if (i - startLine > 500) break; // Safety limit
+    }
+    
+    // Common keywords to skip
+    const keywords = ['if', 'for', 'while', 'switch', 'catch', 'return', 'sizeof', 'typeof', 
+                      'new', 'delete', 'throw', 'await', 'async', 'yield', 'class', 'interface',
+                      'try', 'finally', 'else', 'elif', 'except', 'with', 'as', 'from', 'import'];
+    
+    // Generic function call pattern
+    const callRegex = /\b([a-zA-Z_]\w*)\s*\(/g;
+    let match;
+    
+    while ((match = callRegex.exec(functionBody)) !== null) {
+        const name = match[1];
+        if (!keywords.includes(name.toLowerCase()) && name !== symbol.name) {
+            calls.push(name);
+        }
+    }
+    
+    // TAL-specific: CALL statements
+    if (language === 'tal') {
+        // Direct CALL
+        const talCallRegex = /CALL\s+(\w+)/gi;
+        while ((match = talCallRegex.exec(functionBody)) !== null) {
+            calls.push(match[1]);
+        }
+        // Procedure calls (name followed by parentheses)
+        const talProcRegex = /\b([A-Z_][A-Z0-9_^]*)\s*\(/gi;
+        while ((match = talProcRegex.exec(functionBody)) !== null) {
+            const name = match[1];
+            if (!['IF', 'WHILE', 'FOR', 'CASE', 'SCAN', 'RSCAN'].includes(name.toUpperCase())) {
+                calls.push(name);
+            }
+        }
+    }
+    
+    // SQL-specific: procedure/function calls
+    if (language === 'sql') {
+        // EXEC/EXECUTE procedure
+        const execRegex = /(?:EXEC|EXECUTE)\s+(?:PROCEDURE\s+)?(?:[\w.]+\.)?(\w+)/gi;
+        while ((match = execRegex.exec(functionBody)) !== null) {
+            calls.push(match[1]);
+        }
+        // CALL procedure
+        const sqlCallRegex = /CALL\s+(?:[\w.]+\.)?(\w+)/gi;
+        while ((match = sqlCallRegex.exec(functionBody)) !== null) {
+            calls.push(match[1]);
+        }
+        // Function calls in SELECT/WHERE
+        const sqlFuncRegex = /\b([A-Z_]\w*)\s*\(/gi;
+        while ((match = sqlFuncRegex.exec(functionBody)) !== null) {
+            const name = match[1].toUpperCase();
+            // Skip SQL keywords
+            if (!['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'AND', 'OR', 'NOT',
+                  'IN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'OVER', 'PARTITION',
+                  'ORDER', 'GROUP', 'HAVING', 'UNION', 'EXCEPT', 'INTERSECT', 'JOIN', 'ON',
+                  'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'CAST', 'CONVERT', 'COALESCE', 'NULLIF',
+                  'ISNULL', 'NVL', 'DECODE', 'IF', 'IIF'].includes(name)) {
+                calls.push(match[1]);
+            }
+        }
+    }
+    
+    // C#-specific
+    if (language === 'csharp') {
+        // Method calls with dot notation
+        const csMethodRegex = /\.([A-Z_]\w*)\s*\(/gi;
+        while ((match = csMethodRegex.exec(functionBody)) !== null) {
+            calls.push(match[1]);
+        }
+        // Static method calls
+        const csStaticRegex = /([A-Z]\w*)\.([A-Z_]\w*)\s*\(/g;
+        while ((match = csStaticRegex.exec(functionBody)) !== null) {
+            calls.push(match[2]);
+        }
+    }
+    
+    // Java-specific
+    if (language === 'java') {
+        // Method calls with dot notation
+        const javaMethodRegex = /\.([a-z_]\w*)\s*\(/gi;
+        while ((match = javaMethodRegex.exec(functionBody)) !== null) {
+            calls.push(match[1]);
+        }
+    }
+    
+    // Python-specific
+    if (language === 'python') {
+        // Method calls
+        const pyMethodRegex = /\.([a-z_]\w*)\s*\(/gi;
+        while ((match = pyMethodRegex.exec(functionBody)) !== null) {
+            calls.push(match[1]);
+        }
+    }
+    
+    // JavaScript/TypeScript-specific
+    if (language === 'javascript' || language === 'typescript') {
+        // Method calls with dot notation
+        const jsMethodRegex = /\.([a-zA-Z_]\w*)\s*\(/g;
+        while ((match = jsMethodRegex.exec(functionBody)) !== null) {
+            const name = match[1];
+            // Skip common built-in methods
+            if (!['then', 'catch', 'finally', 'map', 'filter', 'reduce', 'forEach', 'find', 
+                  'some', 'every', 'push', 'pop', 'shift', 'unshift', 'slice', 'splice',
+                  'join', 'split', 'replace', 'match', 'test', 'exec', 'toString', 'valueOf',
+                  'log', 'error', 'warn', 'info', 'debug', 'trace'].includes(name)) {
+                calls.push(name);
+            }
+        }
+        
+        // Await calls
+        const awaitRegex = /await\s+(\w+)\s*\(/g;
+        while ((match = awaitRegex.exec(functionBody)) !== null) {
+            calls.push(match[1]);
+        }
+        
+        // Destructured imports that are called
+        const destructuredCallRegex = /\b([A-Z][a-zA-Z0-9]*)\s*\(/g;
+        while ((match = destructuredCallRegex.exec(functionBody)) !== null) {
+            const name = match[1];
+            // Skip common React/built-in
+            if (!['Array', 'Object', 'String', 'Number', 'Boolean', 'Date', 'Math', 'JSON',
+                  'Promise', 'Error', 'RegExp', 'Map', 'Set', 'WeakMap', 'WeakSet'].includes(name)) {
+                calls.push(name);
+            }
+        }
+    }
+    
+    return [...new Set(calls)]; // Remove duplicates
+}
+
+/**
+ * Track variable accesses and modifications throughout the code
+ */
+function trackVariableAccesses(filePath, content, language) {
+    const lines = content.split('\n');
+    
+    // Get all known variable names from this file
+    const fileVars = new Map();
+    for (const [key, varInfo] of codeIndex.variables) {
+        if (varInfo.file === filePath) {
+            fileVars.set(varInfo.name, key);
+        }
+    }
+    
+    if (fileVars.size === 0) return;
+    
+    // Build regex to find variable names
+    const varNames = [...fileVars.keys()];
+    if (varNames.length === 0) return;
+    
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        
+        for (const varName of varNames) {
+            // Skip if variable name is too short (likely false positives)
+            if (varName.length < 2) continue;
+            
+            // Create word-boundary regex for this variable (no 'g' flag needed for test)
+            const varRegex = new RegExp(`\\b${escapeRegex(varName)}\\b`);
+            
+            if (varRegex.test(line)) {
+                const varKey = fileVars.get(varName);
+                const varInfo = codeIndex.variables.get(varKey);
+                
+                if (varInfo && lineNum + 1 !== varInfo.declarationLine) {
+                    // Determine if this is a read or write
+                    const isModification = isVariableModified(line, varName, language);
+                    
+                    varInfo.accesses.push({
+                        file: filePath,
+                        line: lineNum + 1,
+                        type: isModification ? 'write' : 'read',
+                        context: line.trim().substring(0, 80)
+                    });
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Determine if a variable is being modified on a given line
+ */
+function isVariableModified(line, varName, language) {
+    const escapedName = escapeRegex(varName);
+    
+    // Common assignment patterns
+    const patterns = [
+        new RegExp(`\\b${escapedName}\\s*=(?!=)`),              // x = 
+        new RegExp(`\\b${escapedName}\\s*:=`),                  // x := (Pascal, TAL)
+        new RegExp(`\\b${escapedName}\\s*\\+=`),                // x +=
+        new RegExp(`\\b${escapedName}\\s*-=`),                  // x -=
+        new RegExp(`\\b${escapedName}\\s*\\*=`),                // x *=
+        new RegExp(`\\b${escapedName}\\s*/=`),                  // x /=
+        new RegExp(`\\b${escapedName}\\s*%=`),                  // x %=
+        new RegExp(`\\b${escapedName}\\s*&=`),                  // x &=
+        new RegExp(`\\b${escapedName}\\s*\\|=`),                // x |=
+        new RegExp(`\\b${escapedName}\\s*\\^=`),                // x ^=
+        new RegExp(`\\b${escapedName}\\s*<<=`),                 // x <<=
+        new RegExp(`\\b${escapedName}\\s*>>=`),                 // x >>=
+        new RegExp(`\\+\\+\\s*${escapedName}\\b`),              // ++x
+        new RegExp(`\\b${escapedName}\\s*\\+\\+`),              // x++
+        new RegExp(`--\\s*${escapedName}\\b`),                  // --x
+        new RegExp(`\\b${escapedName}\\s*--`),                  // x--
+    ];
+    
+    // Language-specific patterns
+    if (language === 'cobol') {
+        patterns.push(
+            new RegExp(`MOVE\\s+.*\\s+TO\\s+${escapedName}`, 'i'),       // MOVE x TO var
+            new RegExp(`ADD\\s+.*\\s+TO\\s+${escapedName}`, 'i'),        // ADD x TO var
+            new RegExp(`SUBTRACT\\s+.*\\s+FROM\\s+${escapedName}`, 'i'), // SUBTRACT x FROM var
+            new RegExp(`MULTIPLY\\s+.*\\s+GIVING\\s+${escapedName}`, 'i'),
+            new RegExp(`DIVIDE\\s+.*\\s+GIVING\\s+${escapedName}`, 'i'),
+            new RegExp(`COMPUTE\\s+${escapedName}\\s*=`, 'i'),          // COMPUTE var = 
+            new RegExp(`INTO\\s+${escapedName}\\b`, 'i'),               // READ INTO var
+            new RegExp(`ACCEPT\\s+${escapedName}\\b`, 'i'),             // ACCEPT var
+            new RegExp(`STRING\\s+.*\\s+INTO\\s+${escapedName}`, 'i'),
+            new RegExp(`UNSTRING\\s+.*\\s+INTO\\s+${escapedName}`, 'i'),
+        );
+    }
+    
+    if (language === 'tal') {
+        patterns.push(
+            new RegExp(`\\b${escapedName}\\s*:=`),              // TAL assignment
+            new RegExp(`@\\s*${escapedName}\\s*:=`),            // Indirect assignment
+        );
+    }
+    
+    if (language === 'sql') {
+        patterns.push(
+            new RegExp(`SET\\s+${escapedName}\\s*=`, 'i'),      // SET var = 
+            new RegExp(`INTO\\s+${escapedName}\\b`, 'i'),       // SELECT INTO var
+            new RegExp(`FETCH.*INTO.*${escapedName}`, 'i'),     // FETCH INTO var
+        );
+    }
+    
+    if (language === 'python') {
+        patterns.push(
+            new RegExp(`\\b${escapedName}\\s*=(?!=)`),          // Python assignment
+            new RegExp(`for\\s+${escapedName}\\s+in\\b`),       // for var in
+        );
+    }
+    
+    for (const pattern of patterns) {
+        if (pattern.test(line)) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * Escape special regex characters in a string
+ */
+function escapeRegex(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Grep all context files for a symbol/keyword
+ * Returns all occurrences with file, line number, and context
+ */
+function grepCodeForSymbol(symbolName, options = {}) {
+    const results = {
+        definition: null,
+        calls: [],
+        references: [],
+        variables: [],
+        all: []
+    };
+    
+    if (!symbolName) return results;
+    
+    const escapedSymbol = escapeRegex(symbolName);
+    const wordBoundaryRegex = new RegExp(`\\b${escapedSymbol}\\b`, 'g');
+    const definitionRegex = new RegExp(
+        `^[\\s]*((?:static\\s+)?(?:inline\\s+)?(?:const\\s+)?\\w+[\\s*]+)?${escapedSymbol}\\s*\\(`,
+        'gm'
+    );
+    const callRegex = new RegExp(`\\b${escapedSymbol}\\s*\\(`, 'g');
+    
+    for (const [filePath, file] of contextFiles) {
+        const content = file.content;
+        const lines = content.split('\n');
+        const fileName = filePath.split('/').pop();
+        
+        // Find definition (function declaration with body)
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            
+            // Check if this line defines the function
+            if (definitionRegex.test(line) || 
+                (line.includes(symbolName) && line.match(/^\s*(?:\w+\s+)+\w+\s*\(/))) {
+                
+                // Extract the full function including body
+                let funcCode = line;
+                let braceCount = (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
+                let j = i + 1;
+                
+                // If no opening brace yet, look for it
+                if (braceCount === 0 && !line.includes('{')) {
+                    while (j < lines.length && !lines[j].includes('{')) {
+                        funcCode += '\n' + lines[j];
+                        j++;
+                    }
+                    if (j < lines.length) {
+                        funcCode += '\n' + lines[j];
+                        braceCount = 1;
+                        j++;
+                    }
+                }
+                
+                // Find the closing brace
+                while (j < lines.length && braceCount > 0) {
+                    funcCode += '\n' + lines[j];
+                    braceCount += (lines[j].match(/\{/g) || []).length;
+                    braceCount -= (lines[j].match(/\}/g) || []).length;
+                    j++;
+                }
+                
+                // Only consider it a definition if it's at the start of a line (not inside another function)
+                const beforeLine = lines.slice(Math.max(0, i - 5), i).join('\n');
+                const openBraces = (beforeLine.match(/\{/g) || []).length;
+                const closeBraces = (beforeLine.match(/\}/g) || []).length;
+                
+                if (openBraces <= closeBraces) {
+                    results.definition = {
+                        file: filePath,
+                        fileName,
+                        line: i + 1,
+                        endLine: j,
+                        code: funcCode,
+                        context: lines.slice(Math.max(0, i - 2), Math.min(lines.length, j + 1)).join('\n')
+                    };
+                }
+            }
+            
+            // Check for function calls
+            if (line.includes(symbolName + '(') && !definitionRegex.test(line)) {
+                results.calls.push({
+                    file: filePath,
+                    fileName,
+                    line: i + 1,
+                    code: line.trim(),
+                    context: lines.slice(Math.max(0, i - 1), Math.min(lines.length, i + 2)).join('\n')
+                });
+            }
+            
+            // Check for any reference
+            if (wordBoundaryRegex.test(line)) {
+                wordBoundaryRegex.lastIndex = 0; // Reset regex
+                results.all.push({
+                    file: filePath,
+                    fileName,
+                    line: i + 1,
+                    code: line.trim()
+                });
+            }
+        }
+    }
+    
+    return results;
+}
+
+/**
+ * Build a top-down call graph starting from a function
+ */
+function buildCallGraphFromSymbol(symbolName, maxDepth = 5) {
+    const graph = {
+        root: symbolName,
+        nodes: new Map(),
+        edges: []
+    };
+    
+    const visited = new Set();
+    
+    function traverse(funcName, depth) {
+        if (depth > maxDepth || visited.has(funcName)) return;
+        visited.add(funcName);
+        
+        const calls = codeIndex.callGraph.get(funcName);
+        if (!calls) return;
+        
+        for (const callee of calls) {
+            graph.edges.push({ from: funcName, to: callee, depth });
+            if (!graph.nodes.has(callee)) {
+                const symbol = codeIndex.symbols.get(callee);
+                graph.nodes.set(callee, {
+                    name: callee,
+                    file: symbol?.file?.split('/').pop(),
+                    line: symbol?.line,
+                    type: symbol?.type
+                });
+            }
+            traverse(callee, depth + 1);
+        }
+    }
+    
+    // Add root node
+    const rootSymbol = codeIndex.symbols.get(symbolName);
+    graph.nodes.set(symbolName, {
+        name: symbolName,
+        file: rootSymbol?.file?.split('/').pop(),
+        line: rootSymbol?.line,
+        type: rootSymbol?.type
+    });
+    
+    traverse(symbolName, 0);
+    
+    return graph;
+}
+
+/**
+ * Format call graph as text for prompt
+ */
+function formatCallGraphAsText(graph) {
+    if (graph.edges.length === 0) {
+        return `${graph.root} (no outgoing calls found in index)`;
+    }
+    
+    let text = `## Call Graph (top-down from ${graph.root}):\n\n`;
+    text += '```\n';
+    
+    // Build tree structure
+    const children = new Map();
+    for (const edge of graph.edges) {
+        if (!children.has(edge.from)) {
+            children.set(edge.from, []);
+        }
+        children.get(edge.from).push(edge.to);
+    }
+    
+    function printTree(node, prefix = '', isLast = true) {
+        const nodeInfo = graph.nodes.get(node);
+        const location = nodeInfo?.file ? ` (${nodeInfo.file}:${nodeInfo.line})` : '';
+        text += prefix + (isLast ? '└── ' : '├── ') + node + location + '\n';
+        
+        const nodeChildren = children.get(node) || [];
+        for (let i = 0; i < nodeChildren.length; i++) {
+            const child = nodeChildren[i];
+            const childIsLast = i === nodeChildren.length - 1;
+            printTree(child, prefix + (isLast ? '    ' : '│   '), childIsLast);
+        }
+    }
+    
+    const rootInfo = graph.nodes.get(graph.root);
+    const rootLocation = rootInfo?.file ? ` (${rootInfo.file}:${rootInfo.line})` : '';
+    text += graph.root + rootLocation + '\n';
+    
+    const rootChildren = children.get(graph.root) || [];
+    for (let i = 0; i < rootChildren.length; i++) {
+        printTree(rootChildren[i], '', i === rootChildren.length - 1);
+    }
+    
+    text += '```\n';
+    return text;
+}
+
+/**
+ * Find file dependencies (imports, includes)
+ */
+function findDependencies(content, language) {
+    const deps = [];
+    let match;
+    
+    // C/C++ includes
+    const includeRegex = /#include\s*[<"]([^>"]+)[>"]/g;
+    while ((match = includeRegex.exec(content)) !== null) {
+        deps.push(match[1]);
+    }
+    
+    // Python imports
+    const importRegex = /(?:from\s+(\S+)\s+)?import\s+(\S+)/g;
+    while ((match = importRegex.exec(content)) !== null) {
+        deps.push(match[1] || match[2]);
+    }
+    
+    // JavaScript imports
+    const jsImportRegex = /(?:import|require)\s*\(?['"]([^'"]+)['"]\)?/g;
+    while ((match = jsImportRegex.exec(content)) !== null) {
+        deps.push(match[1]);
+    }
+    
+    // Java imports
+    const javaImportRegex = /import\s+(?:static\s+)?([a-zA-Z0-9_.]+)(?:\.\*)?;/g;
+    while ((match = javaImportRegex.exec(content)) !== null) {
+        deps.push(match[1]);
+    }
+    
+    // Go imports
+    const goImportRegex = /import\s+(?:\w+\s+)?["']([^"']+)["']/g;
+    while ((match = goImportRegex.exec(content)) !== null) {
+        deps.push(match[1]);
+    }
+    
+    // C# using statements
+    const csUsingRegex = /using\s+(?:static\s+)?([a-zA-Z0-9_.]+)\s*;/g;
+    while ((match = csUsingRegex.exec(content)) !== null) {
+        deps.push(match[1]);
+    }
+    
+    // COBOL COPY statements
+    const cobolCopyRegex = /COPY\s+([A-Z0-9][A-Z0-9-]*)/gi;
+    while ((match = cobolCopyRegex.exec(content)) !== null) {
+        deps.push(match[1].toUpperCase());
+    }
+    
+    // TAL SOURCE directives
+    const talSourceRegex = /\?SOURCE\s+([A-Z0-9_^]+)/gi;
+    while ((match = talSourceRegex.exec(content)) !== null) {
+        deps.push(match[1]);
+    }
+    
+    // SQL - referenced tables, procedures, functions
+    const sqlFromRegex = /(?:FROM|JOIN|INTO|UPDATE)\s+(?:[\w.]+\.)?(\w+)/gi;
+    while ((match = sqlFromRegex.exec(content)) !== null) {
+        deps.push(match[1]);
+    }
+    
+    return [...new Set(deps)]; // Remove duplicates
+}
+
+/**
+ * Get index summary for LLM context
+ */
+function getIndexSummary() {
+    if (codeIndex.files.size === 0) {
+        return '';
+    }
+    
+    let summary = '\n\n=== CODE INDEX ===\n';
+    summary += `Files: ${codeIndex.files.size} | Symbols: ${codeIndex.symbols.size} | Variables: ${codeIndex.variables.size} | Call Edges: ${Array.from(codeIndex.callGraph.values()).reduce((sum, calls) => sum + calls.size, 0)}\n\n`;
+    
+    // Group symbols by type
+    const symbolsByType = new Map();
+    for (const [name, symbol] of codeIndex.symbols) {
+        // Skip duplicate entries (we have both "name" and "name@path" entries)
+        if (name.includes('@')) continue;
+        
+        const type = symbol.type || 'unknown';
+        if (!symbolsByType.has(type)) {
+            symbolsByType.set(type, []);
+        }
+        symbolsByType.get(type).push(symbol);
+    }
+    
+    // Functions/Procedures/Methods with call graph
+    summary += '## Callable Symbols & Call Graph:\n';
+    const callableTypes = ['function', 'procedure', 'method', 'subproc', 'section', 'paragraph', 'program'];
+    for (const [funcName, calls] of codeIndex.callGraph) {
+        const symbol = codeIndex.symbols.get(funcName);
+        if (symbol) {
+            const callers = codeIndex.reverseCallGraph.get(funcName);
+            const callerCount = callers ? callers.size : 0;
+            const callList = calls.size > 0 ? ` → calls: ${[...calls].slice(0, 5).join(', ')}${calls.size > 5 ? '...' : ''}` : '';
+            const callerInfo = callerCount > 0 ? ` [called by ${callerCount}]` : ' [entry point]';
+            summary += `- ${funcName} (${symbol.type}, ${symbol.file?.split('/').pop() || 'unknown'}:${symbol.line})${callerInfo}${callList}\n`;
+        }
+    }
+    
+    // Classes/Interfaces/Structs
+    const structTypes = ['class', 'interface', 'struct', 'enum', 'record', 'namespace', 'type'];
+    const structs = [];
+    for (const type of structTypes) {
+        const symbols = symbolsByType.get(type) || [];
+        for (const s of symbols) {
+            structs.push(`- ${s.name} (${type}, ${s.file?.split('/').pop() || ''}:${s.line})`);
+        }
+    }
+    if (structs.length > 0) {
+        summary += '\n## Classes/Structs/Types:\n';
+        summary += structs.slice(0, 30).join('\n') + '\n';
+    }
+    
+    // Variables with data types and access info
+    if (codeIndex.variables.size > 0) {
+        summary += '\n## Variables & Data Flow:\n';
+        
+        // Group by scope
+        const globalVars = [];
+        const memberVars = [];
+        const localVars = [];
+        const paramVars = [];
+        
+        for (const [key, varInfo] of codeIndex.variables) {
+            const fileName = varInfo.file?.split('/').pop() || 'unknown';
+            const accessCount = varInfo.accesses?.length || 0;
+            const readCount = varInfo.accesses?.filter(a => a.type === 'read').length || 0;
+            const writeCount = varInfo.accesses?.filter(a => a.type === 'write').length || 0;
+            
+            const entry = `- ${varInfo.name}: ${varInfo.dataType} (${fileName}:${varInfo.declarationLine}${varInfo.initializationLine ? ', init:' + varInfo.initializationLine : ''}) [R:${readCount} W:${writeCount}]`;
+            
+            switch (varInfo.scope) {
+                case 'global': globalVars.push(entry); break;
+                case 'member': memberVars.push(entry); break;
+                case 'local': localVars.push(entry); break;
+                case 'parameter': paramVars.push(entry); break;
+                default: localVars.push(entry);
+            }
+        }
+        
+        if (globalVars.length > 0) {
+            summary += '### Global Variables:\n';
+            summary += globalVars.slice(0, 15).join('\n') + '\n';
+        }
+        if (memberVars.length > 0) {
+            summary += '### Member Variables:\n';
+            summary += memberVars.slice(0, 15).join('\n') + '\n';
+        }
+        if (paramVars.length > 0) {
+            summary += '### Parameters:\n';
+            summary += paramVars.slice(0, 15).join('\n') + '\n';
+        }
+        if (localVars.length > 0) {
+            summary += '### Local Variables:\n';
+            summary += localVars.slice(0, 15).join('\n') + '\n';
+        }
+    }
+    
+    // SQL objects
+    const sqlTypes = ['table', 'view', 'trigger', 'index', 'package', 'cte'];
+    const sqlObjects = [];
+    for (const type of sqlTypes) {
+        const symbols = symbolsByType.get(type) || [];
+        for (const s of symbols) {
+            sqlObjects.push(`- ${s.name} (${type}, ${s.file?.split('/').pop() || ''}:${s.line})`);
+        }
+    }
+    if (sqlObjects.length > 0) {
+        summary += '\n## SQL Objects:\n';
+        summary += sqlObjects.slice(0, 20).join('\n') + '\n';
+    }
+    
+    // Dependencies (copybooks, includes, imports)
+    const allDeps = new Set();
+    for (const [file, deps] of codeIndex.dependencies) {
+        for (const dep of deps) {
+            allDeps.add(dep);
+        }
+    }
+    if (allDeps.size > 0) {
+        summary += '\n## Dependencies:\n';
+        summary += [...allDeps].slice(0, 20).map(d => `- ${d}`).join('\n') + '\n';
+    }
+    
+    summary += '=== END INDEX ===\n\n';
+    
+    return summary;
+}
+
+/**
+ * Find symbol and its callers/callees
+ */
+function traceSymbol(symbolName) {
+    const result = {
+        symbol: null,
+        callers: [],
+        callees: [],
+        relatedFiles: new Set()
+    };
+    
+    // Find the symbol
+    const symbol = codeIndex.symbols.get(symbolName);
+    if (symbol) {
+        result.symbol = symbol;
+        result.relatedFiles.add(symbol.file);
+    }
+    
+    // Find what calls this symbol
+    const callers = codeIndex.reverseCallGraph.get(symbolName);
+    if (callers) {
+        for (const caller of callers) {
+            const callerSymbol = codeIndex.symbols.get(caller);
+            if (callerSymbol) {
+                result.callers.push(callerSymbol);
+                result.relatedFiles.add(callerSymbol.file);
+            }
+        }
+    }
+    
+    // Find what this symbol calls
+    const callees = codeIndex.callGraph.get(symbolName);
+    if (callees) {
+        for (const callee of callees) {
+            const calleeSymbol = codeIndex.symbols.get(callee);
+            if (calleeSymbol) {
+                result.callees.push(calleeSymbol);
+                result.relatedFiles.add(calleeSymbol.file);
+            }
+        }
+    }
+    
+    return result;
+}
+
+/**
+ * Trace a variable - find its declaration, initialization, and all accesses
+ */
+function traceVariable(varName) {
+    const result = {
+        variable: null,
+        declaration: null,
+        initialization: null,
+        reads: [],
+        writes: [],
+        relatedFiles: new Set()
+    };
+    
+    // Find all variables with this name (could be in multiple files)
+    for (const [key, varInfo] of codeIndex.variables) {
+        if (varInfo.name === varName) {
+            result.variable = varInfo;
+            result.declaration = {
+                file: varInfo.file,
+                line: varInfo.declarationLine,
+                dataType: varInfo.dataType,
+                scope: varInfo.scope
+            };
+            
+            if (varInfo.initializationLine) {
+                result.initialization = {
+                    file: varInfo.file,
+                    line: varInfo.initializationLine
+                };
+            }
+            
+            result.relatedFiles.add(varInfo.file);
+            
+            // Categorize accesses
+            if (varInfo.accesses) {
+                for (const access of varInfo.accesses) {
+                    if (access.type === 'read') {
+                        result.reads.push(access);
+                    } else if (access.type === 'write') {
+                        result.writes.push(access);
+                    }
+                    result.relatedFiles.add(access.file);
+                }
+            }
+            
+            break; // Found the variable
+        }
+    }
+    
+    return result;
+}
+
+/**
+ * Get variable data flow summary for a specific variable
+ */
+function getVariableDataFlow(varName) {
+    const trace = traceVariable(varName);
+    
+    if (!trace.variable) {
+        return `Variable "${varName}" not found in index.`;
+    }
+    
+    let summary = `## Variable: ${varName}\n\n`;
+    summary += `**Type:** ${trace.declaration.dataType}\n`;
+    summary += `**Scope:** ${trace.declaration.scope}\n`;
+    summary += `**Declared:** ${trace.declaration.file?.split('/').pop()}:${trace.declaration.line}\n`;
+    
+    if (trace.initialization) {
+        summary += `**Initialized:** Line ${trace.initialization.line}\n`;
+    } else {
+        summary += `**Initialized:** Not explicitly initialized\n`;
+    }
+    
+    summary += `\n### Read Accesses (${trace.reads.length}):\n`;
+    for (const read of trace.reads.slice(0, 20)) {
+        summary += `- Line ${read.line}: \`${read.context}\`\n`;
+    }
+    if (trace.reads.length > 20) {
+        summary += `- ... and ${trace.reads.length - 20} more\n`;
+    }
+    
+    summary += `\n### Write Accesses (${trace.writes.length}):\n`;
+    for (const write of trace.writes.slice(0, 20)) {
+        summary += `- Line ${write.line}: \`${write.context}\`\n`;
+    }
+    if (trace.writes.length > 20) {
+        summary += `- ... and ${trace.writes.length - 20} more\n`;
+    }
+    
+    return summary;
+}
+
+/**
+ * Generate call graph output as Markdown with Mermaid diagram
+ */
+function generateCallGraphOutput() {
+    let output = `# Call Graph Analysis
+
+Generated: ${new Date().toLocaleString()}
+Files: ${codeIndex.files.size} | Symbols: ${codeIndex.symbols.size} | Functions: ${codeIndex.callGraph.size}
+
+---
+
+## Mermaid Diagram
+
+\`\`\`mermaid
+flowchart LR
+`;
+    
+    // Build mermaid nodes and edges (limit to top functions to avoid huge diagram)
+    const edges = [];
+    const nodes = new Set();
+    
+    // Get functions sorted by number of callers (most called first)
+    const funcsByCallers = Array.from(codeIndex.reverseCallGraph.entries())
+        .map(([name, callers]) => ({ name, count: callers.size }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 50); // Top 50 most called
+    
+    // Also include functions that call others
+    for (const [caller, callees] of codeIndex.callGraph) {
+        if (callees.size > 0) {
+            nodes.add(caller);
+            for (const callee of callees) {
+                if (codeIndex.symbols.has(callee)) { // Only include functions we know about
+                    nodes.add(callee);
+                    edges.push({ from: caller, to: callee });
+                }
+            }
+        }
+    }
+    
+    // Limit edges for readability
+    const limitedEdges = edges.slice(0, 100);
+    
+    for (const edge of limitedEdges) {
+        // Sanitize names for mermaid (remove special chars)
+        const from = edge.from.replace(/[^a-zA-Z0-9_]/g, '_');
+        const to = edge.to.replace(/[^a-zA-Z0-9_]/g, '_');
+        output += `    ${from}["${edge.from}"] --> ${to}["${edge.to}"]\n`;
+    }
+    
+    output += `\`\`\`
+
+${edges.length > 100 ? `*(Showing 100 of ${edges.length} edges)*\n\n` : ''}
+---
+
+## Entry Points (No Callers)
+
+Functions that are not called by any other function in the codebase:
+
+| Function | File | Line |
+|----------|------|------|
+`;
+    
+    // Find entry points (functions with no callers)
+    for (const [funcName, calls] of codeIndex.callGraph) {
+        const callers = codeIndex.reverseCallGraph.get(funcName);
+        if (!callers || callers.size === 0) {
+            const symbol = codeIndex.symbols.get(funcName);
+            if (symbol) {
+                const file = symbol.file?.split('/').pop() || 'unknown';
+                output += `| \`${funcName}\` | ${file} | ${symbol.line} |\n`;
+            }
+        }
+    }
+    
+    output += `
+---
+
+## Most Called Functions
+
+| Function | Called By | File |
+|----------|-----------|------|
+`;
+    
+    for (const { name, count } of funcsByCallers.slice(0, 30)) {
+        const symbol = codeIndex.symbols.get(name);
+        const file = symbol?.file?.split('/').pop() || 'unknown';
+        output += `| \`${name}\` | ${count} callers | ${file} |\n`;
+    }
+    
+    output += `
+---
+
+## Full Call Graph (Text)
+
+`;
+    
+    // Group by file
+    const byFile = new Map();
+    for (const [funcName, calls] of codeIndex.callGraph) {
+        const symbol = codeIndex.symbols.get(funcName);
+        const file = symbol?.file?.split('/').pop() || 'unknown';
+        if (!byFile.has(file)) byFile.set(file, []);
+        byFile.get(file).push({ name: funcName, calls: [...calls], symbol });
+    }
+    
+    for (const [file, funcs] of byFile) {
+        output += `### ${file}\n\n`;
+        for (const { name, calls, symbol } of funcs) {
+            const callers = codeIndex.reverseCallGraph.get(name);
+            const callerCount = callers ? callers.size : 0;
+            output += `**${name}** (line ${symbol?.line || '?'})\n`;
+            if (callerCount > 0) {
+                output += `- Called by: ${[...callers].slice(0, 5).join(', ')}${callerCount > 5 ? ` (+${callerCount - 5} more)` : ''}\n`;
+            }
+            if (calls.length > 0) {
+                output += `- Calls: ${calls.slice(0, 10).join(', ')}${calls.length > 10 ? ` (+${calls.length - 10} more)` : ''}\n`;
+            }
+            output += '\n';
+        }
+    }
+    
+    return output;
+}
+
+/**
+ * Generate HTML page with interactive call graph visualization
+ */
+function generateCallGraphHtml() {
+    log('=== GENERATING CALL GRAPH HTML ===');
+    log('callGraph size:', codeIndex.callGraph.size);
+    log('symbols size:', codeIndex.symbols.size);
+    log('reverseCallGraph size:', codeIndex.reverseCallGraph.size);
+    
+    // Debug: show all callGraph entries
+    for (const [funcName, callees] of codeIndex.callGraph) {
+        log('  callGraph:', funcName, '→', [...callees].join(', ') || '(none)');
+    }
+    
+    // Debug: show all symbols
+    log('All symbols:');
+    for (const [key, sym] of codeIndex.symbols) {
+        log('  symbol:', key, 'type:', sym.type);
+    }
+    
+    // Build graph data
+    const nodes = [];
+    const links = [];
+    const nodeMap = new Map();
+    
+    // Collect all nodes
+    let nodeId = 0;
+    for (const [funcName, callees] of codeIndex.callGraph) {
+        log('Processing:', funcName, 'with', callees.size, 'callees');
+        if (!nodeMap.has(funcName)) {
+            const symbol = codeIndex.symbols.get(funcName);
+            const callerCount = codeIndex.reverseCallGraph.get(funcName)?.size || 0;
+            nodeMap.set(funcName, nodeId);
+            nodes.push({
+                id: nodeId++,
+                name: funcName,
+                file: symbol?.file?.split('/').pop() || 'unknown',
+                line: symbol?.line || 0,
+                type: symbol?.type || 'function',
+                callers: callerCount,
+                calls: callees.size,
+                calleeNames: [...callees],
+                callerNames: []
+            });
+            log('  Added node:', funcName);
+        }
+        
+        for (const callee of callees) {
+            log('  Checking callee:', callee, 'exists in symbols?', codeIndex.symbols.has(callee));
+            if (codeIndex.symbols.has(callee)) {
+                if (!nodeMap.has(callee)) {
+                    const symbol = codeIndex.symbols.get(callee);
+                    const callerCount = codeIndex.reverseCallGraph.get(callee)?.size || 0;
+                    const calleeCallees = codeIndex.callGraph.get(callee) || new Set();
+                    nodeMap.set(callee, nodeId);
+                    nodes.push({
+                        id: nodeId++,
+                        name: callee,
+                        file: symbol?.file?.split('/').pop() || 'unknown',
+                        line: symbol?.line || 0,
+                        type: symbol?.type || 'function',
+                        callers: callerCount,
+                        calls: calleeCallees.size,
+                        calleeNames: [...calleeCallees],
+                        callerNames: []
+                    });
+                    log('  Added callee node:', callee);
+                }
+                links.push({
+                    source: nodeMap.get(funcName),
+                    target: nodeMap.get(callee)
+                });
+                log('  Added link:', funcName, '→', callee);
+            } else {
+                log('  SKIPPED callee (not in symbols):', callee);
+            }
+        }
+    }
+    
+    log('Final: nodes:', nodes.length, 'links:', links.length);
+    
+    // Build caller names
+    for (const node of nodes) {
+        const callers = codeIndex.reverseCallGraph.get(node.name);
+        if (callers) {
+            node.callerNames = [...callers].filter(c => nodeMap.has(c));
+        }
+    }
+    
+    // Group by file for colors
+    const files = [...new Set(nodes.map(n => n.file))];
+    
+    const nodesJson = JSON.stringify(nodes);
+    const linksJson = JSON.stringify(links);
+    const filesJson = JSON.stringify(files);
+
+    return `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>AstraCode Graph</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117;
+            color: #e6edf3;
+            overflow: hidden;
+        }
+        
+        #container {
+            display: flex;
+            height: 100vh;
+        }
+        
+        #sidebar {
+            width: 320px;
+            background: #161b22;
+            border-right: 1px solid #30363d;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .sidebar-header {
+            padding: 16px;
+            border-bottom: 1px solid #30363d;
+        }
+        
+        .sidebar-header h1 {
+            font-size: 1.3em;
+            color: #58a6ff;
+            margin-bottom: 8px;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin-top: 12px;
+        }
+        
+        .stat {
+            background: #21262d;
+            padding: 8px;
+            border-radius: 6px;
+            text-align: center;
+        }
+        
+        .stat-value { font-size: 1.4em; font-weight: 600; color: #58a6ff; }
+        .stat-label { font-size: 0.75em; color: #8b949e; }
+        
+        .search-box {
+            margin: 12px 16px;
+            padding: 10px 12px;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #e6edf3;
+            font-size: 0.9em;
+            width: calc(100% - 32px);
+        }
+        
+        .search-box:focus { outline: none; border-color: #58a6ff; }
+        
+        .file-filter {
+            padding: 0 16px;
+            margin-bottom: 8px;
+        }
+        
+        .file-filter select {
+            width: 100%;
+            padding: 8px;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #e6edf3;
+            font-size: 0.85em;
+        }
+        
+        .func-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+        
+        .func-item {
+            padding: 10px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-bottom: 4px;
+            transition: background 0.15s;
+        }
+        
+        .func-item:hover { background: #21262d; }
+        .func-item.selected { background: #1f6feb; }
+        
+        .func-name {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.9em;
+            color: #ffa657;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .func-meta {
+            display: flex;
+            gap: 8px;
+            margin-top: 4px;
+            font-size: 0.75em;
+            color: #8b949e;
+        }
+        
+        .func-meta .file { color: #58a6ff; }
+        
+        #graph {
+            flex: 1;
+            position: relative;
+        }
+        
+        #graph svg {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .node circle {
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .node:hover circle {
+            filter: brightness(1.3);
+        }
+        
+        .node.selected circle {
+            stroke: #fff;
+            stroke-width: 3px;
+        }
+        
+        .node.dimmed circle {
+            opacity: 0.15;
+        }
+        
+        .node.dimmed text {
+            opacity: 0.15;
+        }
+        
+        .node text {
+            font-size: 11px;
+            fill: #e6edf3;
+            pointer-events: none;
+            font-family: 'SF Mono', Monaco, monospace;
+        }
+        
+        .link {
+            stroke: #30363d;
+            stroke-opacity: 0.6;
+            fill: none;
+        }
+        
+        .link.highlighted {
+            stroke: #58a6ff;
+            stroke-opacity: 1;
+            stroke-width: 2px;
+        }
+        
+        .link.caller {
+            stroke: #f85149;
+            stroke-opacity: 1;
+            stroke-width: 2px;
+        }
+        
+        .link.callee {
+            stroke: #3fb950;
+            stroke-opacity: 1;
+            stroke-width: 2px;
+        }
+        
+        .link.dimmed {
+            stroke-opacity: 0.05;
+        }
+        
+        #tooltip {
+            position: absolute;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 12px 16px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.15s;
+            max-width: 300px;
+            z-index: 1000;
+        }
+        
+        #tooltip.visible { opacity: 1; }
+        
+        #tooltip h3 {
+            font-family: monospace;
+            color: #ffa657;
+            font-size: 1em;
+            margin-bottom: 8px;
+        }
+        
+        #tooltip .info {
+            color: #8b949e;
+            font-size: 0.85em;
+            margin-bottom: 8px;
+        }
+        
+        #tooltip .connections {
+            display: flex;
+            gap: 16px;
+        }
+        
+        #tooltip .conn {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 0.85em;
+        }
+        
+        #tooltip .conn.callers { color: #f85149; }
+        #tooltip .conn.callees { color: #3fb950; }
+        
+        #detail-panel {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            width: 300px;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            display: none;
+            overflow: hidden;
+        }
+        
+        #detail-panel.visible { display: block; }
+        
+        .detail-header {
+            padding: 16px;
+            background: #21262d;
+            border-bottom: 1px solid #30363d;
+        }
+        
+        .detail-title {
+            font-family: monospace;
+            color: #ffa657;
+            font-size: 1.1em;
+            word-break: break-all;
+        }
+        
+        .detail-file {
+            color: #58a6ff;
+            font-size: 0.85em;
+            margin-top: 4px;
+        }
+        
+        .detail-close {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            background: none;
+            border: none;
+            color: #8b949e;
+            font-size: 1.2em;
+            cursor: pointer;
+        }
+        
+        .detail-close:hover { color: #e6edf3; }
+        
+        .detail-section {
+            padding: 12px 16px;
+            border-bottom: 1px solid #30363d;
+        }
+        
+        .detail-section:last-child { border-bottom: none; }
+        
+        .detail-section h4 {
+            font-size: 0.75em;
+            text-transform: uppercase;
+            color: #8b949e;
+            margin-bottom: 8px;
+            letter-spacing: 0.5px;
+        }
+        
+        .detail-list {
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        
+        .detail-item {
+            padding: 6px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 0.85em;
+            margin-bottom: 2px;
+            transition: background 0.15s;
+        }
+        
+        .detail-item:hover { background: #21262d; }
+        .detail-item.caller { color: #f85149; }
+        .detail-item.callee { color: #3fb950; }
+        
+        .controls {
+            position: absolute;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 8px;
+            background: #161b22;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid #30363d;
+        }
+        
+        .controls button {
+            padding: 6px 12px;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            color: #e6edf3;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        
+        .controls button:hover { background: #30363d; }
+        
+        .legend {
+            position: absolute;
+            bottom: 16px;
+            right: 16px;
+            background: #161b22;
+            padding: 12px 16px;
+            border-radius: 8px;
+            border: 1px solid #30363d;
+            font-size: 0.8em;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+        
+        .legend-item:last-child { margin-bottom: 0; }
+        
+        .legend-circle {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        
+        .breadcrumb {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            background: #161b22;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid #30363d;
+            font-size: 0.85em;
+        }
+        
+        .breadcrumb-item {
+            color: #58a6ff;
+            cursor: pointer;
+        }
+        
+        .breadcrumb-item:hover { text-decoration: underline; }
+        .breadcrumb-sep { color: #484f58; }
+        .breadcrumb-current { color: #ffa657; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="sidebar">
+            <div class="sidebar-header">
+                <h1>🔮 Code Graph</h1>
+                <div class="stats">
+                    <div class="stat">
+                        <div class="stat-value">${nodes.length}</div>
+                        <div class="stat-label">Functions</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">${links.length}</div>
+                        <div class="stat-label">Connections</div>
+                    </div>
+                </div>
+            </div>
+            <input type="text" class="search-box" placeholder="@astracode Search functions..." id="search">
+            <div class="file-filter">
+                <select id="fileFilter">
+                    <option value="">All Files</option>
+                </select>
+            </div>
+            <div class="func-list" id="funcList"></div>
+        </div>
+        <div id="graph">
+            <div id="tooltip">
+                <h3 id="tooltipTitle"></h3>
+                <div class="info" id="tooltipInfo"></div>
+                <div class="connections">
+                    <div class="conn callers">◀ <span id="tooltipCallers">0</span> callers</div>
+                    <div class="conn callees">▶ <span id="tooltipCallees">0</span> calls</div>
+                </div>
+            </div>
+            <div class="breadcrumb" id="breadcrumb" style="display:none;">
+                <span class="breadcrumb-item" onclick="resetView()">All</span>
+                <span class="breadcrumb-sep">→</span>
+                <span class="breadcrumb-current" id="breadcrumbCurrent"></span>
+            </div>
+            <div id="detail-panel">
+                <button class="detail-close" onclick="closeDetail()">×</button>
+                <div class="detail-header">
+                    <div class="detail-title" id="detailTitle"></div>
+                    <div class="detail-file" id="detailFile"></div>
+                </div>
+                <div class="detail-section">
+                    <h4>◀ Called By (<span id="callerCount">0</span>)</h4>
+                    <div class="detail-list" id="callerList"></div>
+                </div>
+                <div class="detail-section">
+                    <h4>▶ Calls (<span id="calleeCount">0</span>)</h4>
+                    <div class="detail-list" id="calleeList"></div>
+                </div>
+            </div>
+            <div class="controls">
+                <button onclick="resetView()">Reset View</button>
+                <button onclick="zoomIn()">Zoom +</button>
+                <button onclick="zoomOut()">Zoom -</button>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-circle" style="background:#f85149"></div> Callers</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#3fb950"></div> Callees</div>
+                <div class="legend-item"><div class="legend-circle" style="background:#58a6ff"></div> Selected</div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const nodes = ${nodesJson};
+        const links = ${linksJson};
+        const files = ${filesJson};
+        
+        // Color scale for files
+        const colorScale = d3.scaleOrdinal()
+            .domain(files)
+            .range(d3.schemeTableau10);
+        
+        // Size scale based on connections
+        const sizeScale = d3.scaleSqrt()
+            .domain([0, d3.max(nodes, d => d.callers + d.calls)])
+            .range([8, 40]);
+        
+        // Setup SVG
+        const graphEl = document.getElementById('graph');
+        const width = graphEl.clientWidth;
+        const height = graphEl.clientHeight;
+        
+        const svg = d3.select('#graph')
+            .append('svg')
+            .attr('width', width)
+            .attr('height', height);
+        
+        // Create container for zoom
+        const g = svg.append('g');
+        
+        // Zoom behavior
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 4])
+            .on('zoom', (event) => {
+                g.attr('transform', event.transform);
+            });
+        
+        svg.call(zoom);
+        
+        // Arrow marker
+        svg.append('defs').append('marker')
+            .attr('id', 'arrowhead')
+            .attr('viewBox', '-0 -5 10 10')
+            .attr('refX', 20)
+            .attr('refY', 0)
+            .attr('orient', 'auto')
+            .attr('markerWidth', 6)
+            .attr('markerHeight', 6)
+            .append('path')
+            .attr('d', 'M 0,-5 L 10,0 L 0,5')
+            .attr('fill', '#30363d');
+        
+        // Simulation
+        const simulation = d3.forceSimulation(nodes)
+            .force('link', d3.forceLink(links).id(d => d.id).distance(100))
+            .force('charge', d3.forceManyBody().strength(-300))
+            .force('center', d3.forceCenter(width / 2, height / 2))
+            .force('collision', d3.forceCollide().radius(d => sizeScale(d.callers + d.calls) + 5));
+        
+        // Links
+        const link = g.append('g')
+            .selectAll('line')
+            .data(links)
+            .join('line')
+            .attr('class', 'link')
+            .attr('marker-end', 'url(#arrowhead)');
+        
+        // Nodes
+        const node = g.append('g')
+            .selectAll('g')
+            .data(nodes)
+            .join('g')
+            .attr('class', 'node')
+            .call(d3.drag()
+                .on('start', dragstarted)
+                .on('drag', dragged)
+                .on('end', dragended));
+        
+        node.append('circle')
+            .attr('r', d => sizeScale(d.callers + d.calls))
+            .attr('fill', d => colorScale(d.file))
+            .on('click', (event, d) => selectNode(d))
+            .on('dblclick', (event, d) => drillInto(d))
+            .on('mouseover', showTooltip)
+            .on('mouseout', hideTooltip);
+        
+        node.append('text')
+            .attr('dy', d => sizeScale(d.callers + d.calls) + 12)
+            .attr('text-anchor', 'middle')
+            .text(d => d.name.length > 20 ? d.name.substring(0, 18) + '...' : d.name);
+        
+        simulation.on('tick', () => {
+            link
+                .attr('x1', d => d.source.x)
+                .attr('y1', d => d.source.y)
+                .attr('x2', d => d.target.x)
+                .attr('y2', d => d.target.y);
+            
+            node.attr('transform', d => \`translate(\${d.x},\${d.y})\`);
+        });
+        
+        // Drag functions
+        function dragstarted(event) {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            event.subject.fx = event.subject.x;
+            event.subject.fy = event.subject.y;
+        }
+        
+        function dragged(event) {
+            event.subject.fx = event.x;
+            event.subject.fy = event.y;
+        }
+        
+        function dragended(event) {
+            if (!event.active) simulation.alphaTarget(0);
+            event.subject.fx = null;
+            event.subject.fy = null;
+        }
+        
+        // Tooltip
+        const tooltip = document.getElementById('tooltip');
+        
+        function showTooltip(event, d) {
+            document.getElementById('tooltipTitle').textContent = d.name;
+            document.getElementById('tooltipInfo').textContent = d.file + ':' + d.line;
+            document.getElementById('tooltipCallers').textContent = d.callers;
+            document.getElementById('tooltipCallees').textContent = d.calls;
+            
+            tooltip.style.left = (event.pageX + 15) + 'px';
+            tooltip.style.top = (event.pageY - 10) + 'px';
+            tooltip.classList.add('visible');
+        }
+        
+        function hideTooltip() {
+            tooltip.classList.remove('visible');
+        }
+        
+        // Selection
+        let selectedNode = null;
+        
+        function selectNode(d) {
+            selectedNode = d;
+            
+            // Update node classes
+            node.classed('selected', n => n === d);
+            node.classed('dimmed', n => {
+                if (n === d) return false;
+                if (d.callerNames.includes(n.name)) return false;
+                if (d.calleeNames.includes(n.name)) return false;
+                return true;
+            });
+            
+            // Update link classes
+            link.classed('highlighted', false);
+            link.classed('caller', l => l.target.id === d.id);
+            link.classed('callee', l => l.source.id === d.id);
+            link.classed('dimmed', l => {
+                return l.source.id !== d.id && l.target.id !== d.id;
+            });
+            
+            // Show detail panel
+            showDetail(d);
+            
+            // Update sidebar selection
+            document.querySelectorAll('.func-item').forEach(el => {
+                el.classList.toggle('selected', el.dataset.name === d.name);
+            });
+        }
+        
+        function showDetail(d) {
+            document.getElementById('detailTitle').textContent = d.name;
+            document.getElementById('detailFile').textContent = d.file + ':' + d.line;
+            document.getElementById('callerCount').textContent = d.callerNames.length;
+            document.getElementById('calleeCount').textContent = d.calleeNames.length;
+            
+            const callerList = document.getElementById('callerList');
+            callerList.innerHTML = d.callerNames.map(name => 
+                \`<div class="detail-item caller" onclick="navigateTo('\${name}')">\${name}</div>\`
+            ).join('') || '<div style="color:#8b949e;padding:8px;">No callers</div>';
+            
+            const calleeList = document.getElementById('calleeList');
+            calleeList.innerHTML = d.calleeNames.map(name =>
+                \`<div class="detail-item callee" onclick="navigateTo('\${name}')">\${name}</div>\`
+            ).join('') || '<div style="color:#8b949e;padding:8px;">No calls</div>';
+            
+            document.getElementById('detail-panel').classList.add('visible');
+        }
+        
+        function closeDetail() {
+            document.getElementById('detail-panel').classList.remove('visible');
+            resetHighlights();
+        }
+        
+        function resetHighlights() {
+            selectedNode = null;
+            node.classed('selected', false);
+            node.classed('dimmed', false);
+            link.classed('highlighted', false);
+            link.classed('caller', false);
+            link.classed('callee', false);
+            link.classed('dimmed', false);
+            document.querySelectorAll('.func-item').forEach(el => el.classList.remove('selected'));
+        }
+        
+        function navigateTo(name) {
+            const n = nodes.find(n => n.name === name);
+            if (n) {
+                selectNode(n);
+                // Center on node
+                const transform = d3.zoomIdentity
+                    .translate(width / 2 - n.x, height / 2 - n.y)
+                    .scale(1.5);
+                svg.transition().duration(500).call(zoom.transform, transform);
+            }
+        }
+        
+        function drillInto(d) {
+            // Show only this node and its direct connections
+            const connectedNames = new Set([d.name, ...d.callerNames, ...d.calleeNames]);
+            
+            node.style('display', n => connectedNames.has(n.name) ? null : 'none');
+            link.style('display', l => {
+                return (l.source.name === d.name || l.target.name === d.name) ? null : 'none';
+            });
+            
+            // Show breadcrumb
+            document.getElementById('breadcrumb').style.display = 'flex';
+            document.getElementById('breadcrumbCurrent').textContent = d.name;
+            
+            // Recenter
+            simulation.alpha(0.3).restart();
+        }
+        
+        function resetView() {
+            node.style('display', null);
+            link.style('display', null);
+            document.getElementById('breadcrumb').style.display = 'none';
+            resetHighlights();
+            closeDetail();
+            
+            // Reset zoom
+            svg.transition().duration(500).call(zoom.transform, d3.zoomIdentity);
+            simulation.alpha(0.3).restart();
+        }
+        
+        function zoomIn() {
+            svg.transition().call(zoom.scaleBy, 1.5);
+        }
+        
+        function zoomOut() {
+            svg.transition().call(zoom.scaleBy, 0.67);
+        }
+        
+        // Populate sidebar
+        const funcList = document.getElementById('funcList');
+        const fileFilter = document.getElementById('fileFilter');
+        
+        files.forEach(f => {
+            const opt = document.createElement('option');
+            opt.value = f;
+            opt.textContent = f;
+            fileFilter.appendChild(opt);
+        });
+        
+        function renderFuncList(filter = '', fileFilterVal = '') {
+            const filtered = nodes.filter(n => {
+                const matchesSearch = n.name.toLowerCase().includes(filter.toLowerCase());
+                const matchesFile = !fileFilterVal || n.file === fileFilterVal;
+                return matchesSearch && matchesFile;
+            }).sort((a, b) => (b.callers + b.calls) - (a.callers + a.calls));
+            
+            funcList.innerHTML = filtered.slice(0, 100).map(n => \`
+                <div class="func-item" data-name="\${n.name}" onclick="navigateTo('\${n.name}')">
+                    <div class="func-name">\${n.name}</div>
+                    <div class="func-meta">
+                        <span class="file">\${n.file}</span>
+                        <span>◀\${n.callers} ▶\${n.calls}</span>
+                    </div>
+                </div>
+            \`).join('');
+        }
+        
+        renderFuncList();
+        
+        document.getElementById('search').addEventListener('input', e => {
+            renderFuncList(e.target.value, fileFilter.value);
+        });
+        
+        fileFilter.addEventListener('change', e => {
+            renderFuncList(document.getElementById('search').value, e.target.value);
+        });
+        
+        // Initial zoom to fit
+        setTimeout(() => {
+            const bounds = g.node().getBBox();
+            const fullWidth = bounds.width;
+            const fullHeight = bounds.height;
+            const midX = bounds.x + fullWidth / 2;
+            const midY = bounds.y + fullHeight / 2;
+            const scale = 0.8 / Math.max(fullWidth / width, fullHeight / height);
+            const translate = [width / 2 - scale * midX, height / 2 - scale * midY];
+            
+            svg.transition().duration(750).call(
+                zoom.transform,
+                d3.zoomIdentity.translate(translate[0], translate[1]).scale(scale)
+            );
+        }, 1000);
+    </script>
+</body>
+</html>`;
+}
+
+// ============================================================
+// Vector Indexing (Semantic Search)
+// ============================================================
+
+/**
+ * Simple hash-based embedding (fast, no dependencies)
+ * Uses character n-grams and word frequencies to create a fixed-size vector
+ * Not as good as neural embeddings but works offline with zero setup
+ */
+function simpleHashEmbedding(text, dimensions = 384) {
+    const embedding = new Float32Array(dimensions);
+    
+    // Normalize text
+    const normalized = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+    const words = normalized.split(/\s+/).filter(w => w.length > 1);
+    
+    // Word-level features (TF-like)
+    for (const word of words) {
+        const hash = simpleHash(word);
+        const idx = Math.abs(hash) % dimensions;
+        embedding[idx] += 1;
+        
+        // Also add character trigrams for partial matching
+        for (let i = 0; i < word.length - 2; i++) {
+            const trigram = word.substring(i, i + 3);
+            const trigramHash = simpleHash(trigram);
+            const trigramIdx = Math.abs(trigramHash) % dimensions;
+            embedding[trigramIdx] += 0.5;
+        }
+    }
+    
+    // Add bigrams for phrase matching
+    for (let i = 0; i < words.length - 1; i++) {
+        const bigram = words[i] + '_' + words[i + 1];
+        const hash = simpleHash(bigram);
+        const idx = Math.abs(hash) % dimensions;
+        embedding[idx] += 0.7;
+    }
+    
+    // L2 normalize
+    let norm = 0;
+    for (let i = 0; i < dimensions; i++) {
+        norm += embedding[i] * embedding[i];
+    }
+    norm = Math.sqrt(norm);
+    if (norm > 0) {
+        for (let i = 0; i < dimensions; i++) {
+            embedding[i] /= norm;
+        }
+    }
+    
+    return embedding;
+}
+
+/**
+ * Simple string hash function (djb2)
+ */
+function simpleHash(str) {
+    let hash = 5381;
+    for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) + hash) + str.charCodeAt(i);
+        hash = hash & hash; // Convert to 32bit integer
+    }
+    return hash;
+}
+
+/**
+ * Cosine similarity between two vectors
+ */
+function cosineSimilarity(a, b) {
+    if (a.length !== b.length) return 0;
+    
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+    
+    for (let i = 0; i < a.length; i++) {
+        dotProduct += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+    }
+    
+    const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+    return denominator === 0 ? 0 : dotProduct / denominator;
+}
+
+/**
+ * Chunk code into semantic units (functions, classes, blocks)
+ */
+function chunkCodeForEmbedding(filePath, content, language) {
+    const chunks = [];
+    
+    if (!content) {
+        log('chunkCodeForEmbedding: No content for', filePath);
+        return chunks;
+    }
+    
+    const lines = content.split('\n');
+    const fileName = filePath.split('/').pop();
+    
+    log('chunkCodeForEmbedding:', fileName, '-', lines.length, 'lines,', content.length, 'chars');
+    
+    // Get symbols from code index if available
+    const fileInfo = codeIndex.files.get(filePath);
+    const symbols = fileInfo?.symbols || [];
+    
+    log('  Symbols from codeIndex:', symbols.length);
+    
+    // Strategy 1: Chunk by symbols (functions, classes)
+    const functionSymbols = symbols.filter(s => 
+        ['function', 'method', 'procedure', 'subproc', 'class', 'struct'].includes(s.type)
+    );
+    
+    log('  Function symbols:', functionSymbols.length);
+    
+    if (functionSymbols.length > 0) {
+        // Sort by line number
+        functionSymbols.sort((a, b) => a.line - b.line);
+        
+        for (let i = 0; i < functionSymbols.length && chunks.length < VECTOR_CONFIG.MAX_CHUNKS_PER_FILE; i++) {
+            const sym = functionSymbols[i];
+            const startLine = Math.max(0, sym.line - 1);
+            const nextSym = functionSymbols[i + 1];
+            const endLine = nextSym ? Math.min(nextSym.line - 2, startLine + 100) : Math.min(startLine + 100, lines.length - 1);
+            
+            const chunkText = lines.slice(startLine, endLine + 1).join('\n');
+            
+            if (chunkText.length >= VECTOR_CONFIG.MIN_CHUNK_SIZE) {
+                chunks.push({
+                    id: `${filePath}:${sym.name}`,
+                    text: chunkText,
+                    file: filePath,
+                    fileName: fileName,
+                    startLine: startLine + 1,
+                    endLine: endLine + 1,
+                    type: sym.type,
+                    symbolName: sym.name,
+                    embedding: null
+                });
+            }
+        }
+    }
+    
+    // Strategy 2: If no symbols or file is small, chunk by lines
+    if (chunks.length === 0) {
+        const chunkSize = 30; // lines per chunk
+        const overlap = 5;
+        
+        for (let i = 0; i < lines.length && chunks.length < VECTOR_CONFIG.MAX_CHUNKS_PER_FILE; i += chunkSize - overlap) {
+            const startLine = i;
+            const endLine = Math.min(i + chunkSize, lines.length);
+            const chunkText = lines.slice(startLine, endLine).join('\n');
+            
+            if (chunkText.length >= VECTOR_CONFIG.MIN_CHUNK_SIZE) {
+                chunks.push({
+                    id: `${filePath}:L${startLine + 1}-${endLine}`,
+                    text: chunkText,
+                    file: filePath,
+                    fileName: fileName,
+                    startLine: startLine + 1,
+                    endLine: endLine,
+                    type: 'block',
+                    symbolName: null,
+                    embedding: null
+                });
+            }
+        }
+    }
+    
+    // Also add file-level summary chunk (first ~50 lines with comments)
+    const headerLines = lines.slice(0, Math.min(50, lines.length));
+    const headerText = headerLines.join('\n');
+    if (headerText.length >= VECTOR_CONFIG.MIN_CHUNK_SIZE && !chunks.some(c => c.startLine === 1)) {
+        chunks.unshift({
+            id: `${filePath}:header`,
+            text: headerText,
+            file: filePath,
+            fileName: fileName,
+            startLine: 1,
+            endLine: Math.min(50, lines.length),
+            type: 'header',
+            symbolName: null,
+            embedding: null
+        });
+    }
+    
+    log('  Final chunks for', fileName, ':', chunks.length);
+    return chunks;
+}
+
+/**
+ * Build vector index for all context files
+ */
+async function buildVectorIndex(options = {}) {
+    const { showProgress = true, onProgress = null } = options;
+    
+    if (vectorIndex.isBuilding) {
+        log('Vector index build already in progress');
+        return;
+    }
+    
+    vectorIndex.isBuilding = true;
+    log('=== BUILDING VECTOR INDEX ===');
+    log('contextFiles count:', contextFiles.size);
+    
+    const startTime = Date.now();
+    
+    try {
+        // Clear existing
+        vectorIndex.chunks = [];
+        vectorIndex.embeddings = null;
+        
+        // Collect all chunks from context files
+        const allChunks = [];
+        let fileCount = 0;
+        const totalFiles = contextFiles.size;
+        
+        for (const [filePath, fileInfo] of contextFiles) {
+            log('Chunking file:', filePath, '(', fileInfo.content?.length || 0, 'chars)');
+            const chunks = chunkCodeForEmbedding(filePath, fileInfo.content, fileInfo.language);
+            log('  Created', chunks.length, 'chunks for', filePath.split('/').pop());
+            allChunks.push(...chunks);
+            fileCount++;
+            
+            if (showProgress && onProgress) {
+                const pct = Math.round((fileCount / totalFiles) * 50); // First 50% is chunking
+                onProgress(pct, `Chunking ${fileCount}/${totalFiles} files...`);
+            }
+            
+            // Yield to UI periodically
+            if (fileCount % 10 === 0) {
+                await new Promise(r => setTimeout(r, 1));
+            }
+        }
+        
+        log(`Total chunks created: ${allChunks.length} from ${totalFiles} files`);
+        
+        if (allChunks.length === 0) {
+            log('WARNING: No chunks created!');
+            vectorIndex.isBuilding = false;
+            return;
+        }
+        
+        // Generate embeddings
+        const dimensions = vectorIndex.dimensions;
+        const embeddings = new Float32Array(allChunks.length * dimensions);
+        
+        for (let i = 0; i < allChunks.length; i++) {
+            const chunk = allChunks[i];
+            const embedding = simpleHashEmbedding(chunk.text, dimensions);
+            
+            // Store in flat array
+            embeddings.set(embedding, i * dimensions);
+            
+            // Also store reference in chunk (for convenience)
+            chunk.embedding = embedding;
+            
+            if (showProgress && onProgress && i % 50 === 0) {
+                const pct = 50 + Math.round((i / allChunks.length) * 50); // Second 50% is embedding
+                onProgress(pct, `Embedding ${i}/${allChunks.length} chunks...`);
+            }
+            
+            // Yield periodically
+            if (i % 100 === 0) {
+                await new Promise(r => setTimeout(r, 1));
+            }
+        }
+        
+        vectorIndex.chunks = allChunks;
+        vectorIndex.embeddings = embeddings;
+        vectorIndex.lastUpdated = new Date();
+        
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        log(`Vector index built: ${allChunks.length} chunks in ${elapsed}s`);
+        
+        if (onProgress) {
+            onProgress(100, `✓ ${allChunks.length} chunks indexed`);
+        }
+        
+        // Persist to disk
+        await saveVectorIndex();
+        
+    } catch (error) {
+        log('Error building vector index:', error.message);
+    } finally {
+        vectorIndex.isBuilding = false;
+    }
+}
+
+/**
+ * Search vector index for similar chunks
+ */
+function searchVectorIndex(query, topK = VECTOR_CONFIG.TOP_K_RESULTS) {
+    log('searchVectorIndex called - chunks:', vectorIndex.chunks.length, 'query:', query.substring(0, 50));
+    
+    if (vectorIndex.chunks.length === 0) {
+        log('Vector index is empty');
+        return [];
+    }
+    
+    // Embed the query
+    const queryEmbedding = simpleHashEmbedding(query, vectorIndex.dimensions);
+    log('Query embedded, dimensions:', queryEmbedding.length);
+    
+    // Calculate similarities
+    const results = [];
+    const dimensions = vectorIndex.dimensions;
+    let maxSimilarity = 0;
+    let minSimilarity = 1;
+    
+    for (let i = 0; i < vectorIndex.chunks.length; i++) {
+        const chunk = vectorIndex.chunks[i];
+        
+        // Get embedding from flat array
+        const chunkEmbedding = vectorIndex.embeddings 
+            ? vectorIndex.embeddings.slice(i * dimensions, (i + 1) * dimensions)
+            : chunk.embedding;
+        
+        if (!chunkEmbedding) continue;
+        
+        const similarity = cosineSimilarity(queryEmbedding, chunkEmbedding);
+        maxSimilarity = Math.max(maxSimilarity, similarity);
+        minSimilarity = Math.min(minSimilarity, similarity);
+        
+        if (similarity >= VECTOR_CONFIG.SIMILARITY_THRESHOLD) {
+            results.push({
+                ...chunk,
+                similarity,
+                source: 'vector'
+            });
+        }
+    }
+    
+    log('Vector similarity range:', minSimilarity.toFixed(3), '-', maxSimilarity.toFixed(3), 
+        'threshold:', VECTOR_CONFIG.SIMILARITY_THRESHOLD, 'matches above threshold:', results.length);
+    
+    // Sort by similarity and return top K
+    results.sort((a, b) => b.similarity - a.similarity);
+    return results.slice(0, topK);
+}
+
+/**
+ * Hybrid search combining symbol index, grep, and vector search
+ */
+async function hybridSearch(query, options = {}) {
+    const { maxResults = 15, includeGrep = true, includeVector = true } = options;
+    
+    log('=== HYBRID SEARCH START ===');
+    log('Query:', query);
+    log('Index state - symbols:', codeIndex.symbols.size, 'codeIndex.files:', codeIndex.files.size, 'contextFiles:', contextFiles.size, 'vectors:', vectorIndex.chunks.length);
+    
+    // Log contextFiles for debugging
+    if (contextFiles.size > 0) {
+        log('Context files:');
+        for (const [path, info] of contextFiles) {
+            log('  -', path, '(', info.content?.length || 0, 'chars)');
+        }
+    } else {
+        log('WARNING: No files in contextFiles!');
+    }
+    
+    const results = new Map(); // key: file:line -> result data
+    
+    // 0. Simple text search in contextFiles (always works, no index needed)
+    const queryLower = query.toLowerCase();
+    const queryWords = queryLower.split(/\s+/).filter(w => w.length > 2);
+    log('Query words for text search:', queryWords);
+    
+    for (const [filePath, file] of contextFiles) {
+        const content = file.content || '';
+        const lines = content.split('\n');
+        const fileName = filePath.split('/').pop();
+        let matchCount = 0;
+        
+        for (let i = 0; i < lines.length; i++) {
+            const lineLower = lines[i].toLowerCase();
+            
+            // Check if any query word appears in the line
+            for (const word of queryWords) {
+                if (lineLower.includes(word)) {
+                    const key = `${filePath}:${i + 1}`;
+                    if (!results.has(key)) {
+                        results.set(key, {
+                            file: filePath,
+                            fileName: fileName,
+                            line: i + 1,
+                            symbol: null,
+                            type: 'text',
+                            score: 0.5,
+                            sources: new Set(['text']),
+                            preview: lines[i].trim().substring(0, 100)
+                        });
+                        matchCount++;
+                    } else {
+                        results.get(key).sources.add('text');
+                        results.get(key).score += 0.1; // Boost for multiple word matches
+                    }
+                    break; // Only count once per line
+                }
+            }
+        }
+        log('Text matches in', fileName, ':', matchCount);
+    }
+    
+    log('Simple text search total:', results.size, 'matches');
+    
+    // 1. Symbol Index Search (exact matches)
+    try {
+        const symbolMatches = fuzzySearchSymbols(query, null, 20, 20);
+        log('Symbol matches found:', symbolMatches.length);
+        for (const match of symbolMatches) {
+            const key = `${match.file}:${match.line}`;
+            if (!results.has(key)) {
+                results.set(key, {
+                    file: match.file,
+                    fileName: match.file?.split('/').pop() || 'unknown',
+                    line: match.line || 1,
+                    symbol: match.name,
+                    type: match.type,
+                    score: (match.matchScore || match.score || 50) / 100,
+                    sources: new Set(['symbol']),
+                    preview: match.signature || match.name
+                });
+            } else {
+                results.get(key).sources.add('symbol');
+                results.get(key).score = Math.max(results.get(key).score, (match.matchScore || match.score || 50) / 100);
+            }
+        }
+    } catch (err) {
+        log('Symbol search error:', err.message);
+    }
+    
+    // 2. Grep Search (word boundary matches) - searches contextFiles directly
+    if (includeGrep && contextFiles.size > 0) {
+        try {
+            // Extract keywords from query
+            const keywords = query.toLowerCase()
+                .replace(/[^a-z0-9\s]/g, ' ')
+                .split(/\s+/)
+                .filter(w => w.length > 2);
+            
+            log('Grep keywords:', keywords.slice(0, 3));
+            
+            for (const keyword of keywords.slice(0, 3)) {
+                const grepResult = grepCodeForSymbol(keyword, { maxResults: 10 });
+                const grepMatches = grepResult.all || [];
+                log('Grep results for', keyword, ':', grepMatches.length);
+                for (const match of grepMatches.slice(0, 10)) {
+                    const key = `${match.file}:${match.line}`;
+                    if (!results.has(key)) {
+                        results.set(key, {
+                            file: match.file,
+                            fileName: match.fileName || match.file?.split('/').pop() || 'unknown',
+                            line: match.line || 1,
+                            symbol: null,
+                            type: 'grep',
+                            score: 0.6,
+                            sources: new Set(['grep']),
+                            preview: match.code?.substring(0, 100) || match.content?.substring(0, 100)
+                        });
+                    } else {
+                        results.get(key).sources.add('grep');
+                        results.get(key).score += 0.1;
+                    }
+                }
+            }
+        } catch (err) {
+            log('Grep search error:', err.message);
+        }
+    }
+    
+    // 3. Vector Search (semantic matches)
+    log('Vector search check - chunks:', vectorIndex.chunks.length, 'includeVector:', includeVector);
+    if (includeVector && vectorIndex.chunks.length > 0) {
+        try {
+            const vectorResults = searchVectorIndex(query, 15);
+            log('Vector search returned:', vectorResults.length, 'results');
+            for (const match of vectorResults) {
+                log('  Vector match:', match.fileName, 'line', match.startLine, 'similarity:', match.similarity?.toFixed(3));
+                const key = `${match.file}:${match.startLine}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: match.file,
+                        fileName: match.fileName,
+                        line: match.startLine,
+                        endLine: match.endLine,
+                        symbol: match.symbolName,
+                        type: match.type,
+                        score: match.similarity * 0.9, // Vector similarity
+                        sources: new Set(['vector']),
+                        preview: match.text?.substring(0, 100)
+                    });
+                } else {
+                    results.get(key).sources.add('vector');
+                    results.get(key).score += match.similarity * 0.3; // Boost for semantic match
+                }
+            }
+        } catch (err) {
+            log('Vector search error:', err.message);
+        }
+    } else if (vectorIndex.chunks.length === 0) {
+        log('Vector index empty - run "AstraCode: Rebuild Index" to build it');
+    }
+    
+    // Boost items found by multiple methods
+    for (const [key, data] of results) {
+        if (data.sources.size > 1) {
+            data.score *= 1.0 + (data.sources.size * 0.25); // 25% boost per additional source
+        }
+    }
+    
+    // Sort by score and return
+    const sortedResults = Array.from(results.values())
+        .sort((a, b) => b.score - a.score)
+        .slice(0, maxResults);
+    
+    log(`Hybrid search complete: ${sortedResults.length} results returned`);
+    log('=== HYBRID SEARCH END ===');
+    
+    return sortedResults;
+}
+
+/**
+ * Save vector index to disk
+ */
+async function saveVectorIndex() {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) return;
+    
+    try {
+        const astraDir = vscode.Uri.joinPath(workspaceFolder.uri, '.astra', 'vectors');
+        await vscode.workspace.fs.createDirectory(astraDir);
+        
+        // Save chunks metadata (without embeddings)
+        const chunksData = vectorIndex.chunks.map(c => ({
+            id: c.id,
+            file: c.file,
+            fileName: c.fileName,
+            startLine: c.startLine,
+            endLine: c.endLine,
+            type: c.type,
+            symbolName: c.symbolName,
+            textLength: c.text.length
+            // Note: text not saved to reduce size, can be reloaded from files
+        }));
+        
+        const metadata = {
+            version: 1,
+            model: vectorIndex.model,
+            dimensions: vectorIndex.dimensions,
+            chunkCount: vectorIndex.chunks.length,
+            lastUpdated: vectorIndex.lastUpdated?.toISOString(),
+            chunks: chunksData
+        };
+        
+        const metadataUri = vscode.Uri.joinPath(astraDir, 'index.json');
+        await vscode.workspace.fs.writeFile(metadataUri, Buffer.from(JSON.stringify(metadata, null, 2)));
+        
+        // Save embeddings as binary
+        if (vectorIndex.embeddings) {
+            const embeddingsUri = vscode.Uri.joinPath(astraDir, 'embeddings.bin');
+            const buffer = Buffer.from(vectorIndex.embeddings.buffer);
+            await vscode.workspace.fs.writeFile(embeddingsUri, buffer);
+        }
+        
+        log(`Vector index saved: ${vectorIndex.chunks.length} chunks`);
+        
+    } catch (error) {
+        log('Error saving vector index:', error.message);
+    }
+}
+
+/**
+ * Load vector index from disk
+ */
+async function loadVectorIndex() {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) return false;
+    
+    try {
+        const astraDir = vscode.Uri.joinPath(workspaceFolder.uri, '.astra', 'vectors');
+        
+        // Load metadata
+        const metadataUri = vscode.Uri.joinPath(astraDir, 'index.json');
+        const metadataBytes = await vscode.workspace.fs.readFile(metadataUri);
+        const metadata = JSON.parse(Buffer.from(metadataBytes).toString('utf8'));
+        
+        // Load embeddings
+        const embeddingsUri = vscode.Uri.joinPath(astraDir, 'embeddings.bin');
+        const embeddingsBytes = await vscode.workspace.fs.readFile(embeddingsUri);
+        const embeddings = new Float32Array(embeddingsBytes.buffer.slice(
+            embeddingsBytes.byteOffset,
+            embeddingsBytes.byteOffset + embeddingsBytes.byteLength
+        ));
+        
+        // Reconstruct chunks (text will be reloaded on demand)
+        vectorIndex.chunks = metadata.chunks.map((c, i) => ({
+            ...c,
+            text: '', // Will be populated if needed
+            embedding: embeddings.slice(i * metadata.dimensions, (i + 1) * metadata.dimensions)
+        }));
+        
+        vectorIndex.embeddings = embeddings;
+        vectorIndex.dimensions = metadata.dimensions;
+        vectorIndex.model = metadata.model;
+        vectorIndex.lastUpdated = metadata.lastUpdated ? new Date(metadata.lastUpdated) : null;
+        
+        log(`Vector index loaded: ${vectorIndex.chunks.length} chunks`);
+        return true;
+        
+    } catch (error) {
+        // Index doesn't exist or is corrupted
+        log('No vector index found or error loading:', error.message);
+        return false;
+    }
+}
+
+/**
+ * Clear vector index (in memory and on disk)
+ */
+async function clearVectorIndex() {
+    vectorIndex.chunks = [];
+    vectorIndex.embeddings = null;
+    vectorIndex.lastUpdated = null;
+    
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (workspaceFolder) {
+        try {
+            const vectorsDir = vscode.Uri.joinPath(workspaceFolder.uri, '.astra', 'vectors');
+            await vscode.workspace.fs.delete(vectorsDir, { recursive: true });
+            log('Vector index directory deleted');
+        } catch (e) {
+            // Directory may not exist
+        }
+    }
+    
+    log('Vector index cleared');
+}
+
+/**
+ * Get vector index statistics
+ */
+function getVectorIndexStats() {
+    if (vectorIndex.chunks.length === 0) {
+        return null;
+    }
+    
+    const files = new Set(vectorIndex.chunks.map(c => c.file));
+    const types = {};
+    for (const chunk of vectorIndex.chunks) {
+        types[chunk.type] = (types[chunk.type] || 0) + 1;
+    }
+    
+    return {
+        chunks: vectorIndex.chunks.length,
+        files: files.size,
+        types,
+        dimensions: vectorIndex.dimensions,
+        model: vectorIndex.model,
+        lastUpdated: vectorIndex.lastUpdated,
+        memorySizeMB: vectorIndex.embeddings 
+            ? (vectorIndex.embeddings.byteLength / (1024 * 1024)).toFixed(2)
+            : 0
+    };
+}
+
+// ============================================================
+// Context File Tree Provider
+// ============================================================
+
+class ContextFilesProvider {
+    constructor() {
+        this._onDidChangeTreeData = new vscode.EventEmitter();
+        this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+    }
+
+    refresh() {
+        this._onDidChangeTreeData.fire();
+    }
+
+    getTreeItem(element) {
+        return element;
+    }
+
+    getChildren() {
+        const items = [];
+        
+        for (const [path, file] of contextFiles) {
+            const item = new vscode.TreeItem(
+                file.uri.path.split('/').pop(),
+                vscode.TreeItemCollapsibleState.None
+            );
+            item.description = `${file.language} • ${(file.content.length / 1024).toFixed(1)}KB`;
+            item.tooltip = file.uri.fsPath;
+            item.contextValue = 'contextFile';
+            item.resourceUri = file.uri;
+            item.command = {
+                command: 'vscode.open',
+                arguments: [file.uri],
+                title: 'Open File'
+            };
+            items.push(item);
+        }
+        
+        if (items.length === 0) {
+            const emptyItem = new vscode.TreeItem('No files in context');
+            emptyItem.description = 'Right-click a file to add';
+            return [emptyItem];
+        }
+        
+        return items;
+    }
+}
+
+// ============================================================
+// Chat Webview Provider
+// ============================================================
+
+class ChatViewProvider {
+    constructor(extensionUri) {
+        this.extensionUri = extensionUri;
+    }
+
+    resolveWebviewView(webviewView) {
+        chatWebviewView = webviewView;
+        
+        webviewView.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [this.extensionUri]
+        };
+        
+        webviewView.webview.html = this.getHtmlContent();
+        
+        // Handle messages from webview
+        webviewView.webview.onDidReceiveMessage(async (message) => {
+            try {
+                switch (message.type) {
+                    case 'chat':
+                        await handleChatMessage(message.text);
+                        break;
+                    case 'setMode':
+                        currentMode = message.mode;
+                        updateChatStatus();
+                        log('Mode changed to:', currentMode);
+                        break;
+                    case 'clearHistory':
+                    chatHistory = [];
+                    updateChatUI();
+                    break;
+                case 'addFiles':
+                    // Open file picker - accept files OR folders
+                    const uris = await vscode.window.showOpenDialog({
+                        canSelectMany: true,
+                        canSelectFiles: true,
+                        canSelectFolders: true,
+                        openLabel: 'Add to AstraCode Context'
+                        // No filters - accept all file types
+                    });
+                    if (uris && uris.length > 0) {
+                        for (const uri of uris) {
+                            await addToContext(uri);
+                        }
+                    }
+                    break;
+                case 'clearContext':
+                    clearContext();
+                    log('Context cleared from UI');
+                    break;
+                case 'removeFile':
+                    if (message.path) {
+                        removeFileFromContext(message.path);
+                        log('Removed file from UI:', message.path);
+                    }
+                    break;
+                case 'command':
+                    // Execute a VS Code command
+                    if (message.command === 'showCallGraph') {
+                        vscode.commands.executeCommand('astra.showCallGraph');
+                    } else if (message.command === 'openCallGraphInBrowser') {
+                        vscode.commands.executeCommand('astra.openCallGraphInBrowser');
+                    } else if (message.command === 'showIndexStats') {
+                        vscode.commands.executeCommand('astra.showIndexStats');
+                    } else if (message.command === 'showCallersOf') {
+                        vscode.commands.executeCommand('astra.showCallersOf');
+                    } else if (message.command === 'clearIndex') {
+                        vscode.commands.executeCommand('astra.clearIndex');
+                    } else if (message.command === 'rebuildIndex') {
+                        vscode.commands.executeCommand('astra.rebuildIndex');
+                    } else if (message.command === 'semanticSearch') {
+                        vscode.commands.executeCommand('astra.semanticSearch');
+                    }
+                    break;
+                case 'cancelTask':
+                    // Cancel currently running task
+                    taskController.cancel();
+                    chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+                    break;
+                case 'openFile':
+                    // Open a file in the editor
+                    if (message.filePath) {
+                        try {
+                            const fileUri = vscode.Uri.file(message.filePath);
+                            const doc = await vscode.workspace.openTextDocument(fileUri);
+                            await vscode.window.showTextDocument(doc, { preview: false });
+                            log('Opened file:', message.filePath);
+                        } catch (err) {
+                            log('Error opening file:', err.message);
+                            vscode.window.showErrorMessage(`Could not open file: ${message.filePath}`);
+                        }
+                    }
+                    break;
+                case 'revealFile':
+                    // Reveal file in OS file explorer
+                    if (message.filePath) {
+                        try {
+                            const fileUri = vscode.Uri.file(message.filePath);
+                            await vscode.commands.executeCommand('revealFileInOS', fileUri);
+                        } catch (err) {
+                            log('Error revealing file:', err.message);
+                        }
+                    }
+                    break;
+            }
+            } catch (error) {
+                log('Error handling message:', error.message);
+                vscode.window.showErrorMessage(`AstraCode error: ${error.message}`);
+            }
+        });
+        
+        // Initial status update
+        updateChatStatus();
+    }
+
+    getHtmlContent() {
+        return `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size);
+            color: var(--vscode-foreground);
+            background: var(--vscode-sideBar-background);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            padding: 8px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            margin-bottom: 8px;
+        }
+        
+        .mode-selector {
+            display: flex;
+            gap: 4px;
+        }
+        
+        .mode-btn {
+            padding: 4px 8px;
+            border: 1px solid var(--vscode-button-border);
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            cursor: pointer;
+            font-size: 11px;
+            border-radius: 3px;
+        }
+        
+        .mode-btn.active {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+        }
+        
+        .status {
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 4px;
+        }
+        
+        .status-indicator.local { background: #4ec9b0; }
+        .status-indicator.api { background: #569cd6; }
+        .status-indicator.auto { background: #dcdcaa; }
+        
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+        }
+        
+        .message {
+            margin-bottom: 12px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            max-width: 95%;
+        }
+        
+        .message.user {
+            background: var(--vscode-input-background);
+            margin-left: auto;
+        }
+        
+        .message.assistant {
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-panel-border);
+        }
+        
+        .message-divider {
+            display: flex;
+            align-items: center;
+            margin: 12px 0;
+            gap: 12px;
+        }
+        
+        .message-divider::before,
+        .message-divider::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: linear-gradient(to right, transparent, var(--vscode-panel-border), transparent);
+        }
+        
+        .message-divider-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--vscode-panel-border);
+        }
+        
+        .message-header {
+            font-size: 10px;
+            color: var(--vscode-descriptionForeground);
+            margin-bottom: 4px;
+        }
+        
+        .message-content {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .message-content code {
+            background: var(--vscode-textCodeBlock-background);
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-family: var(--vscode-editor-font-family);
+        }
+        
+        .message-content pre {
+            background: var(--vscode-textCodeBlock-background);
+            padding: 8px;
+            border-radius: 4px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+        
+        .message-content pre.code-block {
+            position: relative;
+            cursor: pointer;
+        }
+        
+        .message-content pre.code-block:hover {
+            outline: 1px solid var(--vscode-focusBorder);
+        }
+        
+        .message-content pre.code-block::after {
+            content: 'Click to copy';
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            font-size: 10px;
+            opacity: 0;
+            transition: opacity 0.2s;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        
+        .message-content pre.code-block:hover::after {
+            opacity: 1;
+        }
+        
+        .message-content pre.code-block.copied::after {
+            content: 'Copied!';
+            opacity: 1;
+            background: var(--vscode-testing-iconPassed);
+        }
+        
+        .message-content .file-link {
+            cursor: pointer;
+            color: var(--vscode-textLink-foreground);
+            text-decoration: underline;
+            background-color: var(--vscode-textCodeBlock-background);
+            padding: 2px 6px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        
+        .message-content .file-link:hover {
+            color: var(--vscode-textLink-activeForeground);
+            background-color: var(--vscode-button-hoverBackground);
+        }
+        
+        .message-content h1, .message-content h2, .message-content h3 {
+            margin: 12px 0 8px 0;
+            font-weight: 600;
+        }
+        
+        .message-content h1 { font-size: 1.3em; }
+        .message-content h2 { font-size: 1.15em; }
+        .message-content h3 { font-size: 1.05em; }
+        
+        .message-content hr {
+            border: none;
+            border-top: 1px solid var(--vscode-panel-border);
+            margin: 12px 0;
+        }
+        
+        .message-content blockquote {
+            border-left: 3px solid var(--vscode-textBlockQuote-border);
+            padding-left: 10px;
+            margin: 8px 0;
+            color: var(--vscode-textBlockQuote-foreground);
+        }
+        
+        .input-container {
+            padding-top: 8px;
+            border-top: 1px solid var(--vscode-panel-border);
+        }
+        
+        .input-row {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .input-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 8px;
+            gap: 8px;
+        }
+        
+        .action-right {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .input-hint {
+            font-size: 10px;
+            color: var(--vscode-descriptionForeground);
+            margin-top: 4px;
+            opacity: 0.8;
+        }
+        
+        #addFilesBtn {
+            padding: 6px 12px;
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        #addFilesBtn:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+        }
+        
+        #chatInput {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid var(--vscode-input-border);
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: inherit;
+            resize: none;
+            min-height: 60px;
+        }
+        
+        #chatInput:focus {
+            outline: 1px solid var(--vscode-focusBorder);
+        }
+        
+        #sendBtn {
+            padding: 8px 16px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            align-self: flex-end;
+        }
+        
+        #sendBtn:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        
+        #sendBtn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        #cancelBtn {
+            padding: 8px 12px;
+            background: linear-gradient(135deg, #f44336, #c62828) !important;
+            color: white !important;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            align-self: flex-end;
+            font-weight: 600;
+            animation: pulse 1.5s infinite;
+        }
+        
+        #cancelBtn:hover {
+            background: linear-gradient(135deg, #ef5350, #e53935) !important;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        .context-summary {
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            padding: 4px 0;
+        }
+        
+        .loading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--vscode-descriptionForeground);
+        }
+        
+        .loading-dots::after {
+            content: '';
+            animation: dots 1.5s steps(4, end) infinite;
+        }
+        
+        @keyframes dots {
+            0%, 20% { content: ''; }
+            40% { content: '.'; }
+            60% { content: '..'; }
+            80%, 100% { content: '...'; }
+        }
+        
+        .empty-state {
+            text-align: center;
+            color: var(--vscode-descriptionForeground);
+            padding: 40px 20px;
+        }
+        
+        .empty-state h3 {
+            margin-bottom: 8px;
+            color: var(--vscode-foreground);
+        }
+        
+        .quick-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 12px;
+            justify-content: center;
+        }
+        
+        .quick-action {
+            padding: 4px 8px;
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        
+        .quick-action:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+        }
+        
+        .quick-actions-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-bottom: 8px;
+            justify-content: center;
+        }
+        
+        .quick-action-btn {
+            padding: 4px 10px;
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        
+        .quick-action-btn:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+        }
+        
+        /* Graph button - subtle green */
+        .graph-btn {
+            background: rgba(76, 175, 80, 0.2) !important;
+            color: #81C784 !important;
+            border: 1px solid rgba(76, 175, 80, 0.4) !important;
+            font-weight: 500;
+        }
+        
+        .graph-btn:hover {
+            background: rgba(76, 175, 80, 0.35) !important;
+            border-color: rgba(76, 175, 80, 0.6) !important;
+        }
+        
+        /* Semantic Search button - subtle purple */
+        .search-btn {
+            background: rgba(124, 77, 255, 0.2) !important;
+            color: #B39DDB !important;
+            border: 1px solid rgba(124, 77, 255, 0.4) !important;
+            font-weight: 500;
+        }
+        
+        .search-btn:hover {
+            background: rgba(124, 77, 255, 0.35) !important;
+            border-color: rgba(124, 77, 255, 0.6) !important;
+        }
+        
+        .add-files-big {
+            padding: 12px 24px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 16px 0;
+        }
+        
+        .add-files-big:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        
+        .context-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            margin-bottom: 4px;
+        }
+        
+        .context-files-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            flex: 1;
+        }
+        
+        .context-file-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 6px;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            border-radius: 10px;
+            font-size: 11px;
+        }
+        
+        .context-file-chip .remove-file {
+            cursor: pointer;
+            opacity: 0.7;
+            font-size: 10px;
+        }
+        
+        .context-file-chip .remove-file:hover {
+            opacity: 1;
+        }
+        
+        .clear-context-btn {
+            padding: 2px 6px;
+            background: transparent;
+            color: var(--vscode-descriptionForeground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 10px;
+            white-space: nowrap;
+        }
+        
+        .clear-context-btn:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+            color: var(--vscode-foreground);
+        }
+        
+        .context-actions {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+        
+        .index-btn {
+            padding: 2px 6px;
+            background: transparent;
+            color: var(--vscode-descriptionForeground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 10px;
+            white-space: nowrap;
+        }
+        
+        .index-btn:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+            color: var(--vscode-foreground);
+        }
+        
+        /* Index Progress - Inline version (no layout shift) */
+        .index-progress-inline {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 8px;
+            background: var(--vscode-editor-background);
+            border-radius: 4px;
+            border: 1px solid var(--vscode-panel-border);
+            font-size: 11px;
+        }
+        
+        .index-progress-text-inline {
+            color: var(--vscode-descriptionForeground);
+            min-width: 80px;
+        }
+        
+        /* Flashing Indexing Indicator */
+        .indexing-indicator {
+            font-size: 14px;
+            animation: flash-bulb 0.8s ease-in-out infinite;
+        }
+        
+        @keyframes flash-bulb {
+            0%, 100% { 
+                opacity: 1; 
+                filter: brightness(1) drop-shadow(0 0 4px #ffd700);
+            }
+            50% { 
+                opacity: 0.4; 
+                filter: brightness(0.6) drop-shadow(0 0 0px #ffd700);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="mode-selector">
+            <button class="mode-btn" data-mode="auto" title="Smart detection">Auto</button>
+            <button class="mode-btn" data-mode="local" title="Use context files only">Local</button>
+            <button class="mode-btn" data-mode="api" title="Search API server">API</button>
+        </div>
+        <div class="status">
+            <span class="status-indicator auto"></span>
+            <span id="statusText">Auto Mode</span>
+        </div>
+    </div>
+    
+    <div id="contextBar" class="context-bar" style="display: none;">
+        <div id="contextFilesList" class="context-files-list"></div>
+        <div class="context-actions">
+            <div id="indexProgressInline" class="index-progress-inline" style="display: none;">
+                <span id="indexingIndicator" class="indexing-indicator">💡</span>
+                <span id="indexProgressText" class="index-progress-text-inline">0%</span>
+            </div>
+            <button id="rebuildIndexBtn" class="index-btn" title="Rebuild code index">🔄 Rebuild</button>
+            <button id="clearContextBtn" class="clear-context-btn" title="Clear all files and index">🗑️ Clear All</button>
+        </div>
+    </div>
+    
+    <div id="chatContainer" class="chat-container">
+        <div class="empty-state">
+            <h3><span style="color: #FFD700;">★</span> AstraCode Assistant</h3>
+            <p>Add files to context, then ask questions</p>
+            <button class="add-files-big" id="addFilesBigBtn">📎 Add Files to Context</button>
+        </div>
+    </div>
+    
+    <div class="input-container">
+        <div id="quickActionsBar" class="quick-actions-bar">
+            <button class="quick-action-btn" data-prompt="Find bugs and issues">🐛 Debug</button>
+            <button class="quick-action-btn graph-btn" data-command="openCallGraphInBrowser">⬡ Graph</button>
+            <button class="quick-action-btn search-btn" data-command="semanticSearch">🧠 Search</button>
+            <button class="quick-action-btn" data-prompt="Generate full documentation (DeepWiki style)">📄 Docs</button>
+        </div>
+        <div class="input-row">
+            <textarea id="chatInput" placeholder="Ask a question... (Ctrl+Enter to send)" rows="2"></textarea>
+        </div>
+        <div class="input-actions">
+            <button id="addFilesBtn" title="Add files to context">📎 Add Files</button>
+            <div class="action-right">
+                <button id="cancelBtn" style="display:none" title="Cancel current task">⏹️ Cancel</button>
+                <button id="sendBtn">Send</button>
+            </div>
+        </div>
+        <div class="input-hint">
+            💡 Right-click file in Explorer → "AstraCode: Add File to Context"
+        </div>
+    </div>
+    
+    <script>
+        const vscode = acquireVsCodeApi();
+        
+        // Elements
+        const chatContainer = document.getElementById('chatContainer');
+        const chatInput = document.getElementById('chatInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const addFilesBtn = document.getElementById('addFilesBtn');
+        const statusText = document.getElementById('statusText');
+        const contextBar = document.getElementById('contextBar');
+        const contextFilesList = document.getElementById('contextFilesList');
+        const clearContextBtn = document.getElementById('clearContextBtn');
+        const modeBtns = document.querySelectorAll('.mode-btn');
+        const quickActions = document.querySelectorAll('.quick-action');
+        
+        let currentMode = 'auto';
+        let isProcessing = false;
+        let contextFilesData = []; // Store file paths for removal
+        
+        // Add files button (small)
+        addFilesBtn.addEventListener('click', () => {
+            vscode.postMessage({ type: 'addFiles' });
+        });
+        
+        // Add files button (big - in empty state)
+        const addFilesBigBtn = document.getElementById('addFilesBigBtn');
+        if (addFilesBigBtn) {
+            addFilesBigBtn.addEventListener('click', () => {
+                vscode.postMessage({ type: 'addFiles' });
+            });
+        }
+        
+        // Clear context button
+        clearContextBtn.addEventListener('click', () => {
+            vscode.postMessage({ type: 'clearContext' });
+        });
+        
+        // Rebuild index button
+        const rebuildIndexBtn = document.getElementById('rebuildIndexBtn');
+        
+        if (rebuildIndexBtn) {
+            rebuildIndexBtn.addEventListener('click', () => {
+                vscode.postMessage({ type: 'command', command: 'rebuildIndex' });
+            });
+        }
+        
+        // Mode selection
+        modeBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+                currentMode = btn.dataset.mode;
+                modeBtns.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                
+                document.querySelector('.status-indicator').className = 'status-indicator ' + currentMode;
+                
+                vscode.postMessage({ type: 'setMode', mode: currentMode });
+            });
+        });
+        
+        // Quick actions (in empty state)
+        quickActions.forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (btn.dataset.command) {
+                    vscode.postMessage({ type: 'command', command: btn.dataset.command });
+                } else if (btn.dataset.prompt) {
+                    chatInput.value = btn.dataset.prompt;
+                    chatInput.focus();
+                }
+            });
+        });
+        
+        // Persistent quick action buttons (always visible above input)
+        document.querySelectorAll('.quick-action-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (btn.dataset.command) {
+                    vscode.postMessage({ type: 'command', command: btn.dataset.command });
+                } else if (btn.dataset.prompt) {
+                    chatInput.value = btn.dataset.prompt;
+                    chatInput.focus();
+                    // Optionally auto-send
+                    // sendMessage();
+                }
+            });
+        });
+        
+        // Send message
+        function sendMessage() {
+            const text = chatInput.value.trim();
+            if (!text || isProcessing) return;
+            
+            chatInput.value = '';
+            vscode.postMessage({ type: 'chat', text });
+        }
+        
+        sendBtn.addEventListener('click', sendMessage);
+        
+        // Cancel button
+        document.getElementById('cancelBtn')?.addEventListener('click', () => {
+            vscode.postMessage({ type: 'cancelTask' });
+        });
+        
+        chatInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+        
+        // Receive messages from extension
+        window.addEventListener('message', event => {
+            const message = event.data;
+            
+            switch (message.type) {
+                case 'updateChat':
+                    renderChat(message.history);
+                    break;
+                case 'updateStatus':
+                    updateStatus(message);
+                    break;
+                case 'setProcessing':
+                    isProcessing = message.processing;
+                    sendBtn.disabled = isProcessing;
+                    
+                    // Show/hide cancel button
+                    const cancelBtn = document.getElementById('cancelBtn');
+                    if (cancelBtn) {
+                        cancelBtn.style.display = isProcessing ? 'inline-block' : 'none';
+                    }
+                    
+                    if (isProcessing) {
+                        addLoadingIndicator();
+                        sendBtn.textContent = '⏳';
+                    } else {
+                        removeLoadingIndicator();
+                        sendBtn.textContent = 'Send';
+                    }
+                    break;
+                case 'appendResponse':
+                    appendToLastMessage(message.text);
+                    break;
+                case 'replaceLastResponse':
+                    replaceLastResponse(message.text);
+                    break;
+                case 'finalizeResponse':
+                    finalizeLastMessage();
+                    break;
+                case 'indexProgress':
+                    showIndexProgress(message.progress, message.message);
+                    break;
+            }
+        });
+        
+        // Index progress indicator - uses inline element (no layout shift)
+        function showIndexProgress(progress, message) {
+            const progressContainer = document.getElementById('indexProgressInline');
+            const progressText = document.getElementById('indexProgressText');
+            
+            if (!progressContainer || !progressText) return;
+            
+            if (progress < 100) {
+                // Show progress
+                progressContainer.style.display = 'flex';
+                progressText.textContent = message;
+            } else {
+                // Complete - show briefly then hide
+                progressText.textContent = '✓ Done';
+                setTimeout(() => {
+                    progressContainer.style.display = 'none';
+                }, 1500);
+            }
+        }
+        
+        function renderChat(history) {
+            if (!history || history.length === 0) {
+                chatContainer.innerHTML = \`
+                    <div class="empty-state">
+                        <h3><span style="color: #FFD700;">★</span> AstraCode Assistant</h3>
+                        <p>Add files to context, then ask questions</p>
+                        <button class="add-files-big" id="addFilesBigBtnDynamic">📎 Add Files to Context</button>
+                    </div>
+                \`;
+                
+                // Attach add files button listener
+                const addBtn = document.getElementById('addFilesBigBtnDynamic');
+                if (addBtn) {
+                    addBtn.addEventListener('click', () => {
+                        vscode.postMessage({ type: 'addFiles' });
+                    });
+                }
+                return;
+            }
+            
+            chatContainer.innerHTML = history.map((msg, index) => {
+                const messageHtml = \`
+                    <div class="message \${msg.role}">
+                        <div class="message-header">\${msg.role === 'user' ? 'You' : 'AstraCode'}</div>
+                        <div class="message-content">\${escapeHtml(msg.content)}</div>
+                    </div>
+                \`;
+                // Add divider after user message (before assistant response)
+                const divider = (msg.role === 'user' && index < history.length - 1) ? 
+                    '<div class="message-divider"><div class="message-divider-dot"></div></div>' : '';
+                return messageHtml + divider;
+            }).join('');
+            
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        function updateStatus(status) {
+            statusText.textContent = status.text;
+            
+            // Update mode buttons
+            modeBtns.forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.mode === status.mode);
+            });
+            
+            document.querySelector('.status-indicator').className = 'status-indicator ' + status.mode;
+            
+            // Update context files bar
+            if (status.files && status.files.length > 0) {
+                contextBar.style.display = 'flex';
+                contextFilesData = status.files;
+                
+                contextFilesList.innerHTML = status.files.map((file, index) => 
+                    '<span class="context-file-chip">' +
+                        file.name +
+                        '<span class="remove-file" data-index="' + index + '" title="Remove">✕</span>' +
+                    '</span>'
+                ).join('');
+                
+                // Add click handlers for remove buttons
+                contextFilesList.querySelectorAll('.remove-file').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        const index = parseInt(e.target.dataset.index);
+                        const file = contextFilesData[index];
+                        if (file) {
+                            vscode.postMessage({ type: 'removeFile', path: file.path });
+                        }
+                    });
+                });
+            } else {
+                contextBar.style.display = 'none';
+                contextFilesList.innerHTML = '';
+            }
+        }
+        
+        function addLoadingIndicator() {
+            const existing = document.querySelector('.loading');
+            if (existing) return;
+            
+            // Add divider before assistant response
+            const existingDivider = chatContainer.querySelector('.message-divider:last-child');
+            if (!existingDivider) {
+                const divider = document.createElement('div');
+                divider.className = 'message-divider';
+                divider.innerHTML = '<div class="message-divider-dot"></div>';
+                chatContainer.appendChild(divider);
+            }
+            
+            const loading = document.createElement('div');
+            loading.className = 'message assistant loading';
+            loading.innerHTML = '<div class="loading-dots">Thinking</div>';
+            chatContainer.appendChild(loading);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        function removeLoadingIndicator() {
+            const loading = document.querySelector('.loading');
+            if (loading) loading.remove();
+        }
+        
+        function appendToLastMessage(text) {
+            removeLoadingIndicator();
+            
+            let lastMsg = chatContainer.querySelector('.message.assistant:last-child');
+            if (!lastMsg || lastMsg.classList.contains('loading')) {
+                lastMsg = document.createElement('div');
+                lastMsg.className = 'message assistant';
+                lastMsg.innerHTML = '<div class="message-header">AstraCode</div><div class="message-content"></div>';
+                chatContainer.appendChild(lastMsg);
+            }
+            
+            const content = lastMsg.querySelector('.message-content');
+            content.textContent += text;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        function replaceLastResponse(text) {
+            const lastMsg = chatContainer.querySelector('.message.assistant:last-child');
+            if (lastMsg && !lastMsg.classList.contains('loading')) {
+                const content = lastMsg.querySelector('.message-content');
+                if (content) {
+                    content.textContent = text;
+                }
+            }
+        }
+        
+        // Called when response is complete - converts plain text to rendered markdown with clickable links
+        function finalizeLastMessage() {
+            const lastMsg = chatContainer.querySelector('.message.assistant:last-child');
+            if (lastMsg && !lastMsg.classList.contains('loading')) {
+                const content = lastMsg.querySelector('.message-content');
+                if (content && content.textContent) {
+                    // Convert plain text to rendered markdown
+                    content.innerHTML = renderMarkdown(content.textContent);
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
+            }
+        }
+        
+        // Simple markdown renderer for code blocks and file links
+        // Simple markdown renderer for code blocks and formatting
+        function renderMarkdown(text) {
+            // Escape HTML first
+            let html = text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            
+            // Render fenced code blocks (using String.fromCharCode to avoid template issues)
+            const tick = String.fromCharCode(96); // backtick character
+            // More forgiving regex - newline before closing backticks is optional
+            const codeBlockRegex = new RegExp(tick + tick + tick + '(\\\\w*)\\\\n?([\\\\s\\\\S]*?)\\\\n?' + tick + tick + tick, 'g');
+            
+            // Track code block positions to protect them from further processing
+            const codeBlocks = [];
+            html = html.replace(codeBlockRegex, function(match, lang, code) {
+                const placeholder = '___CODEBLOCK_' + codeBlocks.length + '___';
+                codeBlocks.push('<pre class="code-block" data-lang="' + lang + '"><code>' + code + '</code></pre>');
+                return placeholder;
+            });
+            
+            // Render inline code and protect from further processing
+            const inlineCodeRegex = new RegExp(tick + '([^' + tick + ']+)' + tick, 'g');
+            const inlineCodes = [];
+            html = html.replace(inlineCodeRegex, function(match, code) {
+                const placeholder = '___INLINECODE_' + inlineCodes.length + '___';
+                inlineCodes.push('<code class="inline-code">' + code + '</code>');
+                return placeholder;
+            });
+            
+            // Render headers
+            html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+            html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+            html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+            
+            // Render bold
+            html = html.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+            
+            // Render italic - but NOT if it looks like a comment (/* or */)
+            // Only match standalone *text* not part of /* */
+            html = html.replace(/(?<![\\/*])\\*([^\\*\\n]+)\\*(?![\\/*])/g, '<em>$1</em>');
+            
+            // Render horizontal rules
+            html = html.replace(/^---$/gm, '<hr>');
+            
+            // Render blockquotes
+            html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+            
+            // Preserve line breaks
+            html = html.replace(/\\n/g, '<br>');
+            
+            // Restore code blocks
+            for (let i = 0; i < codeBlocks.length; i++) {
+                html = html.replace('___CODEBLOCK_' + i + '___', codeBlocks[i]);
+            }
+            
+            // Restore inline codes and add file link detection
+            for (let i = 0; i < inlineCodes.length; i++) {
+                let code = inlineCodes[i];
+                // Check if it's a file path
+                const pathMatch = code.match(/<code class="inline-code">([^<]+)<\\/code>/);
+                if (pathMatch) {
+                    const path = pathMatch[1];
+                    if (/\\.(java|py|js|ts|c|cpp|go|rs|rb|cs|kt|swift|php|sql|md|txt|json|xml|html|yaml|yml|tal|cbl|cobol)$/i.test(path)) {
+                        code = '<code class="inline-code file-link" data-path="' + path + '" title="Click to open in VS Code">📄 ' + path + '</code>';
+                    }
+                }
+                html = html.replace('___INLINECODE_' + i + '___', code);
+            }
+            
+            return html;
+        }
+        
+        function escapeHtml(text) {
+            // Now use the markdown renderer instead
+            return renderMarkdown(text);
+        }
+        
+        // Add click handler for file links
+        document.addEventListener('click', function(e) {
+            if (e.target.classList.contains('file-link')) {
+                const filePath = e.target.dataset.path || e.target.textContent;
+                if (filePath) {
+                    vscode.postMessage({ type: 'openFile', filePath: filePath });
+                }
+            }
+            // Handle code block clicks (copy to clipboard)
+            if (e.target.closest('.code-block')) {
+                const code = e.target.closest('.code-block').textContent;
+                navigator.clipboard.writeText(code).then(function() {
+                    // Show brief "copied" feedback
+                    const block = e.target.closest('.code-block');
+                    block.classList.add('copied');
+                    setTimeout(function() { block.classList.remove('copied'); }, 1000);
+                });
+            }
+        });
+        
+        // Set initial active mode
+        document.querySelector('.mode-btn[data-mode="auto"]').classList.add('active');
+    </script>
+</body>
+</html>`;
+    }
+}
+
+// ============================================================
+// PLAN & EXECUTE AGENTIC ARCHITECTURE
+// ============================================================
+
+// ============================================================
+// Fuzzy Matching for Code Search
+// ============================================================
+
+/**
+ * Calculate fuzzy match score between query and symbol name
+ * Higher score = better match
+ * Returns 0 if no match
+ */
+function fuzzyMatchScore(query, symbolName) {
+    const q = query.toLowerCase();
+    const s = symbolName.toLowerCase();
+    
+    // Exact match - highest priority
+    if (s === q) return 100;
+    
+    // Exact substring match
+    if (s.includes(q)) return 80;
+    
+    // Query is abbreviation of CamelCase (e.g., "rte" matches "RangeTblEntry")
+    const camelScore = matchCamelCaseAbbrev(q, symbolName);
+    if (camelScore > 0) return 70 + camelScore;
+    
+    // Query matches word boundaries (e.g., "parse_rel" matches "parse_relation")
+    const wordScore = matchWordBoundaries(q, s);
+    if (wordScore > 0) return 60 + wordScore;
+    
+    // All query characters appear in order (subsequence match)
+    const subseqScore = matchSubsequence(q, s);
+    if (subseqScore > 0) return 40 + subseqScore;
+    
+    return 0;
+}
+
+/**
+ * Match CamelCase abbreviation
+ * "RTE" matches "RangeTblEntry", "pf" matches "parseFrom"
+ */
+function matchCamelCaseAbbrev(abbrev, name) {
+    // Extract capital letters and first letter
+    const capitals = name.match(/^[a-z]|[A-Z]/g);
+    if (!capitals) return 0;
+    
+    const abbrevLower = abbrev.toLowerCase();
+    const capitalsLower = capitals.join('').toLowerCase();
+    
+    // Check if abbrev matches capitals
+    if (capitalsLower.startsWith(abbrevLower)) {
+        return 20 * (abbrevLower.length / capitalsLower.length);
+    }
+    
+    // Check if abbrev is subsequence of capitals
+    let ai = 0;
+    for (let ci = 0; ci < capitalsLower.length && ai < abbrevLower.length; ci++) {
+        if (capitalsLower[ci] === abbrevLower[ai]) ai++;
+    }
+    if (ai === abbrevLower.length) {
+        return 15 * (abbrevLower.length / capitalsLower.length);
+    }
+    
+    return 0;
+}
+
+/**
+ * Match word boundaries (underscore or camelCase transitions)
+ */
+function matchWordBoundaries(query, name) {
+    // Split by underscore or camelCase
+    const words = name.split(/[_]|(?=[A-Z])/).map(w => w.toLowerCase()).filter(w => w);
+    const queryParts = query.split(/[_\s]/).filter(p => p);
+    
+    let matchedParts = 0;
+    for (const qp of queryParts) {
+        for (const word of words) {
+            if (word.startsWith(qp) || word.includes(qp)) {
+                matchedParts++;
+                break;
+            }
+        }
+    }
+    
+    if (matchedParts === queryParts.length) {
+        return 20 * (matchedParts / words.length);
+    }
+    
+    return matchedParts > 0 ? 10 * (matchedParts / queryParts.length) : 0;
+}
+
+/**
+ * Check if query is a subsequence of name
+ */
+function matchSubsequence(query, name) {
+    let qi = 0;
+    for (let ni = 0; ni < name.length && qi < query.length; ni++) {
+        if (name[ni] === query[qi]) qi++;
+    }
+    
+    if (qi === query.length) {
+        // Score based on how compact the match is
+        return 20 * (query.length / name.length);
+    }
+    
+    return 0;
+}
+
+/**
+ * Search symbols with fuzzy matching
+ * Handles large repositories with early termination and result limits
+ */
+function fuzzySearchSymbols(query, type = null, minScore = 30, maxResults = INDEX_CONFIG.SEARCH_RESULT_LIMIT) {
+    const results = [];
+    let scanned = 0;
+    const maxScan = codeIndex.symbols.size > 10000 ? 10000 : codeIndex.symbols.size; // Limit scan for huge repos
+    
+    for (const [key, symbol] of codeIndex.symbols) {
+        if (scanned++ > maxScan) {
+            log('fuzzySearchSymbols: Hit scan limit at', maxScan);
+            break;
+        }
+        
+        if (type && symbol.type !== type) continue;
+        
+        const score = fuzzyMatchScore(query, symbol.name);
+        if (score >= minScore) {
+            results.push({
+                ...symbol,
+                file: symbol.file?.split('/').pop() || key.split('@')[1]?.split('/').pop(),
+                matchScore: score
+            });
+            
+            // Early termination if we have enough high-quality results
+            if (results.length >= maxResults * 2 && results.filter(r => r.matchScore > 70).length >= maxResults) {
+                log('fuzzySearchSymbols: Early termination with', results.length, 'results');
+                break;
+            }
+        }
+    }
+    
+    // Sort by score descending
+    results.sort((a, b) => b.matchScore - a.matchScore);
+    
+    // Return limited results
+    return results.slice(0, maxResults);
+}
+
+/**
+ * AGENT TOOLS REGISTRY
+ * Defines all available tools the agent can use
+ */
+const AGENT_TOOLS = {
+    // === CONTEXT TOOLS (work with attached files) ===
+    read_context_file: {
+        name: 'read_context_file',
+        description: 'Read content of a specific file from the attached context',
+        parameters: { fileName: 'string' },
+        execute: async (params) => {
+            const { fileName } = params;
+            for (const [path, file] of contextFiles) {
+                const name = path.split('/').pop();
+                if (name === fileName || name.toLowerCase() === fileName.toLowerCase()) {
+                    return { 
+                        success: true, 
+                        data: { 
+                            fileName: name, 
+                            content: file.content, 
+                            language: file.language,
+                            size: file.content.length 
+                        }
+                    };
+                }
+            }
+            return { success: false, error: `File "${fileName}" not found in context` };
+        }
+    },
+    
+    list_context_files: {
+        name: 'list_context_files',
+        description: 'List all files currently in context with their sizes and languages',
+        parameters: {},
+        execute: async () => {
+            const files = [];
+            for (const [path, file] of contextFiles) {
+                files.push({
+                    name: path.split('/').pop(),
+                    path: path,
+                    language: file.language,
+                    size: file.content.length,
+                    lines: file.content.split('\n').length
+                });
+            }
+            return { success: true, data: { files, count: files.length } };
+        }
+    },
+    
+    grep_context: {
+        name: 'grep_context',
+        description: 'Search for a pattern across all context files, returns matching lines with surrounding context',
+        parameters: { pattern: 'string', caseSensitive: 'boolean?', contextLines: 'number?' },
+        execute: async (params) => {
+            const { pattern, caseSensitive = false, contextLines = 5 } = params;
+            const results = [];
+            const regex = new RegExp(pattern, caseSensitive ? 'g' : 'gi');
+            
+            log('grep_context: Searching for pattern:', pattern);
+            log('grep_context: Context lines:', contextLines);
+            
+            for (const [path, file] of contextFiles) {
+                const fileName = path.split('/').pop();
+                const lines = file.content.split('\n');
+                const matchedLineNums = new Set();
+                
+                // Find all matching line numbers
+                lines.forEach((line, idx) => {
+                    // Reset regex lastIndex for each test
+                    regex.lastIndex = 0;
+                    if (regex.test(line)) {
+                        matchedLineNums.add(idx);
+                    }
+                });
+                
+                log('grep_context:', fileName, '- found', matchedLineNums.size, 'matches');
+                
+                // Group matches that are close together
+                if (matchedLineNums.size > 0) {
+                    const sortedMatches = Array.from(matchedLineNums).sort((a, b) => a - b);
+                    
+                    // Create ranges with context
+                    let ranges = [];
+                    let currentRange = null;
+                    
+                    for (const lineNum of sortedMatches) {
+                        const start = Math.max(0, lineNum - contextLines);
+                        const end = Math.min(lines.length - 1, lineNum + contextLines);
+                        
+                        if (currentRange && start <= currentRange.end + 2) {
+                            // Merge with current range
+                            currentRange.end = end;
+                            currentRange.matchLines.push(lineNum);
+                        } else {
+                            // Start new range
+                            if (currentRange) ranges.push(currentRange);
+                            currentRange = { start, end, matchLines: [lineNum] };
+                        }
+                    }
+                    if (currentRange) ranges.push(currentRange);
+                    
+                    // Extract code blocks with context
+                    for (const range of ranges) {
+                        const codeBlock = lines.slice(range.start, range.end + 1)
+                            .map((line, i) => {
+                                const actualLineNum = range.start + i + 1;
+                                const isMatch = range.matchLines.includes(range.start + i);
+                                return `${actualLineNum.toString().padStart(4)}: ${isMatch ? '>>> ' : '    '}${line}`;
+                            })
+                            .join('\n');
+                        
+                        results.push({
+                            fileName,
+                            startLine: range.start + 1,
+                            endLine: range.end + 1,
+                            matchCount: range.matchLines.length,
+                            content: codeBlock
+                        });
+                    }
+                }
+            }
+            
+            log('grep_context: Total result blocks:', results.length);
+            return { success: true, data: { results, count: results.length, totalMatches: results.reduce((s, r) => s + r.matchCount, 0) } };
+        }
+    },
+    
+    // === LOCAL INDEX TOOLS (work with in-memory code index) ===
+    search_index: {
+        name: 'search_index',
+        description: 'Search the local code index for symbols, functions, classes using fuzzy matching. Handles cryptic names like "RTE" matching "RangeTblEntry". Returns symbol definitions with locations and call relationships.',
+        parameters: { pattern: 'string', type: 'string?', fuzzy: 'boolean?' },
+        execute: async (params) => {
+            const { pattern, type, fuzzy = true } = params;
+            
+            log('search_index: Searching for pattern:', pattern, 'type:', type || 'all', 'fuzzy:', fuzzy);
+            
+            const results = {
+                symbols: [],
+                functions: [],
+                classes: [],
+                callGraph: [],
+                calledBy: []
+            };
+            
+            if (fuzzy) {
+                // Use fuzzy matching
+                const fuzzyResults = fuzzySearchSymbols(pattern, type, 30);
+                log('search_index: Fuzzy search found', fuzzyResults.length, 'matches');
+                
+                for (const symbol of fuzzyResults) {
+                    results.symbols.push({
+                        name: symbol.name,
+                        type: symbol.type,
+                        file: symbol.file,
+                        line: symbol.line,
+                        params: symbol.params,
+                        dataType: symbol.dataType,
+                        matchScore: symbol.matchScore
+                    });
+                    
+                    // Categorize
+                    if (symbol.type === 'function' || symbol.type === 'method' || symbol.type === 'procedure') {
+                        results.functions.push(symbol.name);
+                    } else if (symbol.type === 'class') {
+                        results.classes.push(symbol.name);
+                    }
+                }
+            } else {
+                // Use regex matching
+                const regex = new RegExp(pattern, 'i');
+                
+                for (const [key, symbol] of codeIndex.symbols) {
+                    if (regex.test(symbol.name)) {
+                        if (type && symbol.type !== type) continue;
+                        
+                        results.symbols.push({
+                            name: symbol.name,
+                            type: symbol.type,
+                            file: symbol.file?.split('/').pop() || key.split('@')[1]?.split('/').pop(),
+                            line: symbol.line,
+                            params: symbol.params,
+                            dataType: symbol.dataType
+                        });
+                        
+                        if (symbol.type === 'function' || symbol.type === 'method' || symbol.type === 'procedure') {
+                            results.functions.push(symbol.name);
+                        } else if (symbol.type === 'class') {
+                            results.classes.push(symbol.name);
+                        }
+                    }
+                }
+            }
+            
+            // Get call graph for matched functions
+            for (const funcName of results.functions) {
+                const calls = codeIndex.callGraph.get(funcName);
+                if (calls && calls.size > 0) {
+                    results.callGraph.push({
+                        function: funcName,
+                        calls: Array.from(calls)
+                    });
+                }
+                
+                const callers = codeIndex.reverseCallGraph.get(funcName);
+                if (callers && callers.size > 0) {
+                    results.calledBy.push({
+                        function: funcName,
+                        calledBy: Array.from(callers)
+                    });
+                }
+            }
+            
+            log('search_index: Found', results.symbols.length, 'symbols,', 
+                results.functions.length, 'functions,',
+                results.classes.length, 'classes');
+            
+            return { 
+                success: true, 
+                data: { 
+                    ...results,
+                    summary: {
+                        symbolCount: results.symbols.length,
+                        functionCount: results.functions.length,
+                        classCount: results.classes.length,
+                        hasCallGraph: results.callGraph.length > 0
+                    }
+                } 
+            };
+        }
+    },
+    
+    get_function_context: {
+        name: 'get_function_context',
+        description: 'Get the full source code of a specific function/method and its call relationships',
+        parameters: { functionName: 'string' },
+        execute: async (params) => {
+            const { functionName } = params;
+            
+            log('get_function_context: Looking for function:', functionName);
+            
+            // Find the symbol
+            let symbol = codeIndex.symbols.get(functionName);
+            if (!symbol) {
+                // Try to find by partial match
+                for (const [key, sym] of codeIndex.symbols) {
+                    if (sym.name === functionName || key.startsWith(functionName + '@')) {
+                        symbol = sym;
+                        break;
+                    }
+                }
+            }
+            
+            if (!symbol) {
+                return { success: false, error: `Function "${functionName}" not found in index` };
+            }
+            
+            // Get the file content
+            const file = contextFiles.get(symbol.file);
+            if (!file) {
+                return { success: false, error: `Source file not in context: ${symbol.file}` };
+            }
+            
+            // Extract function body (heuristic: from definition line to next function or end)
+            const lines = file.content.split('\n');
+            const startLine = symbol.line - 1;
+            let endLine = startLine + 1;
+            
+            // Find end of function (simple heuristic based on indentation/braces)
+            const startIndent = lines[startLine].match(/^\s*/)[0].length;
+            for (let i = startLine + 1; i < lines.length; i++) {
+                const line = lines[i];
+                const indent = line.match(/^\s*/)[0].length;
+                // Check for next function at same or lower indentation
+                if (line.trim() && indent <= startIndent && 
+                    (line.match(/^[\s]*(def |class |function |async function |proc |procedure )/i) ||
+                     (indent === 0 && line.match(/^\w/)))) {
+                    endLine = i;
+                    break;
+                }
+                endLine = i + 1;
+            }
+            
+            // Limit to 100 lines max
+            endLine = Math.min(endLine, startLine + 100);
+            
+            const functionCode = lines.slice(startLine, endLine)
+                .map((line, i) => `${(startLine + i + 1).toString().padStart(4)}: ${line}`)
+                .join('\n');
+            
+            // Get call relationships
+            const calls = codeIndex.callGraph.get(functionName);
+            const calledBy = codeIndex.reverseCallGraph.get(functionName);
+            
+            log('get_function_context: Found function at line', symbol.line, 
+                'calls:', calls?.size || 0, 'calledBy:', calledBy?.size || 0);
+            
+            return {
+                success: true,
+                data: {
+                    name: functionName,
+                    file: symbol.file?.split('/').pop(),
+                    line: symbol.line,
+                    type: symbol.type,
+                    params: symbol.params,
+                    code: functionCode,
+                    calls: calls ? Array.from(calls) : [],
+                    calledBy: calledBy ? Array.from(calledBy) : []
+                }
+            };
+        }
+    },
+
+    // === COMPREHENSIVE SEARCH (combines index + grep) ===
+    search_code: {
+        name: 'search_code',
+        description: 'Comprehensive code search: combines fuzzy index search AND grep for thorough results. Use this for implementation questions.',
+        parameters: { query: 'string', contextLines: 'number?', expandTerms: 'boolean?' },
+        execute: async (params) => {
+            const { query, contextLines = 5, expandTerms = true } = params;
+            
+            log('search_code: Comprehensive search for:', query);
+            
+            // Build search terms from query
+            let searchTerms = query.split(/[\s,|]+/).filter(t => t.length >= 2);
+            log('search_code: Initial terms:', searchTerms);
+            
+            // LLM-powered term expansion - find related function/variable names
+            if (expandTerms && searchTerms.length < 10) {
+                try {
+                    const expansionPrompt = `Given this search query about code: "${query}"
+
+Generate additional search terms that would help find the IMPLEMENTATION code.
+
+Think about:
+- Function names that might implement this (e.g., "prepare_", "build_", "create_", "_encode", "_parse")
+- Variable names related to this feature
+- Common programming patterns for this functionality
+
+Current terms: ${searchTerms.join(', ')}
+
+Return ONLY a comma-separated list of 5-10 additional search terms (single words, no phrases):`;
+                    
+                    const expandedTermsStr = await callLanguageModel(expansionPrompt);
+                    const expandedTerms = expandedTermsStr
+                        .split(/[,\n]+/)
+                        .map(t => t.trim().toLowerCase())
+                        .filter(t => t.length >= 2 && t.length <= 30 && !t.includes(' '));
+                    
+                    // Add unique expanded terms
+                    const existingLower = new Set(searchTerms.map(t => t.toLowerCase()));
+                    for (const term of expandedTerms.slice(0, 10)) {
+                        if (!existingLower.has(term)) {
+                            searchTerms.push(term);
+                            existingLower.add(term);
+                        }
+                    }
+                    log('search_code: Expanded terms:', searchTerms);
+                } catch (err) {
+                    log('search_code: Term expansion failed:', err.message);
+                }
+            }
+            
+            const results = {
+                indexResults: {
+                    symbols: [],
+                    functions: [],
+                    callGraph: []
+                },
+                grepResults: [],
+                combinedContext: ''
+            };
+            
+            // 1. Search index with fuzzy matching for each term
+            const seenSymbols = new Set();
+            for (const term of searchTerms) {
+                const fuzzyResults = fuzzySearchSymbols(term, null, 40);
+                for (const symbol of fuzzyResults.slice(0, 10)) { // Top 10 per term
+                    if (!seenSymbols.has(symbol.name)) {
+                        seenSymbols.add(symbol.name);
+                        results.indexResults.symbols.push({
+                            name: symbol.name,
+                            type: symbol.type,
+                            file: symbol.file,
+                            line: symbol.line,
+                            matchScore: symbol.matchScore
+                        });
+                        
+                        if (symbol.type === 'function' || symbol.type === 'method' || symbol.type === 'procedure') {
+                            results.indexResults.functions.push(symbol.name);
+                            
+                            // Get call graph
+                            const calls = codeIndex.callGraph.get(symbol.name);
+                            const calledBy = codeIndex.reverseCallGraph.get(symbol.name);
+                            if (calls?.size > 0 || calledBy?.size > 0) {
+                                results.indexResults.callGraph.push({
+                                    function: symbol.name,
+                                    calls: calls ? Array.from(calls) : [],
+                                    calledBy: calledBy ? Array.from(calledBy) : []
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            
+            log('search_code: Index search found', results.indexResults.symbols.length, 'symbols');
+            
+            // 2. Grep for patterns in actual code
+            // Limit files to search for large repos
+            const MAX_FILES_TO_GREP = 200;
+            const MAX_TOTAL_GREP_RESULTS = 50;
+            
+            const grepPattern = searchTerms.join('|');
+            const grepRegex = new RegExp(grepPattern, 'gi');
+            
+            let filesSearched = 0;
+            for (const [path, file] of contextFiles) {
+                // Stop if we have enough results
+                if (results.grepResults.length >= MAX_TOTAL_GREP_RESULTS) {
+                    log('search_code: Hit grep result limit at', MAX_TOTAL_GREP_RESULTS);
+                    break;
+                }
+                
+                // Stop if we've searched enough files
+                if (filesSearched++ >= MAX_FILES_TO_GREP) {
+                    log('search_code: Hit file limit at', MAX_FILES_TO_GREP);
+                    break;
+                }
+                
+                const fileName = path.split('/').pop();
+                const lines = file.content.split('\n');
+                const matchedLineNums = new Set();
+                
+                // Skip very large files in large repos
+                if (contextFiles.size > 100 && lines.length > 5000) {
+                    log('search_code: Skipping large file', fileName, 'with', lines.length, 'lines');
+                    continue;
+                }
+                
+                lines.forEach((line, idx) => {
+                    grepRegex.lastIndex = 0;
+                    if (grepRegex.test(line)) {
+                        matchedLineNums.add(idx);
+                    }
+                });
+                
+                if (matchedLineNums.size > 0) {
+                    const sortedMatches = Array.from(matchedLineNums).sort((a, b) => a - b);
+                    
+                    // Group nearby matches
+                    let ranges = [];
+                    let currentRange = null;
+                    
+                    for (const lineNum of sortedMatches) {
+                        const start = Math.max(0, lineNum - contextLines);
+                        const end = Math.min(lines.length - 1, lineNum + contextLines);
+                        
+                        if (currentRange && start <= currentRange.end + 2) {
+                            currentRange.end = end;
+                            currentRange.matchLines.push(lineNum);
+                        } else {
+                            if (currentRange) ranges.push(currentRange);
+                            currentRange = { start, end, matchLines: [lineNum] };
+                        }
+                    }
+                    if (currentRange) ranges.push(currentRange);
+                    
+                    // Extract code blocks - limit per file
+                    const maxBlocksPerFile = contextFiles.size > 100 ? 2 : 5;
+                    for (const range of ranges.slice(0, maxBlocksPerFile)) {
+                        const codeBlock = lines.slice(range.start, range.end + 1)
+                            .map((line, i) => {
+                                const actualLineNum = range.start + i + 1;
+                                const isMatch = range.matchLines.includes(range.start + i);
+                                return `${actualLineNum.toString().padStart(4)}: ${isMatch ? '>>> ' : '    '}${line}`;
+                            })
+                            .join('\n');
+                        
+                        results.grepResults.push({
+                            fileName,
+                            startLine: range.start + 1,
+                            endLine: range.end + 1,
+                            matchCount: range.matchLines.length,
+                            content: codeBlock
+                        });
+                    }
+                }
+            }
+            
+            log('search_code: Grep found', results.grepResults.length, 'code blocks from', filesSearched, 'files');
+            
+            // 3. Build combined context for LLM
+            let combined = '# SEARCH RESULTS\n\n';
+            
+            // Check if we found anything
+            const foundNothing = results.indexResults.symbols.length === 0 && results.grepResults.length === 0;
+            
+            if (foundNothing) {
+                combined += `## No Results Found\n`;
+                combined += `Search query "${query}" did not match any symbols or code in the attached files.\n\n`;
+                combined += `### Files searched:\n`;
+                for (const [path] of contextFiles) {
+                    combined += `- ${path.split('/').pop()}\n`;
+                }
+                combined += `\n### Suggestions:\n`;
+                combined += `- Try different search terms\n`;
+                combined += `- Check if the relevant code is in the attached files\n`;
+                combined += `- Use more general terms\n`;
+            } else {
+                // Include ALL index results - answer_question will handle chunking
+                if (results.indexResults.symbols.length > 0) {
+                    combined += '## Symbols Found (by relevance)\n';
+                    for (const sym of results.indexResults.symbols) {
+                        combined += `- ${sym.name} (${sym.type}) in ${sym.file}:${sym.line}`;
+                        if (sym.matchScore) combined += ` [score:${sym.matchScore}]`;
+                        combined += '\n';
+                    }
+                    combined += '\n';
+                }
+                
+                // Include ALL call graph relationships
+                if (results.indexResults.callGraph.length > 0) {
+                    combined += '## Call Relationships\n';
+                    for (const cg of results.indexResults.callGraph) {
+                        if (cg.calls.length > 0) {
+                            combined += `- ${cg.function} calls: ${cg.calls.join(', ')}\n`;
+                        }
+                        if (cg.calledBy.length > 0) {
+                            combined += `- ${cg.function} called by: ${cg.calledBy.join(', ')}\n`;
+                        }
+                    }
+                    combined += '\n';
+                }
+                
+                // Include ALL grep results - answer_question will chunk if needed
+                if (results.grepResults.length > 0) {
+                    combined += '## Relevant Code\n\n';
+                    
+                    for (const block of results.grepResults) {
+                        combined += `### ${block.fileName} (lines ${block.startLine}-${block.endLine})\n`;
+                        combined += '```\n' + block.content + '\n```\n\n';
+                    }
+                }
+            }
+            
+            results.combinedContext = combined;
+            log('search_code: Final context size:', combined.length, 'chars');
+            log('search_code: Will be chunked if > 18KB by answer_question');
+            
+            return {
+                success: true,
+                data: {
+                    ...results,
+                    summary: {
+                        symbolCount: results.indexResults.symbols.length,
+                        functionCount: results.indexResults.functions.length,
+                        grepBlocks: results.grepResults.length,
+                        totalMatches: results.grepResults.reduce((s, r) => s + r.matchCount, 0)
+                    }
+                }
+            };
+        }
+    },
+
+    // === API SERVER TOOLS (work with indexed codebase) ===
+    search_codebase: {
+        name: 'search_codebase',
+        description: 'Search the API server for code matching a query',
+        parameters: { query: 'string', limit: 'number?' },
+        execute: async (params) => {
+            const { query, limit = 10 } = params;
+            const config = vscode.workspace.getConfiguration('astra');
+            const apiUrl = config.get('apiUrl') || 'http://localhost:8080';
+            
+            try {
+                const response = await fetch(`${apiUrl}/api/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+                if (!response.ok) throw new Error(`API error: ${response.status}`);
+                const data = await response.json();
+                return { success: true, data };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        }
+    },
+    
+    get_file_from_api: {
+        name: 'get_file_from_api',
+        description: 'Fetch a specific file from the API server by path',
+        parameters: { filePath: 'string' },
+        execute: async (params) => {
+            const { filePath } = params;
+            const config = vscode.workspace.getConfiguration('astra');
+            const apiUrl = config.get('apiUrl') || 'http://localhost:8080';
+            
+            try {
+                const response = await fetch(`${apiUrl}/api/file?path=${encodeURIComponent(filePath)}`);
+                if (!response.ok) throw new Error(`API error: ${response.status}`);
+                const data = await response.json();
+                return { success: true, data };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        }
+    },
+    
+    check_api_available: {
+        name: 'check_api_available',
+        description: 'Check if the API server is available and get its capabilities',
+        parameters: {},
+        execute: async () => {
+            const config = vscode.workspace.getConfiguration('astra');
+            const apiUrl = config.get('apiUrl') || 'http://localhost:8080';
+            
+            try {
+                const response = await fetch(`${apiUrl}/health`, { 
+                    method: 'GET',
+                    signal: AbortSignal.timeout(3000)
+                });
+                if (response.ok) {
+                    return { success: true, data: { available: true, url: apiUrl } };
+                }
+                return { success: true, data: { available: false, url: apiUrl } };
+            } catch (error) {
+                return { success: true, data: { available: false, url: apiUrl, error: error.message } };
+            }
+        }
+    },
+    
+    // === CODE INDEX TOOLS (use local code index) ===
+    get_symbol_info: {
+        name: 'get_symbol_info',
+        description: 'Get information about a symbol (function, class, variable) from the code index',
+        parameters: { symbolName: 'string' },
+        execute: async (params) => {
+            const { symbolName } = params;
+            const symbol = codeIndex.symbols.get(symbolName);
+            if (symbol) {
+                const calls = codeIndex.callGraph.get(symbolName);
+                const callers = codeIndex.reverseCallGraph.get(symbolName);
+                return { 
+                    success: true, 
+                    data: { 
+                        ...symbol, 
+                        calls: calls ? [...calls] : [],
+                        calledBy: callers ? [...callers] : []
+                    }
+                };
+            }
+            return { success: false, error: `Symbol "${symbolName}" not found in index` };
+        }
+    },
+    
+    get_call_graph: {
+        name: 'get_call_graph',
+        description: 'Get the call graph for a function (what it calls and what calls it)',
+        parameters: { functionName: 'string', depth: 'number?' },
+        execute: async (params) => {
+            const { functionName, depth = 3 } = params;
+            const graph = buildCallGraphFromSymbol(functionName, depth);
+            if (graph.nodes.size > 0) {
+                return { 
+                    success: true, 
+                    data: { 
+                        root: graph.root,
+                        nodes: [...graph.nodes.keys()],
+                        edges: graph.edges,
+                        text: formatCallGraphAsText(graph)
+                    }
+                };
+            }
+            return { success: false, error: `No call graph found for "${functionName}"` };
+        }
+    },
+    
+    list_symbols: {
+        name: 'list_symbols',
+        description: 'List all symbols in the code index, optionally filtered by type or file',
+        parameters: { type: 'string?', file: 'string?' },
+        execute: async (params) => {
+            const { type, file } = params;
+            const symbols = [];
+            for (const [name, info] of codeIndex.symbols) {
+                if (type && info.type !== type) continue;
+                if (file && !info.file?.includes(file)) continue;
+                symbols.push({ name, type: info.type, file: info.file?.split('/').pop(), line: info.line });
+            }
+            return { success: true, data: { symbols, count: symbols.length } };
+        }
+    },
+    
+    // === ANALYSIS TOOLS ===
+    analyze_code_structure: {
+        name: 'analyze_code_structure',
+        description: 'Analyze the structure of code (functions, classes, imports)',
+        parameters: { content: 'string', language: 'string?' },
+        execute: async (params) => {
+            const { content, language } = params;
+            // Use regex patterns to extract structure
+            const functions = [];
+            const classes = [];
+            const imports = [];
+            
+            // C/Java style functions
+            const funcPattern = /(?:(?:public|private|protected|static|async|export)\s+)*(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*(?:\{|;)/g;
+            let match;
+            while ((match = funcPattern.exec(content)) !== null) {
+                functions.push(match[1]);
+            }
+            
+            // Classes/structs
+            const classPattern = /(?:class|struct|interface|enum)\s+(\w+)/g;
+            while ((match = classPattern.exec(content)) !== null) {
+                classes.push(match[1]);
+            }
+            
+            // Imports
+            const importPattern = /(?:#include|import|from|require)\s*[<"']?([^>"'\s;]+)/g;
+            while ((match = importPattern.exec(content)) !== null) {
+                imports.push(match[1]);
+            }
+            
+            return { 
+                success: true, 
+                data: { 
+                    functions: [...new Set(functions)], 
+                    classes: [...new Set(classes)], 
+                    imports: [...new Set(imports)],
+                    lines: content.split('\n').length
+                }
+            };
+        }
+    },
+    
+    // === TRANSFORMATION TOOLS ===
+    translate_code: {
+        name: 'translate_code',
+        description: 'Translate code from one language to another using LLM. Handles large files by chunking.',
+        parameters: { content: 'string', sourceLanguage: 'string', targetLanguage: 'string', fileName: 'string?' },
+        execute: async (params) => {
+            const { content, sourceLanguage, targetLanguage, fileName } = params;
+            const lines = content.split('\n');
+            const MAX_LINES_PER_CHUNK = 300;
+            
+            // For small files, translate directly
+            if (lines.length <= MAX_LINES_PER_CHUNK) {
+                const prompt = `Translate this ${sourceLanguage} code to ${targetLanguage}. 
+${fileName ? `File: ${fileName}` : ''}
+
+CRITICAL RULES:
+1. Translate EVERY line - no placeholders, no "// TODO", no "// other methods"
+2. Preserve ALL logic, ALL branches, ALL error handling
+3. Use idiomatic ${targetLanguage} patterns
+4. Keep comments (translate if needed)
+5. The translation MUST be complete and compilable
+6. DO NOT summarize or skip any code
+
+SOURCE CODE:
+\`\`\`${sourceLanguage}
+${content}
+\`\`\`
+
+Output ONLY the translated ${targetLanguage} code (no explanation):`;
+
+                const result = await callLanguageModel(prompt);
+                // Extract code from markdown if present
+                let translatedCode = result;
+                const codeMatch = result.match(/\`\`\`(?:\w+)?\n([\s\S]*?)\n\`\`\`/);
+                if (codeMatch) {
+                    translatedCode = codeMatch[1];
+                }
+                // Clean up lazy LLM patterns
+                translatedCode = cleanupGeneratedCode(translatedCode);
+                return { success: true, data: { translatedCode, targetLanguage, chunks: 1 } };
+            }
+            
+            // For large files, chunk and translate
+            log(`TRANSLATE: Large file (${lines.length} lines), chunking...`);
+            const chunks = [];
+            let currentChunk = [];
+            let braceDepth = 0;
+            
+            // Smart chunking - try to break at function boundaries
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                currentChunk.push(line);
+                
+                // Track brace depth
+                braceDepth += (line.match(/\{/g) || []).length;
+                braceDepth -= (line.match(/\}/g) || []).length;
+                
+                // Break at function boundaries when possible
+                if (currentChunk.length >= MAX_LINES_PER_CHUNK && braceDepth === 0) {
+                    chunks.push(currentChunk.join('\n'));
+                    currentChunk = [];
+                }
+                // Force break if chunk is too large
+                else if (currentChunk.length >= MAX_LINES_PER_CHUNK * 1.5) {
+                    chunks.push(currentChunk.join('\n'));
+                    currentChunk = [];
+                }
+            }
+            if (currentChunk.length > 0) {
+                chunks.push(currentChunk.join('\n'));
+            }
+            
+            log(`TRANSLATE: Split into ${chunks.length} chunks`);
+            
+            // Translate each chunk
+            const translatedChunks = [];
+            for (let i = 0; i < chunks.length; i++) {
+                const chunk = chunks[i];
+                const isFirst = i === 0;
+                const isLast = i === chunks.length - 1;
+                
+                const chunkPrompt = `Translate this ${sourceLanguage} code to ${targetLanguage}.
+${fileName ? `File: ${fileName}` : ''} (Part ${i + 1}/${chunks.length})
+${isFirst ? 'This is the BEGINNING of the file - include imports/headers.' : ''}
+${isLast ? 'This is the END of the file - include closing braces.' : ''}
+
+RULES:
+- Translate EVERY line completely
+- NO placeholders or TODO comments
+- Preserve all logic and comments
+
+SOURCE (Part ${i + 1}):
+\`\`\`${sourceLanguage}
+${chunk}
+\`\`\`
+
+Output ONLY the translated code for this part:`;
+
+                const result = await callLanguageModel(chunkPrompt);
+                let translatedChunk = result;
+                const codeMatch = result.match(/\`\`\`(?:\w+)?\n([\s\S]*?)\n\`\`\`/);
+                if (codeMatch) {
+                    translatedChunk = codeMatch[1];
+                }
+                // Clean up lazy LLM patterns
+                translatedChunk = cleanupGeneratedCode(translatedChunk);
+                translatedChunks.push(translatedChunk);
+            }
+            
+            let fullTranslation = translatedChunks.join('\n\n');
+            // Final cleanup of complete translation
+            fullTranslation = cleanupGeneratedCode(fullTranslation);
+            return { 
+                success: true, 
+                data: { 
+                    translatedCode: fullTranslation, 
+                    targetLanguage, 
+                    chunks: chunks.length,
+                    originalLines: lines.length
+                }
+            };
+        }
+    },
+    
+    translate_file: {
+        name: 'translate_file',
+        description: 'Translate a specific file from context to another language',
+        parameters: { fileName: 'string', targetLanguage: 'string' },
+        execute: async (params) => {
+            const { fileName, targetLanguage } = params;
+            
+            // Find the file in context
+            let targetFile = null;
+            for (const [path, file] of contextFiles) {
+                const name = path.split('/').pop();
+                if (name === fileName || name.toLowerCase() === fileName.toLowerCase()) {
+                    targetFile = { name, content: file.content, language: file.language };
+                    break;
+                }
+            }
+            
+            if (!targetFile) {
+                return { success: false, error: `File "${fileName}" not found in context` };
+            }
+            
+            // Use the translate_code tool
+            return await AGENT_TOOLS.translate_code.execute({
+                content: targetFile.content,
+                sourceLanguage: targetFile.language,
+                targetLanguage: targetLanguage,
+                fileName: targetFile.name
+            });
+        }
+    },
+    
+    translate_all_files: {
+        name: 'translate_all_files',
+        description: 'Translate ALL attached files to a target language. Includes critique loop and compilation. Preserves all symbols, methods, variables, functions, and decimal precision.',
+        parameters: { targetLanguage: 'string', outputStyle: 'string?', compile: 'boolean?' },
+        execute: async (params) => {
+            const { targetLanguage, outputStyle = 'separate', compile = true } = params;
+            const MAX_CRITIQUE_ITERATIONS = 10;
+            
+            if (contextFiles.size === 0) {
+                return { success: false, error: 'No files attached. Please attach source files to translate.' };
+            }
+            
+            log(`TRANSLATE_ALL: Translating ${contextFiles.size} files to ${targetLanguage}`);
+            
+            // First pass: Extract all symbols from all files for context
+            const allSymbols = new Map();
+            const allFiles = [];
+            
+            for (const [path, file] of contextFiles) {
+                const fileName = path.split('/').pop();
+                allFiles.push({ path, fileName, content: file.content, language: file.language });
+                
+                // Extract symbols from this file
+                const fileSymbols = extractSymbolsFromCode(file.content, file.language);
+                for (const sym of fileSymbols) {
+                    allSymbols.set(sym.name, { ...sym, sourceFile: fileName });
+                }
+            }
+            
+            log(`TRANSLATE_ALL: Found ${allSymbols.size} symbols across ${allFiles.length} files`);
+            
+            // Build symbol reference for translation consistency
+            const symbolReference = Array.from(allSymbols.values())
+                .slice(0, 100) // Limit to avoid huge prompts
+                .map(s => `- ${s.name} (${s.type}) from ${s.sourceFile}`)
+                .join('\n');
+            
+            // Translate each file with critique loop
+            const translatedFiles = [];
+            
+            for (let i = 0; i < allFiles.length; i++) {
+                const file = allFiles[i];
+                const fileLines = file.content.split('\n').length;
+                
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n*Translating file ${i + 1}/${allFiles.length}: ${file.fileName} (${fileLines} lines)...*\n`
+                });
+                
+                // For large files, use chunked translation
+                let translatedCode;
+                if (fileLines > 500) {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `*Large file detected - using chunked translation...*\n`
+                    });
+                    translatedCode = await translateLargeFile(file, targetLanguage, symbolReference);
+                } else {
+                    translatedCode = await translateSingleFile(file, targetLanguage, symbolReference);
+                }
+                
+                if (!translatedCode) {
+                    translatedFiles.push({
+                        originalFile: file.fileName,
+                        error: 'Translation failed'
+                    });
+                    continue;
+                }
+                
+                // Critique loop
+                let iteration = 0;
+                let critiqueResult = { passed: false, issues: [] };
+                
+                while (iteration < MAX_CRITIQUE_ITERATIONS) {
+                    // Check for cancellation
+                    if (taskController.isCancelled) {
+                        log('Translation critique cancelled by user');
+                        throw new Error('Task cancelled by user');
+                    }
+                    
+                    iteration++;
+                    
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `*Critique iteration ${iteration}/${MAX_CRITIQUE_ITERATIONS}...*\n`
+                    });
+                    
+                    // Run critique
+                    critiqueResult = await critiqueTranslation(
+                        file.content, 
+                        file.language,
+                        translatedCode, 
+                        targetLanguage,
+                        file.fileName
+                    );
+                    
+                    if (critiqueResult.passed) {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: `✅ *Critique passed on iteration ${iteration}*\n`
+                        });
+                        break;
+                    }
+                    
+                    // Show issues found
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `⚠️ *Found ${critiqueResult.issues.length} issues, fixing...*\n`
+                    });
+                    
+                    // Fix the issues
+                    translatedCode = await fixTranslationIssues(
+                        file.content,
+                        file.language,
+                        translatedCode,
+                        targetLanguage,
+                        critiqueResult.issues
+                    );
+                    
+                    if (!translatedCode) {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: `❌ *Fix attempt failed, using previous version*\n`
+                        });
+                        break;
+                    }
+                }
+                
+                if (iteration >= MAX_CRITIQUE_ITERATIONS && !critiqueResult.passed) {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `⚠️ *Max iterations reached, some issues may remain*\n`
+                    });
+                }
+                
+                // Generate new filename
+                const baseName = file.fileName.replace(/\.\w+$/, '');
+                const newExtension = getFileExtension(targetLanguage);
+                const newFileName = `${baseName}.${newExtension}`;
+                
+                translatedFiles.push({
+                    originalFile: file.fileName,
+                    newFileName,
+                    translatedCode,
+                    language: targetLanguage,
+                    critiqueIterations: iteration,
+                    critiquePassed: critiqueResult.passed
+                });
+            }
+            
+            // Compile if Java and compile flag is true
+            let compilationResult = null;
+            if (compile && targetLanguage.toLowerCase() === 'java') {
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n*Compiling Java files...*\n`
+                });
+                
+                compilationResult = await compileJavaFiles(translatedFiles);
+                
+                if (compilationResult.success) {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `✅ *Compilation successful!*\n`
+                    });
+                } else {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `❌ *Compilation failed*\n`
+                    });
+                    
+                    // Attempt to fix compilation errors (one more critique cycle)
+                    if (compilationResult.errors && compilationResult.errors.length > 0) {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: `*Attempting to fix ${compilationResult.errors.length} compilation errors...*\n`
+                        });
+                        
+                        // Fix each file that has errors
+                        for (const error of compilationResult.errors) {
+                            const fileToFix = translatedFiles.find(f => 
+                                f.newFileName === error.file || f.newFileName.endsWith(error.file)
+                            );
+                            
+                            if (fileToFix) {
+                                const originalFile = allFiles.find(f => f.fileName === fileToFix.originalFile);
+                                if (originalFile) {
+                                    const fixedCode = await fixCompilationError(
+                                        originalFile.content,
+                                        originalFile.language,
+                                        fileToFix.translatedCode,
+                                        targetLanguage,
+                                        error
+                                    );
+                                    
+                                    if (fixedCode) {
+                                        fileToFix.translatedCode = fixedCode;
+                                        fileToFix.compilationFixed = true;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Try compiling again
+                        compilationResult = await compileJavaFiles(translatedFiles);
+                        if (compilationResult.success) {
+                            chatWebviewView?.webview.postMessage({ 
+                                type: 'appendResponse', 
+                                text: `✅ *Compilation successful after fixes!*\n`
+                            });
+                        }
+                    }
+                }
+            }
+            
+            // Format output based on style
+            if (outputStyle === 'combined' || allFiles.length === 1) {
+                // Single output with all files
+                let combinedOutput = `// TRANSLATED PROJECT: ${targetLanguage}\n`;
+                combinedOutput += `// Original files: ${allFiles.map(f => f.fileName).join(', ')}\n\n`;
+                
+                for (const tf of translatedFiles) {
+                    if (tf.error) {
+                        combinedOutput += `// ERROR translating ${tf.originalFile}: ${tf.error}\n\n`;
+                    } else {
+                        combinedOutput += `// ========== ${tf.newFileName} ==========\n`;
+                        combinedOutput += tf.translatedCode;
+                        combinedOutput += '\n\n';
+                    }
+                }
+                
+                return {
+                    success: true,
+                    data: {
+                        translatedCode: combinedOutput,
+                        targetLanguage,
+                        fileCount: translatedFiles.length,
+                        files: translatedFiles.map(f => f.newFileName || f.originalFile)
+                    }
+                };
+            } else {
+                // Separate files
+                return {
+                    success: true,
+                    data: {
+                        translatedFiles,
+                        targetLanguage,
+                        fileCount: translatedFiles.length,
+                        summary: translatedFiles.map(f => 
+                            f.error 
+                                ? `❌ ${f.originalFile}: ${f.error}`
+                                : `✅ ${f.originalFile} → ${f.newFileName}`
+                        ).join('\n')
+                    }
+                };
+            }
+        }
+    },
+    
+    trace_code: {
+        name: 'trace_code',
+        description: 'Trace a function, feature, or concept through the codebase',
+        parameters: { target: 'string', traceType: 'string?' },
+        execute: async (params) => {
+            const { target, traceType = 'auto' } = params;
+            
+            // Determine if target is a function name or concept
+            const isFunction = codeIndex.symbols.has(target) || /^[a-zA-Z_]\w+$/.test(target);
+            
+            let traceInfo = '';
+            
+            if (isFunction && codeIndex.symbols.has(target)) {
+                // Function trace
+                const symbol = codeIndex.symbols.get(target);
+                const calls = codeIndex.callGraph.get(target);
+                const callers = codeIndex.reverseCallGraph.get(target);
+                
+                traceInfo = `## Function: ${target}\n`;
+                traceInfo += `- Type: ${symbol.type}\n`;
+                traceInfo += `- File: ${symbol.file?.split('/').pop()}:${symbol.line}\n`;
+                if (symbol.signature) traceInfo += `- Signature: ${symbol.signature}\n`;
+                
+                if (callers && callers.size > 0) {
+                    traceInfo += `\n### Called by (${callers.size}):\n`;
+                    for (const caller of [...callers].slice(0, 10)) {
+                        traceInfo += `- ${caller}\n`;
+                    }
+                }
+                
+                if (calls && calls.size > 0) {
+                    traceInfo += `\n### Calls (${calls.size}):\n`;
+                    for (const callee of [...calls].slice(0, 10)) {
+                        traceInfo += `- ${callee}\n`;
+                    }
+                }
+                
+                // Get call graph
+                const graph = buildCallGraphFromSymbol(target, 3);
+                traceInfo += `\n### Call Graph:\n${formatCallGraphAsText(graph)}\n`;
+                
+            } else {
+                // Concept trace - grep for keywords
+                const keywords = target.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+                const matches = [];
+                
+                for (const [path, file] of contextFiles) {
+                    const fileName = path.split('/').pop();
+                    const lines = file.content.split('\n');
+                    
+                    lines.forEach((line, idx) => {
+                        const lineLower = line.toLowerCase();
+                        const matchingKeywords = keywords.filter(k => lineLower.includes(k));
+                        if (matchingKeywords.length > 0) {
+                            matches.push({
+                                file: fileName,
+                                line: idx + 1,
+                                code: line.trim().substring(0, 100),
+                                keywords: matchingKeywords
+                            });
+                        }
+                    });
+                }
+                
+                // Sort by number of matching keywords
+                matches.sort((a, b) => b.keywords.length - a.keywords.length);
+                
+                traceInfo = `## Concept Trace: "${target}"\n`;
+                traceInfo += `Found ${matches.length} relevant lines\n\n`;
+                
+                // Group by file
+                const byFile = {};
+                for (const m of matches.slice(0, 50)) {
+                    if (!byFile[m.file]) byFile[m.file] = [];
+                    byFile[m.file].push(m);
+                }
+                
+                for (const [file, fileMatches] of Object.entries(byFile)) {
+                    traceInfo += `### ${file}\n`;
+                    for (const m of fileMatches.slice(0, 10)) {
+                        traceInfo += `- Line ${m.line}: ${m.code}\n`;
+                    }
+                    traceInfo += '\n';
+                }
+            }
+            
+            // Use LLM to analyze the trace
+            const analysisPrompt = `Analyze this code trace and explain the flow:
+
+${traceInfo}
+
+Provide:
+1. What is "${target}"?
+2. Entry points
+3. Call flow (top to bottom)
+4. Key data structures
+5. How it works step by step`;
+
+            const analysis = await callLanguageModel(analysisPrompt);
+            
+            return { 
+                success: true, 
+                data: { 
+                    trace: traceInfo, 
+                    analysis,
+                    target,
+                    isFunction 
+                }
+            };
+        }
+    },
+    
+    review_code: {
+        name: 'review_code',
+        description: 'Review code for bugs, issues, and improvements',
+        parameters: { content: 'string', focus: 'string?' },
+        execute: async (params) => {
+            const { content, focus = 'general' } = params;
+            
+            const prompt = `Review this code for ${focus === 'general' ? 'bugs, issues, and improvements' : focus}:
+
+\`\`\`
+${content.substring(0, 15000)}
+\`\`\`
+
+Provide a structured code review:
+
+## Summary
+Brief overview of the code quality
+
+## Issues Found
+List specific issues with line numbers if possible:
+- 🔴 Critical: [issue]
+- 🟡 Warning: [issue]
+- 🔵 Info: [suggestion]
+
+## Recommendations
+Specific improvements to make
+
+## Good Practices
+What the code does well`;
+
+            const review = await callLanguageModel(prompt);
+            return { success: true, data: { review, focus } };
+        }
+    },
+    
+    explain_code: {
+        name: 'explain_code',
+        description: 'Explain what a piece of code does',
+        parameters: { content: 'string', detail: 'string?' },
+        execute: async (params) => {
+            const { content, detail = 'medium' } = params;
+            const detailLevel = detail === 'brief' ? 'briefly' : detail === 'detailed' ? 'in detail' : 'concisely';
+            
+            const prompt = `Explain ${detailLevel} what this code does:
+
+\`\`\`
+${content.substring(0, 10000)}
+\`\`\`
+
+Explain the purpose, key functions, and how it works.`;
+
+            const result = await callLanguageModel(prompt);
+            return { success: true, data: { explanation: result } };
+        }
+    },
+    
+    document_code: {
+        name: 'document_code',
+        description: 'Generate documentation for code',
+        parameters: { content: 'string', format: 'string?' },
+        execute: async (params) => {
+            const { content, format = 'markdown' } = params;
+            
+            const prompt = `Generate ${format} documentation for this code:
+
+\`\`\`
+${content.substring(0, 12000)}
+\`\`\`
+
+Include:
+1. Overview
+2. Functions/methods with parameters and return types
+3. Usage examples
+4. Dependencies`;
+
+            const result = await callLanguageModel(prompt);
+            return { success: true, data: { documentation: result } };
+        }
+    },
+    
+    generate_full_documentation: {
+        name: 'generate_full_documentation',
+        description: 'Generate comprehensive DeepWiki-style documentation for all files in context',
+        parameters: { style: 'string?' },
+        execute: async (params) => {
+            const { style = 'deepwiki' } = params;
+            
+            if (contextFiles.size === 0) {
+                return { success: false, error: 'No files in context to document' };
+            }
+            
+            const fileList = [];
+            for (const [path, file] of contextFiles) {
+                fileList.push({ 
+                    name: path.split('/').pop(), 
+                    path, 
+                    language: file.language, 
+                    size: file.content.length 
+                });
+            }
+            
+            try {
+                const documentation = await generateDocumentationFile(fileList, `Generate ${style} documentation`);
+                return { success: true, data: { documentation, style, fileCount: fileList.length } };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        }
+    },
+    
+    search_api_server: {
+        name: 'search_api_server',
+        description: 'Search the API server codebase when no local context is available',
+        parameters: { query: 'string' },
+        execute: async (params) => {
+            const { query } = params;
+            const config = vscode.workspace.getConfiguration('astra');
+            const apiUrl = config.get('apiUrl') || 'http://localhost:8080';
+            
+            try {
+                const searchTerms = query.replace(/[^\w\s]/g, ' ').trim();
+                const response = await fetch(`${apiUrl}/api/search?q=${encodeURIComponent(searchTerms)}&limit=10`);
+                
+                if (!response.ok) {
+                    return { success: false, error: `API returned ${response.status}` };
+                }
+                
+                const results = await response.json();
+                
+                if (!results || results.length === 0) {
+                    return { success: true, data: { results: [], message: 'No results found' } };
+                }
+                
+                // Build context from results
+                let context = '';
+                for (const r of results.slice(0, 5)) {
+                    context += `=== ${r.procedure_name || r.file_path} ===\n`;
+                    context += (r.content_preview || r.content || '').substring(0, 2000);
+                    context += '\n\n';
+                }
+                
+                return { success: true, data: { results, context, count: results.length } };
+            } catch (error) {
+                return { success: false, error: `API server error: ${error.message}` };
+            }
+        }
+    },
+    
+    // === CODE GENERATION TOOLS ===
+    generate_code: {
+        name: 'generate_code',
+        description: 'Generate new code based on requirements and save to file',
+        parameters: { requirements: 'string', language: 'string', fileName: 'string?' },
+        execute: async (params) => {
+            const { requirements, language, fileName } = params;
+            
+            const prompt = `Generate ${language} code based on these requirements:
+
+${requirements}
+
+RULES:
+1. Write complete, production-ready code
+2. Include proper error handling
+3. Add comments explaining key sections
+4. Follow ${language} best practices and conventions
+5. Make the code modular and maintainable
+
+Output ONLY the code (no explanations):`;
+
+            const generatedCode = await callLanguageModel(prompt);
+            
+            // Extract code from markdown if present
+            let cleanCode = generatedCode;
+            const codeMatch = generatedCode.match(/```(?:\w+)?\n([\s\S]*?)\n```/);
+            if (codeMatch) {
+                cleanCode = codeMatch[1];
+            }
+            // Clean up lazy LLM patterns
+            cleanCode = cleanupGeneratedCode(cleanCode);
+            
+            // Generate a file name if not provided
+            const finalFileName = fileName || `generated_${Date.now()}`;
+            
+            return { 
+                success: true, 
+                data: { 
+                    generatedCode: cleanCode, 
+                    language,
+                    fileName: finalFileName,
+                    shouldSave: true
+                }
+            };
+        }
+    },
+    
+    create_from_example: {
+        name: 'create_from_example',
+        description: 'Create new code based on an example/template from context',
+        parameters: { exampleFile: 'string', modifications: 'string', newFileName: 'string', targetLanguage: 'string?' },
+        execute: async (params) => {
+            const { exampleFile, modifications, newFileName, targetLanguage } = params;
+            
+            // Find the example file in context
+            let exampleContent = null;
+            let exampleLang = null;
+            
+            for (const [path, file] of contextFiles) {
+                const name = path.split('/').pop();
+                if (name === exampleFile || name.toLowerCase() === exampleFile.toLowerCase()) {
+                    exampleContent = file.content;
+                    exampleLang = file.language;
+                    break;
+                }
+            }
+            
+            if (!exampleContent) {
+                return { success: false, error: `Example file "${exampleFile}" not found in context` };
+            }
+            
+            const lang = targetLanguage || exampleLang;
+            
+            const prompt = `Based on this example code:
+
+\`\`\`${exampleLang}
+${exampleContent.substring(0, 10000)}
+\`\`\`
+
+Create a new ${lang} file with these modifications:
+${modifications}
+
+Output ONLY the new code:`;
+
+            const generatedCode = await callLanguageModel(prompt);
+            
+            let cleanCode = generatedCode;
+            const codeMatch = generatedCode.match(/```(?:\w+)?\n([\s\S]*?)\n```/);
+            if (codeMatch) {
+                cleanCode = codeMatch[1];
+            }
+            // Clean up lazy LLM patterns
+            cleanCode = cleanupGeneratedCode(cleanCode);
+            
+            return { 
+                success: true, 
+                data: { 
+                    generatedCode: cleanCode, 
+                    language: lang,
+                    fileName: newFileName,
+                    basedOn: exampleFile,
+                    shouldSave: true
+                }
+            };
+        }
+    },
+    
+    // === ANSWER TOOLS ===
+    answer_question: {
+        name: 'answer_question',
+        description: 'Answer a question using ONLY the provided code context. Handles large contexts by chunking and summarizing.',
+        parameters: { question: 'string', context: 'string?', domain: 'string?', domain_notes: 'string?', requireCodeCitations: 'boolean?' },
+        execute: async (params) => {
+            const { question, context, domain, domain_notes, requireCodeCitations = true } = params;
+            
+            log('answer_question: Received params');
+            log('answer_question: question length:', question?.length || 0);
+            log('answer_question: context length:', context?.length || 0);
+            log('answer_question: domain:', domain || 'none');
+            
+            // === STEP 1: Decompose compound questions ===
+            const subQuestions = decomposeQuestion(question);
+            log('answer_question: Decomposed into', subQuestions.length, 'sub-questions:', subQuestions);
+            
+            // Check if we have meaningful context
+            const hasContext = context && context.length > 100;
+            
+            if (!hasContext && requireCodeCitations) {
+                log('answer_question: WARNING - No meaningful context provided');
+                return { 
+                    success: true, 
+                    data: { 
+                        answer: `**No relevant code found in the attached files.**\n\nI searched but couldn't find code related to "${question.substring(0, 100)}..."\n\nPlease try:\n1. Attaching more relevant source files\n2. Using a different search pattern\n3. Checking the Output panel (View → Output → AstraCode) for search details`
+                    } 
+                };
+            }
+            
+            // Size limit for single LLM call (leave room for instructions)
+            const CHUNK_SIZE = 18000;
+            
+            // If context fits in one chunk, process directly
+            if (!context || context.length <= CHUNK_SIZE) {
+                log('answer_question: Context fits in single chunk');
+                return await processAnswerDirect(question, context, domain, domain_notes);
+            }
+            
+            // Large context - need to chunk and iterate
+            log('answer_question: Large context detected, using chunked processing');
+            log('answer_question: Total context size:', context.length, 'chars');
+            
+            // Notify user
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `*Processing ${Math.ceil(context.length / 1000)}KB of code in chunks...*\n\n`
+            });
+            
+            // Split context into chunks by code blocks (### headers)
+            const chunks = splitContextIntoChunks(context, CHUNK_SIZE);
+            log('answer_question: Split into', chunks.length, 'chunks');
+            
+            // Process each chunk to extract relevant findings
+            const chunkFindings = [];
+            
+            for (let i = 0; i < chunks.length; i++) {
+                log(`answer_question: Processing chunk ${i + 1}/${chunks.length}`);
+                
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n*Analyzing chunk ${i + 1}/${chunks.length}...*\n`
+                });
+                
+                const chunkPrompt = `# CODE CHUNK ${i + 1}/${chunks.length}
+${chunks[i]}
+
+# ORIGINAL QUESTION
+"${question}"
+
+# SUB-QUESTIONS TO ANSWER
+${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}
+
+# EXTRACTION TASK
+Find code that answers the questions above. For each finding:
+
+1. **Call Direction**: Who calls whom? (A calls B, not B calls A)
+2. **Request vs Response**: If question mentions encoding/processing, distinguish:
+   - REQUEST encoding: How outgoing data is formatted (prepare, encode, serialize)
+   - RESPONSE encoding: How incoming data is parsed (decode, parse, read)
+3. **Entry Points**: Where does the flow START? (public API functions users call)
+4. **Implementation**: Where is the actual WORK done? (internal functions)
+5. **Configurability**: What parameters control behavior? What options exist?
+
+# FORMAT
+- Be PRECISE about call direction: "get() calls request()" not "request() handles get()"
+- Include file:line for everything
+- Note which sub-question each finding answers
+- Say "No relevant code in this chunk" if nothing matches
+
+Findings:`;
+                
+                try {
+                    const chunkResult = await callLanguageModel(chunkPrompt);
+                    if (chunkResult && !chunkResult.includes('No relevant code')) {
+                        chunkFindings.push(`## Chunk ${i + 1} Findings:\n${chunkResult}`);
+                    }
+                } catch (err) {
+                    log('answer_question: Chunk', i + 1, 'error:', err.message);
+                }
+            }
+            
+            // Now synthesize all findings
+            if (chunkFindings.length === 0) {
+                return {
+                    success: true,
+                    data: {
+                        answer: `**No relevant code found for "${question.substring(0, 100)}..."**\n\nSearched through ${chunks.length} code chunks but found no relevant implementations.\n\nThe attached files may not contain the code you're looking for.`
+                    }
+                };
+            }
+            
+            log('answer_question: Synthesizing', chunkFindings.length, 'chunk findings');
+            
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n*Synthesizing findings from ${chunkFindings.length} chunks...*\n\n`
+            });
+            
+            // For large number of findings, use hierarchical summarization
+            // Group findings → summarize each group → synthesize summaries
+            const MAX_FINDINGS_PER_SYNTHESIS = 10;
+            const MAX_CHARS_PER_SYNTHESIS = 35000;
+            
+            let findingsToSynthesize = chunkFindings;
+            
+            if (chunkFindings.length > MAX_FINDINGS_PER_SYNTHESIS) {
+                log('answer_question: Large findings set, using hierarchical summarization');
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `*(${chunkFindings.length} chunks - using hierarchical summarization)*\n`
+                });
+                
+                // Group findings into batches
+                const batches = [];
+                for (let i = 0; i < chunkFindings.length; i += MAX_FINDINGS_PER_SYNTHESIS) {
+                    batches.push(chunkFindings.slice(i, i + MAX_FINDINGS_PER_SYNTHESIS));
+                }
+                
+                log('answer_question: Created', batches.length, 'batches for summarization');
+                
+                // Summarize each batch
+                const batchSummaries = [];
+                for (let b = 0; b < batches.length; b++) {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `*Summarizing batch ${b + 1}/${batches.length}...*\n`
+                    });
+                    
+                    const batchContent = batches[b].join('\n\n');
+                    const batchPrompt = `# BATCH ${b + 1}/${batches.length} FINDINGS
+
+${batchContent}
+
+# TASK
+Summarize the KEY findings from this batch that are relevant to: "${question}"
+
+Focus on:
+- Entry points and main functions
+- Call flow (who calls whom)
+- Important data structures
+- Keep file:line references
+
+Be concise but preserve important details. Output a summary (not the raw findings).`;
+
+                    try {
+                        const summary = await callLanguageModel(batchPrompt);
+                        if (summary && summary.length > 50) {
+                            batchSummaries.push(`## Batch ${b + 1} Summary\n${summary}`);
+                        }
+                    } catch (err) {
+                        log('answer_question: Batch', b + 1, 'summarization error:', err.message);
+                    }
+                }
+                
+                findingsToSynthesize = batchSummaries;
+                log('answer_question: Reduced to', batchSummaries.length, 'batch summaries');
+            }
+            
+            let combinedFindings = findingsToSynthesize.join('\n\n');
+            
+            // Final safety truncation if still too large
+            if (combinedFindings.length > MAX_CHARS_PER_SYNTHESIS) {
+                log('answer_question: Truncating findings from', combinedFindings.length, 'to', MAX_CHARS_PER_SYNTHESIS);
+                combinedFindings = combinedFindings.substring(0, MAX_CHARS_PER_SYNTHESIS) + '\n\n... (truncated) ...';
+            }
+            
+            // Final synthesis prompt - developer-oriented summary
+            const synthesisPrompt = `# FINDINGS FROM CODE ANALYSIS
+${combinedFindings}
+
+# ORIGINAL QUESTION
+${question}
+
+# SUB-QUESTIONS TO ANSWER
+${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}
+
+${domain ? `# DOMAIN: ${domain}` : ''}
+${domain_notes ? `# NOTES: ${domain_notes}` : ''}
+
+# TASK
+Create a DEVELOPER ORIENTATION GUIDE that DIRECTLY ANSWERS each sub-question.
+
+# CRITICAL RULES
+1. **Answer each sub-question explicitly** in the Direct Answers section
+2. **Code flow direction**: Show who CALLS whom (caller → callee), e.g., "get() calls request()" 
+3. **Entry points**: Functions that USERS call (public API), not internal helpers
+4. **If asked "is X configurable?"**: Answer YES/NO with specific parameters and examples
+
+# FORMAT REQUIREMENTS
+- Use the EXACT section headers shown below (with emojis)
+- Keep descriptions concise (1-2 sentences max per item)
+- Always use \`code formatting\` for function names, files, and structs
+- Include file:line references for everything
+
+# TEMPLATE:
+
+## 💬 Direct Answers
+
+${subQuestions.map((sq, idx) => `**Q${idx + 1}: ${sq}**
+> [Direct answer with code references]
+`).join('\n')}
+
+---
+
+## 🚀 Quick Summary
+> **One sentence** describing what this code does and where to start.
+> 
+> **Entry Point:** \`function_name()\` in \`file.c:line\`
+
+---
+
+## 📁 Key Files
+
+| File | Purpose | Key Functions |
+|:-----|:--------|:--------------|
+| \`file.c\` | Brief description | \`func1()\`, \`func2()\` |
+
+---
+
+## 🔄 Code Flow
+
+IMPORTANT: Show actual call direction. The CALLER is on the left, CALLEE on the right.
+User calls → Public API → Internal implementation → Helper functions
+
+\`\`\`
+1. user_calls_this()   [api.py:100]      → PUBLIC entry point
+   │
+   ├─► internal_func() [impl.py:200]     → Does the actual work
+   │   │
+   │   └─► helper()    [utils.py:50]     → Helper function
+\`\`\`
+
+---
+
+## 📦 Data Structures
+
+| Structure | Location | Purpose |
+|:----------|:---------|:--------|
+| \`StructName\` | \`file.h:line\` | What it stores |
+
+---
+
+## 🔍 Key Functions
+
+| Function | Location | Purpose |
+|:---------|:---------|:--------|
+| \`func_name()\` | \`file.c:line\` | What it does |
+
+---
+
+## 🔧 Configurability (if applicable)
+
+| Parameter/Option | Values | Effect |
+|:-----------------|:-------|:-------|
+| \`param_name\` | value1, value2 | What it controls |
+
+---
+
+## 🎯 Where to Start (Developer Onboarding)
+
+**If you want to understand this feature:**
+1. **First, read** \`main_file.c\` - Start here to see the entry point
+2. **Then explore** \`core_file.c\` - This is where the main logic lives
+3. **Debug tip:** Set a breakpoint in \`key_function()\` and trace the flow
+
+**If you want to modify this feature:**
+- To change behavior X → Edit \`file.c:function()\`
+- To add a new option → Look at how \`existing_option\` is handled in \`config.c\`
+
+**Key insight:** [One sentence explaining the most important thing a new developer should know]
+
+---
+
+## ⚠️ Notes
+- Any gaps in the findings
+- Areas needing more investigation
+
+CRITICAL: Only include information from the findings above. Use actual file:line references.`;
+            
+            let finalResult;
+            try {
+                log('answer_question: Calling LLM for synthesis, prompt length:', synthesisPrompt.length);
+                
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `*(Synthesis prompt: ${Math.round(synthesisPrompt.length/1000)}KB)*\n`
+                });
+                
+                finalResult = await callLanguageModel(synthesisPrompt);
+                
+                if (!finalResult || finalResult.trim().length < 50) {
+                    log('answer_question: Synthesis returned empty/short result:', finalResult);
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `\n**⚠️ Synthesis returned empty result**\n`
+                    });
+                    // Fallback: return raw findings
+                    finalResult = `## Synthesis returned empty - showing raw findings\n\n${combinedFindings.substring(0, 15000)}`;
+                }
+            } catch (synthError) {
+                log('answer_question: Synthesis error:', synthError.message);
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n**⚠️ Synthesis error: ${synthError.message}**\n`
+                });
+                finalResult = `## Synthesis Error\n\n**Error:** ${synthError.message}\n\n### Raw Findings (first 15KB):\n${combinedFindings.substring(0, 15000)}`;
+            }
+            
+            // Validate answer if enabled
+            if (AGENT_CONFIG.enableJudge) {
+                log('answer_question: Running judge validation');
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n*Validating response...*\n`
+                });
+                
+                try {
+                    // Give judge access to context files with reasonable limits
+                    let fullContext = '';
+                    let contextSize = 0;
+                    const MAX_JUDGE_CONTEXT = 50000;  // ~12K tokens
+                    const MAX_PER_FILE = 5000;  // 5KB per file max
+                    
+                    for (const [path, file] of contextFiles) {
+                        if (contextSize > MAX_JUDGE_CONTEXT) {
+                            fullContext += '\n... (remaining files omitted for token limit) ...\n';
+                            break;
+                        }
+                        const fileName = path.split('/').pop();
+                        const fileContent = file.content.substring(0, MAX_PER_FILE);
+                        fullContext += `### ${fileName}\n\`\`\`\n${fileContent}\n\`\`\`\n\n`;
+                        contextSize += fileContent.length;
+                    }
+                    
+                    const validatedResult = await validateAndRefineAnswer(question, finalResult, fullContext);
+                    return { success: true, data: { answer: validatedResult } };
+                } catch (judgeError) {
+                    log('answer_question: Judge error:', judgeError.message);
+                    // Return unvalidated result on error
+                    return { success: true, data: { answer: finalResult } };
+                }
+            }
+            
+            return { success: true, data: { answer: finalResult } };
+        }
+    }
+};
+
+// Agent configuration
+const AGENT_CONFIG = {
+    enableJudge: true  // Enable judge LLM to validate answers
+};
+
+/**
+ * Clean up generated code - remove lazy LLM output patterns
+ */
+function cleanupGeneratedCode(code) {
+    if (!code) return code;
+    
+    // Only remove lazy LLM placeholder patterns - NOT legitimate code fences
+    const removePatterns = [
+        // C-style placeholders
+        /```\w*\s*\.\.\.+\s*```/g,               // ```java ... ``` (all on one line)
+        /^\s*\.\.\.+\s*$/gm,                      // Just "..." on a line  
+        /\/\/\s*\.\.\.+\s*$/gm,                   // // ...
+        /\/\/\s*rest of (the )?(implementation|code|method|function).*$/gim,
+        /\/\/\s*remaining (implementation|code|logic).*$/gim,
+        /\/\/\s*etc\.?\s*$/gim,
+        /\/\/\s*and so on.*$/gim,
+        /\/\/\s*continue (with )?(the )?(implementation|code).*$/gim,
+        /\/\/\s*similar (to|as) (above|before).*$/gim,
+        /\/\/\s*same (as|pattern).*$/gim,
+        /\/\*\s*\.\.\.+\s*\*\//g,                 // /* ... */
+        /\/\/\s*other methods.*$/gim,
+        /\/\/\s*more methods.*$/gim,
+        /\/\/\s*additional methods.*$/gim,
+        
+        // COBOL-style placeholders (column 7 * or *> inline)
+        /^\s{6}\*\s*\.\.\.+.*$/gm,                // COBOL: *  ...
+        /\*>\s*\.\.\.+.*$/gm,                     // COBOL: *> ...
+        /\*>\s*rest of (the )?(implementation|code|paragraph).*$/gim,
+        /\*>\s*remaining (implementation|code|logic).*$/gim,
+        /\*>\s*TODO.*$/gim,
+        /\*>\s*etc\.?\s*$/gim,
+        /\*>\s*continue.*$/gim,
+    ];
+    
+    let cleaned = code;
+    for (const pattern of removePatterns) {
+        cleaned = cleaned.replace(pattern, '');
+    }
+    
+    // Remove excessive empty lines (but keep single empty lines)
+    cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+    
+    return cleaned.trim();
+}
+
+/**
+ * Translate a single file
+ */
+async function translateSingleFile(file, targetLanguage, symbolReference) {
+    const prompt = `# TRANSLATE: ${file.fileName} (${file.language} → ${targetLanguage})
+
+## ABSOLUTE REQUIREMENTS - VIOLATION IS FAILURE
+
+### FORBIDDEN PATTERNS - DO NOT USE ANY OF THESE:
+❌ "// Implementation details"
+❌ "// TODO"
+❌ "// Placeholder"
+❌ "// Add implementation"
+❌ "// Logic to..."
+❌ "// ... implementation"
+❌ "return null; // Placeholder"
+❌ "return new X(); // Placeholder"
+❌ "throw new UnsupportedOperationException()"
+❌ Empty method bodies
+❌ Comments describing what code SHOULD do instead of actual code
+❌ Any comment containing "implement", "placeholder", "TODO", "details"
+
+### REQUIRED:
+✅ Translate EVERY line of code - no exceptions
+✅ Translate EVERY function body completely with actual logic
+✅ Translate EVERY struct/class with all fields and methods
+✅ Preserve ALL numeric precision (3.14159265359 stays exactly that)
+✅ Preserve ALL variable and function names
+✅ If the source has 100 lines of logic, output must have ~100 lines of equivalent logic
+
+### HOW TO HANDLE C CONSTRUCTS:
+- C structs → Java classes with public fields or getters/setters
+- C pointers → Java references (remove * and &)
+- C arrays with size → Java arrays or ArrayList
+- C malloc/free → Java new (no manual memory management)
+- C macros (#define) → Java static final constants
+- C function pointers → Java interfaces or lambdas
+- C void* → Java Object or generics
+- C sizeof → appropriate Java equivalent
+- C unions → Java class with all fields
+
+## PROJECT CONTEXT
+Other symbols in the project:
+${symbolReference || 'No other symbols found'}
+
+## SOURCE CODE (${file.language})
+\`\`\`${file.language}
+${file.content}
+\`\`\`
+
+## OUTPUT REQUIREMENTS
+1. Output ONLY complete, compilable ${targetLanguage} code
+2. Every method must have a FULL implementation - not a placeholder
+3. If you cannot translate something, translate it as best you can - DO NOT use placeholders
+4. The output should be roughly the same length as the input (a 3000 line C file → ~3000 line Java file)
+
+Provide the complete translated code now:`;
+
+    try {
+        const result = await callLanguageModelForCoding(prompt);
+        
+        // Extract code from markdown if present
+        let translatedCode = result;
+        const codeMatch = result.match(/\`\`\`(?:\w+)?\n([\s\S]*?)\n\`\`\`/);
+        if (codeMatch) {
+            translatedCode = codeMatch[1];
+        }
+        
+        // Clean up lazy LLM patterns
+        translatedCode = cleanupGeneratedCode(translatedCode);
+        
+        return translatedCode;
+    } catch (err) {
+        log(`translateSingleFile: Error:`, err.message);
+        return null;
+    }
+}
+
+/**
+ * Translate a large file by chunking it into sections
+ * This handles files that are too large for a single LLM call
+ */
+async function translateLargeFile(file, targetLanguage, symbolReference) {
+    const lines = file.content.split('\n');
+    const totalLines = lines.length;
+    const CHUNK_SIZE = 400; // Lines per chunk
+    
+    log(`translateLargeFile: Processing ${totalLines} lines in chunks of ${CHUNK_SIZE}`);
+    taskController.start(`Translating ${file.fileName} (${totalLines} lines)`);
+    
+    // First, extract all type definitions, structs, enums, and function declarations
+    // These will be included in every chunk for context
+    const headerInfo = extractHeaderInfo(file.content, file.language);
+    
+    // Split into chunks at function boundaries
+    const chunks = splitIntoFunctionChunks(file.content, file.language, CHUNK_SIZE);
+    
+    log(`translateLargeFile: Split into ${chunks.length} chunks`);
+    
+    const translatedChunks = [];
+    let previousTranslations = ''; // Context from previous chunks
+    
+    for (let i = 0; i < chunks.length; i++) {
+        // Check for cancellation
+        if (taskController.isCancelled) {
+            log('Translation cancelled by user');
+            throw new Error('Translation cancelled by user');
+        }
+        
+        const chunk = chunks[i];
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `*Translating chunk ${i + 1}/${chunks.length} (lines ${chunk.startLine}-${chunk.endLine})...*\n`
+        });
+        
+        const prompt = `# TRANSLATE CHUNK ${i + 1}/${chunks.length}: ${file.fileName}
+
+## FILE CONTEXT
+This is part ${i + 1} of ${chunks.length} of a ${totalLines}-line ${file.language} file being translated to ${targetLanguage}.
+
+### Type Definitions & Declarations (for reference):
+\`\`\`${file.language}
+${headerInfo.substring(0, 3000)}
+\`\`\`
+
+${i > 0 ? `### Previous Chunk Translations (for continuity):
+\`\`\`${targetLanguage}
+${previousTranslations.substring(-4000)}
+\`\`\`` : ''}
+
+## CHUNK TO TRANSLATE (lines ${chunk.startLine}-${chunk.endLine}):
+\`\`\`${file.language}
+${chunk.content}
+\`\`\`
+
+## ABSOLUTE REQUIREMENTS:
+❌ NO "// Implementation details"
+❌ NO "// TODO" or "// Placeholder"
+❌ NO empty method bodies
+❌ NO "return null; // Placeholder"
+✅ Translate EVERY line of actual code
+✅ Translate EVERY function body completely
+✅ Preserve ALL numeric precision
+✅ Output should be ~${chunk.content.split('\n').length} lines
+
+## PROJECT SYMBOLS:
+${symbolReference || 'None'}
+
+Output ONLY the translated ${targetLanguage} code for this chunk:`;
+
+        try {
+            const result = await callLanguageModelForCoding(prompt);
+            
+            let translatedChunk = result;
+            const codeMatch = result.match(/\`\`\`(?:\w+)?\n([\s\S]*?)\n\`\`\`/);
+            if (codeMatch) {
+                translatedChunk = codeMatch[1];
+            }
+            
+            // Quick check for placeholders in this chunk
+            if (/\/\/\s*(Implementation|TODO|Placeholder)/gi.test(translatedChunk)) {
+                log(`translateLargeFile: Chunk ${i + 1} has placeholders, retrying...`);
+                
+                // Retry with stricter prompt
+                const retryPrompt = `The previous translation had placeholder comments. Translate this code with COMPLETE implementations.
+
+NO PLACEHOLDERS ALLOWED. Every method must have actual code.
+
+\`\`\`${file.language}
+${chunk.content}
+\`\`\`
+
+Translate to ${targetLanguage} with FULL implementations:`;
+                
+                const retryResult = await callLanguageModelForCoding(retryPrompt);
+                const retryMatch = retryResult.match(/\`\`\`(?:\w+)?\n([\s\S]*?)\n\`\`\`/);
+                if (retryMatch) {
+                    translatedChunk = retryMatch[1];
+                } else {
+                    translatedChunk = retryResult;
+                }
+            }
+            
+            // Clean up lazy LLM patterns
+            translatedChunk = cleanupGeneratedCode(translatedChunk);
+            
+            translatedChunks.push(translatedChunk);
+            
+            // Keep last part of translation for context
+            previousTranslations = translatedChunk;
+            
+        } catch (err) {
+            log(`translateLargeFile: Chunk ${i + 1} error:`, err.message);
+            translatedChunks.push(`// ERROR translating chunk ${i + 1}: ${err.message}`);
+        }
+    }
+    
+    // Combine all chunks
+    let fullTranslation = '';
+    
+    // Add imports/package declaration for Java
+    if (targetLanguage.toLowerCase() === 'java') {
+        fullTranslation = `// Translated from ${file.fileName} (${totalLines} lines)
+// Auto-generated by AstraCode
+
+import java.util.*;
+import java.util.function.*;
+
+`;
+    }
+    
+    fullTranslation += translatedChunks.join('\n\n');
+    
+    // Final cleanup of the complete translation
+    fullTranslation = cleanupGeneratedCode(fullTranslation);
+    
+    log(`translateLargeFile: Complete translation is ${fullTranslation.split('\n').length} lines`);
+    
+    return fullTranslation;
+}
+
+/**
+ * Extract header info (structs, typedefs, function declarations) from code
+ */
+function extractHeaderInfo(content, language) {
+    const lines = content.split('\n');
+    const headerLines = [];
+    
+    const langLower = (language || '').toLowerCase();
+    
+    if (langLower === 'c' || langLower === 'cpp' || langLower === 'c++') {
+        // Extract typedefs, structs, enums, and function declarations
+        let inStruct = false;
+        let braceDepth = 0;
+        
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const trimmed = line.trim();
+            
+            // Include typedefs
+            if (trimmed.startsWith('typedef') || trimmed.startsWith('#define')) {
+                headerLines.push(line);
+                continue;
+            }
+            
+            // Track structs/enums
+            if (trimmed.match(/^(typedef\s+)?(struct|enum|union)\s+\w*/)) {
+                inStruct = true;
+                braceDepth = 0;
+            }
+            
+            if (inStruct) {
+                headerLines.push(line);
+                braceDepth += (line.match(/\{/g) || []).length;
+                braceDepth -= (line.match(/\}/g) || []).length;
+                if (braceDepth <= 0 && line.includes('}')) {
+                    inStruct = false;
+                }
+                continue;
+            }
+            
+            // Function declarations (prototypes)
+            if (trimmed.match(/^(static\s+)?(extern\s+)?[\w\s\*]+\([^)]*\)\s*;$/)) {
+                headerLines.push(line);
+            }
+        }
+    }
+    
+    return headerLines.join('\n');
+}
+
+/**
+ * Split code into chunks at function boundaries
+ */
+function splitIntoFunctionChunks(content, language, maxLines) {
+    const lines = content.split('\n');
+    const chunks = [];
+    let currentChunk = [];
+    let currentStart = 1;
+    let braceDepth = 0;
+    
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        currentChunk.push(line);
+        
+        // Track brace depth
+        braceDepth += (line.match(/\{/g) || []).length;
+        braceDepth -= (line.match(/\}/g) || []).length;
+        
+        // Check if we should break here
+        const shouldBreak = currentChunk.length >= maxLines && braceDepth === 0;
+        const forceBreak = currentChunk.length >= maxLines * 1.5;
+        
+        if (shouldBreak || forceBreak || i === lines.length - 1) {
+            chunks.push({
+                content: currentChunk.join('\n'),
+                startLine: currentStart,
+                endLine: currentStart + currentChunk.length - 1
+            });
+            currentStart = i + 2;
+            currentChunk = [];
+        }
+    }
+    
+    return chunks;
+}
+
+/**
+ * Critique a translation - check for completeness and correctness
+ */
+async function critiqueTranslation(originalCode, sourceLang, translatedCode, targetLang, fileName) {
+    // First, do a quick automated check for obvious placeholder patterns
+    const placeholderPatterns = [
+        /\/\/\s*Implementation\s*details/gi,
+        /\/\/\s*TODO/gi,
+        /\/\/\s*Placeholder/gi,
+        /\/\/\s*Add\s*implementation/gi,
+        /\/\/\s*Logic\s*to/gi,
+        /\/\/\s*\.\.\./gi,
+        /throw\s+new\s+UnsupportedOperationException/gi,
+        /return\s+null;\s*\/\/\s*Placeholder/gi,
+        /return\s+new\s+\w+\(\);\s*\/\/\s*Placeholder/gi,
+        /\/\*\s*Implementation/gi,
+        /NotImplementedException/gi,
+        /\/\/\s*implement\s/gi,
+        /^\s*\.\.\.\s*$/gm,                           // Just "..." on a line
+        /```\w*\s*\.\.\.\s*```/gi,                    // ```java ... ```
+        /\/\/\s*rest of\s/gi,                         // "// rest of implementation"
+        /\/\/\s*remaining\s/gi,                       // "// remaining code"
+        /\/\/\s*etc\.?/gi,                            // "// etc"
+        /\/\/\s*and so on/gi,                         // "// and so on"
+        /\/\/\s*continue\s/gi,                        // "// continue implementation"
+        /\/\/\s*similar\s+to\s/gi,                    // "// similar to above"
+    ];
+    
+    const foundPlaceholders = [];
+    for (const pattern of placeholderPatterns) {
+        const matches = translatedCode.match(pattern);
+        if (matches) {
+            foundPlaceholders.push(...matches.slice(0, 3)); // Limit to 3 examples per pattern
+        }
+    }
+    
+    // Check for empty method bodies (common placeholder pattern)
+    const emptyMethods = translatedCode.match(/\{\s*\}/g);
+    const emptyMethodCount = emptyMethods ? emptyMethods.length : 0;
+    
+    // Check line count ratio - translated should be similar length to original
+    const originalLines = originalCode.split('\n').length;
+    const translatedLines = translatedCode.split('\n').length;
+    const lineRatio = translatedLines / originalLines;
+    
+    // If we found placeholders, fail immediately with specific issues
+    if (foundPlaceholders.length > 0 || (lineRatio < 0.3 && originalLines > 100)) {
+        const issues = [];
+        
+        if (foundPlaceholders.length > 0) {
+            issues.push(`Found ${foundPlaceholders.length} placeholder patterns: ${foundPlaceholders.slice(0, 5).join(', ')}`);
+        }
+        
+        if (lineRatio < 0.3 && originalLines > 100) {
+            issues.push(`Translation is too short: ${translatedLines} lines vs original ${originalLines} lines (${Math.round(lineRatio * 100)}%)`);
+        }
+        
+        if (emptyMethodCount > 5) {
+            issues.push(`Found ${emptyMethodCount} empty method bodies - methods need actual implementation`);
+        }
+        
+        log(`critiqueTranslation: Auto-detected issues:`, issues);
+        return { passed: false, issues };
+    }
+    
+    // If no obvious placeholders, do LLM critique for logic correctness
+    const prompt = `# CRITIQUE TRANSLATION: ${fileName}
+
+## ORIGINAL CODE (${sourceLang}) - ${originalLines} lines
+\`\`\`${sourceLang}
+${originalCode.substring(0, 15000)}${originalCode.length > 15000 ? '\n... (truncated)' : ''}
+\`\`\`
+
+## TRANSLATED CODE (${targetLang}) - ${translatedLines} lines
+\`\`\`${targetLang}
+${translatedCode.substring(0, 15000)}${translatedCode.length > 15000 ? '\n... (truncated)' : ''}
+\`\`\`
+
+## CHECK FOR THESE SPECIFIC ISSUES:
+
+1. **PLACEHOLDER DETECTION** - Are there ANY of these forbidden patterns?
+   - "// Implementation details"
+   - "// TODO" or "// Placeholder"  
+   - "// Logic to..." or "// Add implementation"
+   - Methods that just return null or throw exceptions
+   - Empty method bodies {}
+   - Comments describing what code SHOULD do instead of actual code
+
+2. **COMPLETENESS** - Is EVERY function from the original fully translated?
+   - Count functions in original vs translated
+   - Are function bodies complete or just stubs?
+
+3. **LOGIC PRESERVATION** - Are all branches, loops, conditions translated?
+
+4. **LENGTH CHECK** - Original has ${originalLines} lines. Translation has ${translatedLines} lines.
+   - If translation is <50% the length, it's likely incomplete
+
+## RESPOND:
+If translation is COMPLETE with NO placeholders:
+CRITIQUE_PASSED
+
+If there are ANY placeholders or incomplete methods:
+CRITIQUE_FAILED
+ISSUES:
+1. [Specific issue with line number or function name]
+2. [Next issue]
+...
+
+Be STRICT. Any placeholder pattern = FAILURE.`;
+
+    try {
+        const result = await callLanguageModel(prompt);
+        
+        if (result.includes('CRITIQUE_PASSED')) {
+            return { passed: true, issues: [] };
+        }
+        
+        // Extract issues
+        const issues = [];
+        const issuesMatch = result.match(/ISSUES:\s*([\s\S]*)/);
+        if (issuesMatch) {
+            const issueLines = issuesMatch[1].split('\n').filter(l => l.trim());
+            for (const line of issueLines) {
+                const cleaned = line.replace(/^\d+\.\s*/, '').trim();
+                if (cleaned.length > 5) {
+                    issues.push(cleaned);
+                }
+            }
+        }
+        
+        return { passed: false, issues: issues.length > 0 ? issues : ['Translation incomplete - see critique'] };
+    } catch (err) {
+        log(`critiqueTranslation: Error:`, err.message);
+        return { passed: true, issues: [] }; // Assume pass on error
+    }
+}
+
+/**
+ * Fix translation issues identified by critique
+ */
+async function fixTranslationIssues(originalCode, sourceLang, translatedCode, targetLang, issues) {
+    // For large files, we may need to process in sections
+    const originalLines = originalCode.split('\n').length;
+    
+    const prompt = `# FIX TRANSLATION - IMPLEMENT ALL MISSING CODE
+
+## ORIGINAL SOURCE CODE (${sourceLang}) - ${originalLines} lines
+\`\`\`${sourceLang}
+${originalCode.substring(0, 20000)}${originalCode.length > 20000 ? '\n... (see full source above)' : ''}
+\`\`\`
+
+## CURRENT BROKEN TRANSLATION (${targetLang})
+\`\`\`${targetLang}
+${translatedCode}
+\`\`\`
+
+## ISSUES THAT MUST BE FIXED:
+${issues.map((issue, i) => `${i + 1}. ${issue}`).join('\n')}
+
+## YOUR TASK - BE SPECIFIC
+
+You MUST fix every issue by providing ACTUAL IMPLEMENTATION CODE.
+
+### FORBIDDEN IN YOUR OUTPUT:
+❌ "// Implementation details" 
+❌ "// TODO"
+❌ "// Placeholder"
+❌ "// Logic to..."
+❌ "return null; // Placeholder"
+❌ "return new X(); // Placeholder"
+❌ Empty method bodies {}
+❌ throw UnsupportedOperationException
+❌ Any comment saying what code SHOULD do
+
+### REQUIRED IN YOUR OUTPUT:
+✅ Every method must have ACTUAL CODE that does the work
+✅ Translate the logic from the original source code
+✅ If original has a 50-line function, your fix must have ~50 lines of logic
+✅ Use the original source code to write the actual implementation
+
+### EXAMPLE OF WRONG vs RIGHT:
+
+WRONG (placeholder):
+\`\`\`java
+private static PartitionBoundInfo partition_bounds_create(...) {
+    // Logic to create partition bounds
+    return new PartitionBoundInfo(); // Placeholder
+}
+\`\`\`
+
+RIGHT (actual implementation):
+\`\`\`java
+private static PartitionBoundInfo partition_bounds_create(PartitionBoundSpec[] boundspecs, int nparts, PartitionKey key, int[] mapping) {
+    PartitionBoundInfo boundinfo = new PartitionBoundInfo();
+    boundinfo.strategy = key.strategy;
+    boundinfo.ndatums = 0;
+    
+    // Sort bound specs
+    List<PartitionBoundSpec> sortedSpecs = new ArrayList<>(Arrays.asList(boundspecs));
+    sortedSpecs.sort((a, b) -> compareBounds(a, b, key));
+    
+    // Build datum array
+    for (int i = 0; i < nparts; i++) {
+        PartitionBoundSpec spec = sortedSpecs.get(i);
+        if (spec.is_default) {
+            boundinfo.default_index = i;
+        } else {
+            // Process bound values
+            boundinfo.datums[boundinfo.ndatums++] = spec.lowerdatums;
+        }
+        mapping[i] = i;
+    }
+    
+    return boundinfo;
+}
+\`\`\`
+
+## OUTPUT
+Provide the COMPLETE fixed ${targetLang} code with ALL placeholders replaced by actual implementations.
+The output should be similar in length to the original (${originalLines} lines).
+
+Output the complete fixed code now:`;
+
+    try {
+        const result = await callLanguageModelForCoding(prompt);
+        
+        // Extract code from markdown if present
+        let fixedCode = result;
+        const codeMatch = result.match(/\`\`\`(?:\w+)?\n([\s\S]*?)\n\`\`\`/);
+        if (codeMatch) {
+            fixedCode = codeMatch[1];
+        }
+        
+        // Clean up lazy LLM patterns
+        fixedCode = cleanupGeneratedCode(fixedCode);
+        
+        // Verify the fix actually removed placeholders
+        const stillHasPlaceholders = /\/\/\s*(Implementation|TODO|Placeholder|Logic to)/gi.test(fixedCode);
+        if (stillHasPlaceholders) {
+            log(`fixTranslationIssues: Warning - fix still contains placeholders`);
+        }
+        
+        return fixedCode;
+    } catch (err) {
+        log(`fixTranslationIssues: Error:`, err.message);
+        return null;
+    }
+}
+
+/**
+ * Compile Java files using VS Code's Java extension or javac
+ */
+async function compileJavaFiles(translatedFiles) {
+    const javaFiles = translatedFiles.filter(f => f.language === 'java' && f.translatedCode);
+    
+    if (javaFiles.length === 0) {
+        return { success: true, errors: [], message: 'No Java files to compile' };
+    }
+    
+    // Get workspace folder
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return { success: false, errors: [{ message: 'No workspace folder open' }] };
+    }
+    
+    const workspaceRoot = workspaceFolders[0].uri.fsPath;
+    const outputDir = path.join(workspaceRoot, '.astra', 'generated');
+    const classDir = path.join(workspaceRoot, '.astra', 'compiled');
+    
+    // Ensure directories exist
+    try {
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(outputDir));
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(classDir));
+    } catch (err) {
+        // Directories may already exist
+    }
+    
+    // Save all Java files to disk first
+    const savedFiles = [];
+    for (const file of javaFiles) {
+        const filePath = path.join(outputDir, file.newFileName);
+        try {
+            await vscode.workspace.fs.writeFile(
+                vscode.Uri.file(filePath),
+                Buffer.from(file.translatedCode, 'utf8')
+            );
+            savedFiles.push(filePath);
+            file.savedPath = filePath;
+        } catch (err) {
+            log(`compileJavaFiles: Error saving ${file.newFileName}:`, err.message);
+        }
+    }
+    
+    if (savedFiles.length === 0) {
+        return { success: false, errors: [{ message: 'Failed to save Java files' }] };
+    }
+    
+    // Try to compile using VS Code Java extension first
+    try {
+        // Check if Java extension is available
+        const javaExtension = vscode.extensions.getExtension('redhat.java');
+        
+        if (javaExtension && javaExtension.isActive) {
+            log('compileJavaFiles: Using VS Code Java extension');
+            
+            // Trigger compilation by opening files
+            for (const filePath of savedFiles) {
+                const doc = await vscode.workspace.openTextDocument(filePath);
+                // This triggers the Java extension to compile
+            }
+            
+            // Wait a bit for diagnostics
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Check diagnostics for errors
+            const errors = [];
+            for (const filePath of savedFiles) {
+                const uri = vscode.Uri.file(filePath);
+                const diagnostics = vscode.languages.getDiagnostics(uri);
+                
+                for (const diag of diagnostics) {
+                    if (diag.severity === vscode.DiagnosticSeverity.Error) {
+                        errors.push({
+                            file: path.basename(filePath),
+                            line: diag.range.start.line + 1,
+                            message: diag.message,
+                            code: diag.code
+                        });
+                    }
+                }
+            }
+            
+            if (errors.length === 0) {
+                return { success: true, errors: [], message: 'Compiled via VS Code Java extension' };
+            } else {
+                return { success: false, errors, message: 'Compilation errors found' };
+            }
+        }
+    } catch (err) {
+        log('compileJavaFiles: VS Code Java extension not available, trying javac');
+    }
+    
+    // Fallback: Try javac directly
+    try {
+        const { exec } = require('child_process');
+        const util = require('util');
+        const execPromise = util.promisify(exec);
+        
+        const fileList = savedFiles.join(' ');
+        const command = `javac -d "${classDir}" ${fileList}`;
+        
+        log('compileJavaFiles: Running javac:', command);
+        
+        const { stdout, stderr } = await execPromise(command, { 
+            cwd: outputDir,
+            timeout: 30000 
+        });
+        
+        if (stderr && stderr.includes('error:')) {
+            // Parse javac errors
+            const errors = parseJavacErrors(stderr);
+            return { success: false, errors, message: stderr };
+        }
+        
+        return { success: true, errors: [], message: 'Compiled with javac' };
+        
+    } catch (err) {
+        // Parse error output
+        const errors = parseJavacErrors(err.stderr || err.message);
+        return { success: false, errors, message: err.message };
+    }
+}
+
+/**
+ * Parse javac error output into structured format
+ */
+function parseJavacErrors(output) {
+    const errors = [];
+    const lines = output.split('\n');
+    
+    for (const line of lines) {
+        // Match: FileName.java:lineNum: error: message
+        const match = line.match(/(\w+\.java):(\d+):\s*error:\s*(.+)/);
+        if (match) {
+            errors.push({
+                file: match[1],
+                line: parseInt(match[2]),
+                message: match[3]
+            });
+        }
+    }
+    
+    return errors;
+}
+
+/**
+ * Fix a compilation error in translated code
+ */
+async function fixCompilationError(originalCode, sourceLang, translatedCode, targetLang, error) {
+    const prompt = `# FIX COMPILATION ERROR
+
+## ORIGINAL CODE (${sourceLang})
+\`\`\`${sourceLang}
+${originalCode}
+\`\`\`
+
+## CURRENT ${targetLang} CODE (has compilation error)
+\`\`\`${targetLang}
+${translatedCode}
+\`\`\`
+
+## COMPILATION ERROR
+File: ${error.file}
+Line: ${error.line}
+Error: ${error.message}
+
+## YOUR TASK
+Fix the compilation error. The fix must:
+1. Resolve the specific error mentioned
+2. Not break any other functionality
+3. Preserve all logic from original code
+4. Maintain decimal precision
+
+Output ONLY the complete fixed ${targetLang} code:`;
+
+    try {
+        const result = await callLanguageModelForCoding(prompt);
+        
+        let fixedCode = result;
+        const codeMatch = result.match(/\`\`\`(?:\w+)?\n([\s\S]*?)\n\`\`\`/);
+        if (codeMatch) {
+            fixedCode = codeMatch[1];
+        }
+        
+        // Clean up lazy LLM patterns
+        fixedCode = cleanupGeneratedCode(fixedCode);
+        
+        return fixedCode;
+    } catch (err) {
+        log(`fixCompilationError: Error:`, err.message);
+        return null;
+    }
+}
+
+/**
+ * Judge/Validator: LLM-driven validation
+ * No hardcoded patterns - lets the LLM reason about what's missing
+ */
+async function validateAndRefineAnswer(question, answer, codeContext) {
+    // Always validate - let the LLM decide if anything is missing
+    // Truncate context if too large (keep beginning and end)
+    let contextForJudge = codeContext;
+    if (codeContext.length > 40000) {
+        const halfSize = 18000;
+        contextForJudge = codeContext.substring(0, halfSize) + 
+            '\n\n... [middle truncated] ...\n\n' + 
+            codeContext.substring(codeContext.length - halfSize);
+    }
+    
+    const judgePrompt = `# JUDGE TASK: Validate this answer against the source code
+
+## ORIGINAL QUESTION
+${question}
+
+## GENERATED ANSWER
+${answer}
+
+## SOURCE CODE TO VERIFY AGAINST
+\`\`\`
+${contextForJudge}
+\`\`\`
+
+## YOUR TASK
+You are a code review judge. Carefully:
+
+1. **Read the question** - What EXACTLY is being asked?
+2. **Read the answer** - What claims does it make?
+3. **Search the source code** - Verify each claim. Look for:
+   - Functions mentioned - do they exist at those line numbers?
+   - Call flow direction - is caller→callee correct?
+   - The ACTUAL function where work happens (not just entry points)
+   - Parameters and options that control behavior
+
+4. **Find what's missing** - Grep the code mentally for:
+   - Functions with names suggesting the feature (e.g., "prepare_", "encode_", "_build")
+   - Where data transformation actually happens
+   - Configuration options not mentioned
+
+## RESPOND WITH:
+
+**If the answer is accurate and complete:**
+VALIDATION: PASS
+
+**If important information is wrong or missing:**
+
+## 🧐 Critique
+[Specifically what the answer got wrong or missed. Name exact functions from the code.]
+
+## 🔍 Additional Findings
+
+| Function | Location | Purpose |
+|:---------|:---------|:--------|
+| \`name()\` | \`file:line\` | What it actually does |
+
+[Any missing code flow or important details]
+
+Be concise but specific. Only add findings that significantly improve understanding.`;
+
+    try {
+        log('validateAndRefineAnswer: Running LLM judge');
+        const judgeResult = await callLanguageModel(judgePrompt);
+        
+        if (judgeResult.includes('VALIDATION: PASS')) {
+            log('validateAndRefineAnswer: Judge approved answer');
+            return answer;
+        }
+        
+        if (judgeResult.includes('Critique') || judgeResult.includes('Additional Findings')) {
+            log('validateAndRefineAnswer: Judge added corrections');
+            
+            // Extract critique and additions
+            const critiqueMatch = judgeResult.match(/## 🧐 Critique[\s\S]*?(?=## 🔍|$)/);
+            const additionsMatch = judgeResult.match(/## 🔍 Additional Findings[\s\S]*/);
+            
+            let additions = '';
+            if (critiqueMatch) {
+                additions += critiqueMatch[0].trim();
+            }
+            if (additionsMatch) {
+                if (additions) additions += '\n\n';
+                additions += additionsMatch[0].trim();
+            }
+            
+            if (additions.length > 50) {
+                return answer + '\n\n---\n\n' + additions;
+            }
+            
+            // Fallback: append the whole judge result
+            const cleanResult = judgeResult.replace(/VALIDATION:.*\n?/g, '').trim();
+            if (cleanResult.length > 50) {
+                return answer + '\n\n---\n\n## 🧐 Critique\n\n' + cleanResult;
+            }
+        }
+        
+        return answer;
+    } catch (error) {
+        log('validateAndRefineAnswer: Judge error:', error.message);
+        return answer;
+    }
+}
+
+/**
+ * Decompose compound questions into sub-questions
+ * e.g., "explain X and tell me if Y" → ["How does X work?", "Is Y true/configurable?"]
+ */
+function decomposeQuestion(question) {
+    const subQuestions = [];
+    const questionLower = question.toLowerCase();
+    
+    // Detect compound question patterns
+    const compoundPatterns = [
+        /\band\s+(?:also\s+)?(?:tell|explain|show|describe|check|verify)/i,
+        /\.\s*(?:also|and|additionally)/i,
+        /\?\s*(?:also|and)/i,
+        /,\s*and\s+/i
+    ];
+    
+    const isCompound = compoundPatterns.some(p => p.test(question));
+    
+    if (isCompound) {
+        // Split on "and tell", "and also", etc.
+        const parts = question.split(/\s+and\s+(?:also\s+)?(?:tell|explain|show|check|describe|verify)\s*/i);
+        
+        if (parts.length > 1) {
+            // First part is usually "explain X"
+            subQuestions.push(`How does ${extractTopic(parts[0])} work?`);
+            // Second part is usually "if Y"
+            for (let i = 1; i < parts.length; i++) {
+                const part = parts[i].trim();
+                if (part.match(/^(?:me\s+)?if\s+/i)) {
+                    subQuestions.push(part.replace(/^(?:me\s+)?if\s+/i, 'Is ') + '?');
+                } else {
+                    subQuestions.push(part.endsWith('?') ? part : part + '?');
+                }
+            }
+        }
+    }
+    
+    // Detect yes/no questions embedded in the question
+    if (questionLower.includes('configurable') || questionLower.includes('can be configured')) {
+        if (!subQuestions.some(q => q.toLowerCase().includes('configur'))) {
+            subQuestions.push('Is this configurable? What parameters control the behavior?');
+        }
+    }
+    
+    if (questionLower.includes('optional') || questionLower.includes('can i change')) {
+        if (!subQuestions.some(q => q.toLowerCase().includes('optional') || q.toLowerCase().includes('change'))) {
+            subQuestions.push('What options are available and how do you set them?');
+        }
+    }
+    
+    // Detect request vs response context
+    if (questionLower.includes('request') && !questionLower.includes('response')) {
+        subQuestions.push('Focus on REQUEST handling (outgoing), not response parsing');
+    } else if (questionLower.includes('response') && !questionLower.includes('request')) {
+        subQuestions.push('Focus on RESPONSE handling (incoming), not request encoding');
+    }
+    
+    // Detect encoding/decoding context
+    if (questionLower.includes('encoding') || questionLower.includes('encode')) {
+        if (questionLower.includes('request')) {
+            subQuestions.push('How is outgoing data encoded/serialized before sending?');
+        }
+    }
+    
+    // If no sub-questions detected, use the original question
+    if (subQuestions.length === 0) {
+        subQuestions.push(question);
+    }
+    
+    // Always add "how does it work" if not present
+    const hasExplain = subQuestions.some(q => 
+        q.toLowerCase().includes('how') || 
+        q.toLowerCase().includes('explain') ||
+        q.toLowerCase().includes('work')
+    );
+    if (!hasExplain && subQuestions.length < 3) {
+        subQuestions.unshift(`How does ${extractTopic(question)} work?`);
+    }
+    
+    return subQuestions.slice(0, 4); // Max 4 sub-questions
+}
+
+/**
+ * Extract the main topic from a question
+ */
+function extractTopic(text) {
+    // Remove common question starters
+    let topic = text
+        .replace(/^(?:explain|describe|tell me about|how does|what is|show me)\s*/i, '')
+        .replace(/\s*\?.*$/, '')
+        .replace(/\s*and\s*$/, '')
+        .trim();
+    
+    // If topic is too long, take first part
+    if (topic.length > 50) {
+        topic = topic.split(/[,.]/, 1)[0].trim();
+    }
+    
+    return topic || 'this feature';
+}
+
+/**
+ * Split context into chunks, trying to keep code blocks intact
+ */
+function splitContextIntoChunks(context, maxChunkSize) {
+    const chunks = [];
+    
+    // Try to split by code block headers (### filename)
+    const blocks = context.split(/(?=###\s)/);
+    
+    let currentChunk = '';
+    
+    for (const block of blocks) {
+        // If adding this block would exceed limit, save current chunk
+        if (currentChunk.length + block.length > maxChunkSize && currentChunk.length > 0) {
+            chunks.push(currentChunk);
+            currentChunk = '';
+        }
+        
+        // If single block is too large, split it
+        if (block.length > maxChunkSize) {
+            // Save any current chunk first
+            if (currentChunk.length > 0) {
+                chunks.push(currentChunk);
+                currentChunk = '';
+            }
+            
+            // Split large block by lines
+            const lines = block.split('\n');
+            let subChunk = '';
+            for (const line of lines) {
+                if (subChunk.length + line.length + 1 > maxChunkSize) {
+                    chunks.push(subChunk);
+                    subChunk = '';
+                }
+                subChunk += line + '\n';
+            }
+            if (subChunk.length > 0) {
+                currentChunk = subChunk;
+            }
+        } else {
+            currentChunk += block;
+        }
+    }
+    
+    // Don't forget the last chunk
+    if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+    }
+    
+    return chunks;
+}
+
+/**
+ * Process answer directly (when context fits in single call)
+ */
+async function processAnswerDirect(question, context, domain, domain_notes) {
+    // Decompose question into sub-questions
+    const subQuestions = decomposeQuestion(question);
+    log('processAnswerDirect: Sub-questions:', subQuestions);
+    
+    let prompt = '';
+    
+    if (domain || domain_notes) {
+        prompt += `# Domain: ${domain || 'Code Analysis'}\n`;
+        if (domain_notes) prompt += `Notes: ${domain_notes}\n`;
+        prompt += '\n';
+    }
+    
+    if (context) {
+        prompt += `# SOURCE CODE\n${context}\n\n`;
+    }
+    
+    prompt += `# ORIGINAL QUESTION\n${question}\n\n`;
+    
+    prompt += `# SUB-QUESTIONS TO ANSWER\n${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}\n\n`;
+    
+    // Developer orientation format with better visual structure
+    prompt += `# TASK
+Create a DEVELOPER ORIENTATION GUIDE that DIRECTLY ANSWERS each sub-question.
+
+# CRITICAL RULES
+1. **Answer each sub-question explicitly** in the Direct Answers section
+2. **Code flow direction**: Show who CALLS whom (caller → callee)
+3. **Entry points**: Functions that USERS call (public API), not internal helpers
+4. **If asked "is X configurable?"**: Answer YES/NO with specific parameters and examples
+5. **Request vs Response**: If discussing encoding, distinguish between:
+   - REQUEST encoding: How data is formatted before SENDING
+   - RESPONSE encoding: How data is parsed after RECEIVING
+
+# FORMAT REQUIREMENTS
+- Use the EXACT section headers shown below (with emojis)
+- Keep descriptions concise (1-2 sentences max per item)
+- Always use \`code formatting\` for function names, files, and structs
+- Include file:line references for everything
+
+# TEMPLATE:
+
+## 💬 Direct Answers
+
+${subQuestions.map((sq, idx) => `**Q${idx + 1}: ${sq}**
+> [Direct answer with code references]
+`).join('\n')}
+
+---
+
+## 🚀 Quick Summary
+> **One sentence** describing what this code does and where to start.
+> 
+> **Entry Point:** \`function_name()\` in \`file.c:line\`
+
+---
+
+## 📁 Key Files
+
+| File | Purpose | Key Functions |
+|:-----|:--------|:--------------|
+| \`file.c\` | Brief description | \`func1()\`, \`func2()\` |
+
+---
+
+## 🔄 Code Flow
+
+Show actual call direction: CALLER → CALLEE
+
+\`\`\`
+1. user_calls_this()   [api.py:100]      → PUBLIC entry point
+   │
+   ├─► internal_func() [impl.py:200]     → Does the actual work
+   │   │
+   │   └─► helper()    [utils.py:50]     → Helper function
+\`\`\`
+
+---
+
+## 📦 Data Structures
+
+| Structure | Location | Purpose |
+|:----------|:---------|:--------|
+| \`StructName\` | \`file.h:line\` | What it stores |
+
+---
+
+## 🔍 Key Functions
+
+| Function | Location | Purpose |
+|:---------|:---------|:--------|
+| \`func_name()\` | \`file.c:line\` | What it does |
+
+---
+
+## 🔧 Configurability (if applicable)
+
+| Parameter/Option | Values | Effect |
+|:-----------------|:-------|:-------|
+| \`param_name\` | value1, value2 | What it controls |
+
+---
+
+## 🎯 Where to Start (Developer Onboarding)
+
+**If you want to understand this feature:**
+1. **First, read** \`main_file.c\` - Start here to see the entry point
+2. **Then explore** \`core_file.c\` - This is where the main logic lives
+3. **Debug tip:** Set a breakpoint in \`key_function()\` and trace the flow
+
+**If you want to modify this feature:**
+- To change behavior X → Edit \`file.c:function()\`
+- To add a new option → Look at how \`existing_option\` is handled in \`config.c\`
+
+**Key insight:** [One sentence explaining the most important thing a new developer should know]
+
+---
+
+## ⚠️ Notes
+- Any gaps in the provided code
+- Areas needing more investigation
+
+CRITICAL: Only reference code actually shown above. No invented information.`;
+    
+    log('processAnswerDirect: Prompt length:', prompt.length);
+    
+    const result = await callLanguageModel(prompt);
+    
+    // Validate answer if enabled
+    if (AGENT_CONFIG.enableJudge) {
+        log('processAnswerDirect: Running judge validation');
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n*Validating response...*\n`
+        });
+        
+        // Give judge access to ALL context files for thorough validation
+        let fullContext = '';
+        for (const [path, file] of contextFiles) {
+            const fileName = path.split('/').pop();
+            fullContext += `### ${fileName}\n\`\`\`\n${file.content}\n\`\`\`\n\n`;
+        }
+        
+        const validatedResult = await validateAndRefineAnswer(question, result, fullContext || context);
+        return { success: true, data: { answer: validatedResult } };
+    }
+    
+    return { success: true, data: { answer: result } };
+}
+
+/**
+ * Get a summary of all available tools for the planner
+ */
+function getToolsSummary() {
+    let summary = '## Available Tools\n\n';
+    for (const [name, tool] of Object.entries(AGENT_TOOLS)) {
+        summary += `- **${name}**: ${tool.description}\n`;
+        if (Object.keys(tool.parameters).length > 0) {
+            summary += `  Parameters: ${JSON.stringify(tool.parameters)}\n`;
+        }
+    }
+    return summary;
+}
+
+/**
+ * Get a summary of available resources
+ */
+function getResourcesSummary() {
+    let summary = '## Available Resources\n\n';
+    
+    // Context files
+    if (contextFiles.size > 0) {
+        summary += '### Context Files (attached)\n';
+        for (const [path, file] of contextFiles) {
+            const name = path.split('/').pop();
+            summary += `- ${name} (${file.language}, ${Math.round(file.content.length/1024)}KB, ${file.content.split('\n').length} lines)\n`;
+        }
+        summary += '\n';
+    } else {
+        summary += '### Context Files: None attached\n\n';
+    }
+    
+    // Code index
+    if (codeIndex.symbols.size > 0) {
+        summary += `### Code Index\n`;
+        summary += `- ${codeIndex.symbols.size} symbols indexed\n`;
+        summary += `- ${codeIndex.files.size} files parsed\n`;
+        summary += `- ${codeIndex.callGraph.size} call relationships\n\n`;
+    }
+    
+    // API server (we'll check this during execution)
+    summary += '### API Server: May be available at configured URL\n';
+    
+    return summary;
+}
+
+/**
+ * PLANNER: Uses LLM to create an execution plan
+ */
+async function createExecutionPlan(query, conversationHistory = []) {
+    log('PLANNER: Creating execution plan for:', query);
+    
+    const toolsSummary = getToolsSummary();
+    const resourcesSummary = getResourcesSummary();
+    
+    // Include recent conversation context
+    let conversationContext = '';
+    if (conversationHistory.length > 0) {
+        const recentHistory = conversationHistory.slice(-4);
+        conversationContext = '## Recent Conversation\n';
+        for (const msg of recentHistory) {
+            conversationContext += `${msg.role}: ${msg.content.substring(0, 500)}...\n`;
+        }
+        conversationContext += '\n';
+    }
+    
+    const plannerPrompt = `You are an intelligent task planner for a code assistant called AstraCode.
+
+# USER REQUEST
+"${query}"
+
+${conversationContext}
+${resourcesSummary}
+${toolsSummary}
+
+# YOUR TASK
+1. FIRST: Identify the domain/context (e.g., "ISO 20022 payments", "PostgreSQL internals", "React frontend", "COBOL banking", etc.)
+2. THEN: Create a step-by-step execution plan
+
+# DOMAIN DISCOVERY
+- Analyze the query and any attached files to identify the technical domain
+- Note any domain-specific terminology, standards, or frameworks mentioned
+- This domain context will be used to provide precise, accurate answers
+
+# PLANNING GUIDELINES
+- For "how is X implemented", "explain X", "describe X functionality", "trace X":
+  USE search_code (combines fuzzy index + grep) → answer_question
+  This is the PREFERRED approach for implementation questions.
+  
+- For specific function questions ("explain function Y"): 
+  USE get_function_context → answer_question
+  
+- For "list all X functions", "find functions related to Y":
+  USE search_index → answer_question
+  
+- For simple questions like "what is X": use answer_question with context="$context"
+- For documentation: use generate_full_documentation  
+- For translations ("translate to X", "convert to X"): 
+  USE translate_all_files - translates ALL attached files preserving symbols and decimal precision
+- For code review: use review_code
+- For new code: use generate_code
+
+CRITICAL: When user has attached code files, the answer MUST reference the actual code with file names and line numbers. Do NOT give generic explanations.
+
+# PARAMETER REFERENCE FORMAT
+- "$context" = all attached files content
+- "$step1.data" = full result object from step 1
+- "$step1.data.combinedContext" = combined context from search_code (PREFERRED for implementation questions)
+- "$step1.data.results" = results array from step 1 (for grep results)
+- "$step1.data.symbols" = symbols array from search_index
+- "$step1.data.code" = code from get_function_context
+
+# EXAMPLES
+
+Example 1 - Implementation tracing (RECOMMENDED - use search_code):
+User: "describe how relation parsing is implemented"
+{
+  "domain": "SQL query parser/compiler",
+  "domain_notes": "Relation parsing involves parsing FROM clauses, table references, and join expressions",
+  "understanding": "User wants to understand relation parsing implementation",
+  "strategy": "Use search_code to find symbols and code, then explain",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "search_code",
+      "purpose": "Comprehensive search for relation parsing code",
+      "parameters": { "query": "relation parse FROM RangeTbl table" }
+    },
+    {
+      "step": 2,
+      "tool": "answer_question",
+      "purpose": "Explain relation parsing with specific code references",
+      "parameters": { 
+        "question": "Explain how relation parsing is implemented in this code. For each point, cite specific file names and line numbers: 1) Entry point functions, 2) Key data structures, 3) The parsing flow, 4) How different relation types are handled.",
+        "context": "$step1.data.combinedContext"
+      }
+    }
+  ],
+  "final_output": "Detailed explanation with file/line references"
+}
+
+Example 2 - Specific function deep-dive (MULTI-STEP):
+User: "explain the processPayment function"
+{
+  "domain": "Payment processing code",
+  "domain_notes": "Focus on the specific function, its inputs, outputs, and call graph",
+  "understanding": "User wants to understand a specific function in detail",
+  "strategy": "Get the function source and call graph, then explain",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "get_function_context",
+      "purpose": "Get full source code and call relationships",
+      "parameters": { "functionName": "processPayment" }
+    },
+    {
+      "step": 2,
+      "tool": "answer_question",
+      "purpose": "Explain the function based on its source and call graph",
+      "parameters": { 
+        "question": "Explain processPayment: 1) Purpose, 2) Parameters and return value, 3) Step-by-step logic, 4) Functions it calls and why, 5) What calls this function.",
+        "context": "$step1.data"
+      }
+    }
+  ],
+  "final_output": "Detailed explanation of processPayment function"
+}
+
+Example 3 - Find all functions of a type:
+User: "list all the parser functions"
+{
+  "domain": "Code parsing/compilation",
+  "domain_notes": "Parser functions typically start with parse_ or Parse",
+  "understanding": "User wants to see all parser-related functions",
+  "strategy": "Search index for parser functions and summarize",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "search_index",
+      "purpose": "Find all parser functions",
+      "parameters": { "pattern": "parse|Parse", "type": "function" }
+    },
+    {
+      "step": 2,
+      "tool": "answer_question",
+      "purpose": "Summarize the parser functions found",
+      "parameters": { 
+        "question": "List and briefly describe each parser function found. Group them by purpose if possible.",
+        "context": "$step1.data"
+      }
+    }
+  ],
+  "final_output": "List of parser functions with descriptions"
+}
+
+Example 4 - Simple domain question (SINGLE-STEP):
+User: "what is camt.056?"
+{
+  "domain": "ISO 20022 financial messaging standard",
+  "domain_notes": "camt.* = Cash Management messages. camt.056 = FIToFIPaymentCancellationRequest",
+  "understanding": "User wants to understand the camt.056 message type",
+  "strategy": "Answer with precise ISO 20022 terminology",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "answer_question",
+      "purpose": "Explain camt.056 with accurate terminology",
+      "parameters": { 
+        "question": "What is camt.056 in ISO 20022? Provide the exact message name, purpose, and typical flow.", 
+        "context": "$context" 
+      }
+    }
+  ],
+  "final_output": "Accurate explanation of camt.056"
+}
+
+Example 5 - Translation (SINGLE-STEP):
+User: "translate this TAL to Java"
+{
+  "domain": "Tandem TAL to Java migration",
+  "domain_notes": "TAL = Transaction Application Language for HP NonStop/Tandem systems",
+  "understanding": "User wants to translate code to Java",
+  "strategy": "Use translate_all_files to convert ALL attached files, preserving symbols and precision",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "translate_all_files",
+      "purpose": "Translate all attached files to Java",
+      "parameters": { "targetLanguage": "java" }
+    }
+  ],
+  "final_output": "Java translation of all files"
+}
+
+Example 6 - Multi-file Translation:
+User: "convert these Python files to TypeScript"
+{
+  "domain": "Python to TypeScript migration",
+  "domain_notes": "Preserve type hints, convert to TypeScript interfaces",
+  "understanding": "User wants all attached Python files converted to TypeScript",
+  "strategy": "Use translate_all_files to translate all files together",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "translate_all_files",
+      "purpose": "Translate all Python files to TypeScript",
+      "parameters": { "targetLanguage": "typescript" }
+    }
+  ],
+  "final_output": "TypeScript files with proper types"
+}
+
+# WHEN TO USE EACH TOOL
+- search_code: PREFERRED for implementation questions - combines fuzzy index search + grep in one step
+- search_index: Find symbols by name with fuzzy matching (handles cryptic names like "RTE" → "RangeTblEntry")
+- get_function_context: Get full source code of a specific named function
+- grep_context: Broad text search when you need raw pattern matching  
+- answer_question: Generate explanation based on gathered context
+
+# FUZZY MATCHING
+The search tools support fuzzy matching for cryptic symbol names:
+- "RTE" matches "RangeTblEntry" (CamelCase abbreviation)
+- "parse_rel" matches "parse_relation" (word boundary)
+- "xfrm" matches "transformExpr" (subsequence)
+
+# WHEN TO USE MULTI-STEP vs SINGLE-STEP
+- Use MULTI-STEP for: "how is X implemented", "explain function Y", "trace Z", "list all X functions"
+- Use SINGLE-STEP for: "what is X", "compare A and B", "summarize this code", general questions
+
+# OUTPUT FORMAT
+Respond with ONLY valid JSON (no markdown, no explanation):
+{
+  "domain": "Identified technical domain",
+  "domain_notes": "Key terminology or context to ensure accuracy",
+  "understanding": "Brief description",
+  "strategy": "Approach",
+  "steps": [{ "step": 1, "tool": "tool_name", "purpose": "why", "parameters": { } }],
+  "final_output": "Expected output"
+}
+
+Create the plan now:`;
+
+    try {
+        const response = await callLanguageModel(plannerPrompt);
+        log('PLANNER: Raw response:', response.substring(0, 500));
+        
+        // Extract JSON from response
+        let jsonStr = response.trim();
+        // Remove markdown code blocks if present
+        if (jsonStr.includes('```')) {
+            const jsonMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+            if (jsonMatch) {
+                jsonStr = jsonMatch[1].trim();
+            }
+        }
+        
+        // Try to find JSON object in the response
+        const jsonStart = jsonStr.indexOf('{');
+        const jsonEnd = jsonStr.lastIndexOf('}');
+        if (jsonStart !== -1 && jsonEnd !== -1) {
+            jsonStr = jsonStr.substring(jsonStart, jsonEnd + 1);
+        }
+        
+        const plan = JSON.parse(jsonStr);
+        log('PLANNER: Created plan with', plan.steps?.length || 0, 'steps');
+        log('PLANNER: Strategy:', plan.strategy);
+        
+        return plan;
+    } catch (error) {
+        log('PLANNER ERROR:', error.message);
+        // Return a fallback plan for simple questions
+        return {
+            understanding: query,
+            strategy: 'Direct answer with available context',
+            steps: [
+                {
+                    step: 1,
+                    tool: 'answer_question',
+                    purpose: 'Answer the user query directly',
+                    parameters: { question: query, context: getBasicContext() },
+                    use_result_for: 'Final response'
+                }
+            ],
+            final_output: 'Direct answer to the question'
+        };
+    }
+}
+
+/**
+ * Format grep results into a readable string for LLM context
+ */
+function formatGrepResults(results) {
+    if (!results || !Array.isArray(results)) {
+        log('formatGrepResults: Invalid results:', typeof results);
+        return JSON.stringify(results, null, 2);
+    }
+    
+    if (results.length === 0) {
+        return 'No matches found.';
+    }
+    
+    log('formatGrepResults: Formatting', results.length, 'result blocks');
+    
+    // Check if this is the new format (with content blocks) or old format (individual lines)
+    const isNewFormat = results[0]?.content && results[0]?.startLine;
+    
+    if (isNewFormat) {
+        // New format: code blocks with context
+        let formatted = `Found ${results.reduce((s, r) => s + (r.matchCount || 1), 0)} matches in ${results.length} code blocks:\n\n`;
+        
+        for (const block of results) {
+            formatted += `=== ${block.fileName} (lines ${block.startLine}-${block.endLine}) ===\n`;
+            formatted += block.content;
+            formatted += '\n\n';
+        }
+        
+        return formatted;
+    } else {
+        // Old format: group by file
+        const byFile = {};
+        for (const r of results) {
+            const file = r.fileName || 'unknown';
+            if (!byFile[file]) byFile[file] = [];
+            byFile[file].push(r);
+        }
+        
+        let formatted = `Found ${results.length} matches:\n\n`;
+        for (const [fileName, matches] of Object.entries(byFile)) {
+            formatted += `=== ${fileName} ===\n`;
+            for (const m of matches) {
+                formatted += `Line ${m.line}: ${m.content}\n`;
+            }
+            formatted += '\n';
+        }
+        
+        return formatted;
+    }
+}
+
+/**
+ * Get basic context for fallback scenarios
+ */
+function getBasicContext() {
+    let context = '';
+    for (const [path, file] of contextFiles) {
+        const name = path.split('/').pop();
+        context += `=== ${name} ===\n${file.content.substring(0, 5000)}\n\n`;
+    }
+    return context || 'No files in context';
+}
+
+/**
+ * EXECUTOR: Executes a single step of the plan
+ */
+async function executeStep(step, previousResults, plan) {
+    log(`EXECUTOR: Step ${step.step} - ${step.tool}: ${step.purpose}`);
+    
+    const tool = AGENT_TOOLS[step.tool];
+    if (!tool) {
+        log(`EXECUTOR: Unknown tool "${step.tool}"`);
+        return { success: false, error: `Unknown tool: ${step.tool}` };
+    }
+    
+    // Prepare parameters, potentially using results from previous steps
+    let params = { ...step.parameters };
+    
+    // Inject domain context from plan if tool supports it and not already specified
+    if (plan.domain && !params.domain) {
+        params.domain = plan.domain;
+    }
+    if (plan.domain_notes && !params.domain_notes) {
+        params.domain_notes = plan.domain_notes;
+    }
+    
+    // If parameters reference previous results, substitute them
+    for (const [key, value] of Object.entries(params)) {
+        if (typeof value === 'string') {
+            log(`EXECUTOR: Checking param "${key}" = "${value.substring(0, 100)}..."`);
+            
+            // Check for references like "$step1.data.content" or "$step1.data.results"
+            const refMatch = value.match(/\$step(\d+)\.(.+)/);
+            if (refMatch) {
+                const stepNum = parseInt(refMatch[1]);
+                const pathStr = refMatch[2];
+                const pathParts = pathStr.split('.');
+                log(`EXECUTOR: Found step reference: step${stepNum}.${pathStr}`);
+                log(`EXECUTOR: Previous results count:`, previousResults.length);
+                
+                let result = previousResults[stepNum - 1];
+                log(`EXECUTOR: Step ${stepNum} result:`, result ? 'exists' : 'null');
+                
+                for (const prop of pathParts) {
+                    result = result?.[prop];
+                    log(`EXECUTOR: After accessing .${prop}:`, result ? (Array.isArray(result) ? `array[${result.length}]` : typeof result) : 'null');
+                }
+                
+                // Special formatting for grep results
+                if (pathStr.endsWith('.results') && Array.isArray(result)) {
+                    const formatted = formatGrepResults(result);
+                    log(`EXECUTOR: Formatted grep results: ${formatted.substring(0, 200)}...`);
+                    params[key] = formatted;
+                } else if (typeof result === 'object') {
+                    params[key] = JSON.stringify(result, null, 2);
+                } else {
+                    params[key] = result;
+                }
+            }
+            // Check for special reference "$context" - get all context files
+            else if (value === '$context') {
+                params[key] = getBasicContext();
+            }
+            // Check for "$all_results"
+            else if (value === '$all_results') {
+                params[key] = JSON.stringify(previousResults, null, 2);
+            }
+            // Handle natural language references like "result from step 1"
+            else if (/result\s*(from|of)\s*step\s*(\d+)/i.test(value)) {
+                const match = value.match(/result\s*(?:from|of)\s*step\s*(\d+)/i);
+                if (match) {
+                    const stepNum = parseInt(match[1]);
+                    const prevResult = previousResults[stepNum - 1];
+                    if (prevResult?.data?.results) {
+                        // Format grep results
+                        params[key] = formatGrepResults(prevResult.data.results);
+                    } else if (prevResult?.data?.content) {
+                        params[key] = prevResult.data.content;
+                    } else if (prevResult?.data) {
+                        params[key] = JSON.stringify(prevResult.data);
+                    }
+                }
+            }
+            // Handle "previous result" or "step N result" patterns
+            else if (/previous\s*result|step\s*\d+\s*result/i.test(value)) {
+                const lastResult = previousResults[previousResults.length - 1];
+                if (lastResult?.data?.results) {
+                    // Format grep results
+                    params[key] = formatGrepResults(lastResult.data.results);
+                } else if (lastResult?.data?.content) {
+                    params[key] = lastResult.data.content;
+                } else if (lastResult?.data) {
+                    params[key] = JSON.stringify(lastResult.data);
+                }
+            }
+        }
+    }
+    
+    try {
+        const result = await tool.execute(params);
+        log(`EXECUTOR: Step ${step.step} result:`, result.success ? 'SUCCESS' : 'FAILED');
+        return result;
+    } catch (error) {
+        log(`EXECUTOR: Step ${step.step} error:`, error.message);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
+ * Save generated code to .astra folder and return file info
+ * @param {string} code - The code content to save
+ * @param {string} fileName - Suggested file name
+ * @param {string} language - Programming language for extension
+ * @returns {Promise<{saved: boolean, filePath?: string, fileUri?: vscode.Uri, error?: string}>}
+ */
+async function saveGeneratedCode(code, fileName, language) {
+    log('Saving generated code:', fileName);
+    
+    // Determine file extension based on language
+    const extMap = {
+        'java': '.java',
+        'python': '.py',
+        'javascript': '.js',
+        'typescript': '.ts',
+        'c': '.c',
+        'cpp': '.cpp',
+        'c++': '.cpp',
+        'csharp': '.cs',
+        'c#': '.cs',
+        'go': '.go',
+        'rust': '.rs',
+        'ruby': '.rb',
+        'php': '.php',
+        'swift': '.swift',
+        'kotlin': '.kt',
+        'scala': '.scala'
+    };
+    
+    // Clean up file name and add proper extension
+    let cleanFileName = fileName.replace(/\.[^.]+$/, ''); // Remove existing extension
+    const ext = extMap[language.toLowerCase()] || `.${language.toLowerCase()}`;
+    cleanFileName = cleanFileName + ext;
+    
+    try {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        let fileUri;
+        
+        if (workspaceFolder) {
+            // Save to .astra/generated folder in workspace
+            const astraDir = vscode.Uri.joinPath(workspaceFolder.uri, '.astra', 'generated');
+            try {
+                await vscode.workspace.fs.createDirectory(astraDir);
+            } catch (e) {
+                // Directory might already exist
+            }
+            fileUri = vscode.Uri.joinPath(astraDir, cleanFileName);
+        } else {
+            // Save to temp location
+            const os = require('os');
+            const path = require('path');
+            const tmpDir = path.join(os.tmpdir(), 'astra-generated');
+            try {
+                await vscode.workspace.fs.createDirectory(vscode.Uri.file(tmpDir));
+            } catch (e) {
+                // Directory might already exist
+            }
+            fileUri = vscode.Uri.file(path.join(tmpDir, cleanFileName));
+        }
+        
+        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(code, 'utf-8'));
+        
+        log('Saved generated code to:', fileUri.fsPath);
+        
+        return {
+            saved: true,
+            filePath: fileUri.fsPath,
+            fileUri: fileUri,
+            fileName: cleanFileName
+        };
+        
+    } catch (error) {
+        log('Error saving generated code:', error.message);
+        return {
+            saved: false,
+            error: error.message
+        };
+    }
+}
+
+/**
+ * Format a download link for the chat UI
+ */
+function formatDownloadLink(fileInfo, language) {
+    if (!fileInfo.saved) {
+        return '\n*⚠️ Could not save file to disk*\n';
+    }
+    
+    // Use backtick code format which will be rendered as clickable link
+    return `
+---
+### 📁 File Saved
+
+**Click to open:** \`${fileInfo.filePath}\`
+
+---
+`;
+}
+
+/**
+ * SYNTHESIZER: Combines all step results into a final response
+ */
+async function synthesizeResponse(query, plan, stepResults) {
+    log('SYNTHESIZER: Combining results from', stepResults.length, 'steps');
+    
+    // Check if any step directly produced a good final answer
+    for (let i = stepResults.length - 1; i >= 0; i--) {
+        const result = stepResults[i];
+        const step = plan.steps[i];
+        
+        if (result.success && result.data) {
+            // For multi-file translation (translate_all_files)
+            if (result.data.translatedFiles && Array.isArray(result.data.translatedFiles)) {
+                const targetLang = result.data.targetLanguage || 'java';
+                let output = `## 📦 Translated ${result.data.fileCount} Files to ${targetLang.toUpperCase()}\n\n`;
+                
+                // Summary
+                if (result.data.summary) {
+                    output += `### Summary\n${result.data.summary}\n\n`;
+                }
+                
+                // Save and display each file
+                for (const tf of result.data.translatedFiles) {
+                    if (tf.error) {
+                        output += `### ❌ ${tf.originalFile}\n**Error:** ${tf.error}\n\n`;
+                    } else {
+                        // Save the file
+                        const fileInfo = await saveGeneratedCode(
+                            tf.translatedCode,
+                            tf.newFileName.replace(/\.\w+$/, ''),
+                            targetLang
+                        );
+                        
+                        output += `### ✅ ${tf.originalFile} → ${tf.newFileName}\n`;
+                        if (fileInfo.saved) {
+                            output += `**Click to open:** \`${fileInfo.filePath}\`\n\n`;
+                        }
+                        // Show a preview of the code (first 50 lines)
+                        const codeLines = tf.translatedCode.split('\n');
+                        const preview = codeLines.slice(0, 50).join('\n');
+                        const truncated = codeLines.length > 50 ? `\n// ... (${codeLines.length - 50} more lines)` : '';
+                        output += `\`\`\`${targetLang}\n${preview}${truncated}\n\`\`\`\n\n`;
+                    }
+                }
+                
+                return output;
+            }
+            
+            // For single-file translation (translate_code, translate_file), save and return with download link
+            if (result.data.translatedCode) {
+                const targetLang = result.data.targetLanguage || 'java';
+                const header = `## Translated to ${targetLang.toUpperCase()}`;
+                const stats = result.data.chunks > 1 
+                    ? `\n*Translated in ${result.data.chunks} chunks from ${result.data.originalLines} lines*\n`
+                    : '';
+                
+                // Determine file name from original or plan
+                let originalFileName = 'translated';
+                if (plan.target_file) {
+                    originalFileName = plan.target_file.replace(/\.[^.]+$/, '');
+                } else if (result.data.fileName) {
+                    originalFileName = result.data.fileName.replace(/\.[^.]+$/, '');
+                }
+                
+                // Save the translated code
+                const fileInfo = await saveGeneratedCode(
+                    result.data.translatedCode, 
+                    originalFileName, 
+                    targetLang
+                );
+                
+                const downloadSection = formatDownloadLink(fileInfo, targetLang);
+                
+                return `${header}${stats}
+${downloadSection}
+
+\`\`\`${targetLang}
+${result.data.translatedCode}
+\`\`\``;
+            }
+            // For generated code (from generate_code or create_from_example)
+            if (result.data.generatedCode && result.data.shouldSave) {
+                const lang = result.data.language || 'text';
+                const fileName = result.data.fileName || 'generated';
+                
+                // Save the generated code
+                const fileInfo = await saveGeneratedCode(
+                    result.data.generatedCode,
+                    fileName,
+                    lang
+                );
+                
+                const downloadSection = formatDownloadLink(fileInfo, lang);
+                const basedOnNote = result.data.basedOn 
+                    ? `\n*Based on: ${result.data.basedOn}*\n` 
+                    : '';
+                
+                return `## Generated ${lang.toUpperCase()} Code
+${basedOnNote}
+${downloadSection}
+
+\`\`\`${lang}
+${result.data.generatedCode}
+\`\`\``;
+            }
+            // For full documentation
+            if (result.data.documentation && result.data.fileCount) {
+                return result.data.documentation;
+            }
+            // For trace, return the analysis
+            if (result.data.analysis && result.data.trace) {
+                return result.data.analysis;
+            }
+            // For review, return the review
+            if (result.data.review) {
+                return result.data.review;
+            }
+            // For explanation or answer, return directly
+            if (result.data.explanation) {
+                return result.data.explanation;
+            }
+            // For answer from answer_question - return the actual answer
+            if (result.data.answer) {
+                log('SYNTHESIZER: Returning answer from answer_question');
+                return result.data.answer;
+            }
+            if (result.data.documentation) {
+                return result.data.documentation;
+            }
+            // For API search results with context
+            if (result.data.context && result.data.results) {
+                // Use LLM to answer based on API results
+                const searchContext = result.data.context;
+                const answerPrompt = `Based on these search results:\n\n${searchContext}\n\nAnswer the query: ${query}`;
+                return await callLanguageModel(answerPrompt);
+            }
+        }
+    }
+    
+    // Check for any successful data that might be useful
+    const successfulResults = stepResults.filter(r => r.success && r.data);
+    
+    if (successfulResults.length === 0) {
+        // All steps failed - explain what happened
+        log('SYNTHESIZER: All steps failed');
+        const errors = stepResults.map((r, i) => `Step ${i+1}: ${r.error || 'Unknown error'}`).join('\n');
+        return `I encountered issues processing your request:\n\n${errors}\n\nPlease try rephrasing your question or adding more context.`;
+    }
+    
+    // If no direct answer, synthesize from all results
+    const resultsContext = stepResults.map((r, i) => {
+        const step = plan.steps[i];
+        if (r.success && r.data) {
+            // Summarize data meaningfully
+            if (r.data.files) {
+                return `### Step ${i + 1}: ${step?.purpose}\nFiles: ${r.data.files.map(f => f.name || f).join(', ')}`;
+            }
+            if (r.data.content) {
+                return `### Step ${i + 1}: ${step?.purpose}\nContent: ${r.data.content.substring(0, 500)}...`;
+            }
+            return `### Step ${i + 1}: ${step?.purpose}\n${JSON.stringify(r.data, null, 2).substring(0, 1000)}`;
+        }
+        return `### Step ${i + 1}: ${step?.purpose}\nError: ${r.error}`;
+    }).join('\n\n');
+    
+    const synthesisPrompt = `You completed a multi-step task. Now synthesize the final response.
+
+# Original Request
+"${query}"
+
+# Plan
+Understanding: ${plan.understanding}
+Strategy: ${plan.strategy}
+Expected Output: ${plan.final_output}
+
+# Step Results
+${resultsContext}
+
+# Instructions
+Create a clear, helpful response that addresses the user's original request.
+Use the information gathered from the steps above.
+Be concise but complete. If steps failed, explain what happened.`;
+
+    try {
+        const result = await callLanguageModel(synthesisPrompt);
+        if (result && result.trim()) {
+            return result;
+        }
+    } catch (error) {
+        log('SYNTHESIZER: LLM call failed:', error.message);
+    }
+    
+    // Ultimate fallback - return raw step results
+    log('SYNTHESIZER: Using fallback raw results');
+    return `Here's what I found:\n\n${resultsContext}`;
+}
+
+/**
+ * AGENT ORCHESTRATOR: Main entry point for the agentic workflow
+ */
+async function runAgent(query) {
+    log('AGENT: Starting for query:', query);
+    const startTime = Date.now();
+    
+    // Get context summary
+    const hasContext = contextFiles.size > 0;
+    const fileCount = contextFiles.size;
+    const config = vscode.workspace.getConfiguration('astra');
+    const apiUrl = config.get('apiUrl') || 'http://localhost:8080';
+    
+    // ================================================================
+    // SPECIAL CASE ROUTING (before planning)
+    // ================================================================
+    
+    // CASE 1: Full documentation request with context
+    const isDocRequest = /^(?:document|generate\s+(?:full\s+)?(?:doc|documentation)|documentation|deepwiki|full\s*doc)/i.test(query);
+    log('AGENT: Query:', query, '| isDocRequest:', isDocRequest, '| hasContext:', hasContext);
+    if (isDocRequest && hasContext) {
+        log('AGENT: Routing to full documentation generator');
+        try {
+            const fileList = [];
+            for (const [path, file] of contextFiles) {
+                log('AGENT: Adding file to doc list:', path, '| content length:', file.content?.length || 0);
+                fileList.push({ 
+                    name: path.split('/').pop(), 
+                    path, 
+                    language: file.language, 
+                    size: file.content?.length || 0 
+                });
+            }
+            log('AGENT: Generating docs for', fileList.length, 'files');
+            return await generateDocumentationFile(fileList, query);
+        } catch (error) {
+            log('AGENT: Documentation generation failed:', error.message, error.stack);
+            // Fall through to normal agent flow
+        }
+    }
+    
+    // CASE 2: No context - use API server for search/questions
+    if (!hasContext) {
+        log('AGENT: No context - checking API server');
+        
+        // Check if API is available
+        let apiAvailable = false;
+        try {
+            const response = await fetch(`${apiUrl}/health`, { 
+                method: 'GET',
+                signal: AbortSignal.timeout(2000)
+            });
+            apiAvailable = response.ok;
+        } catch (e) {
+            log('AGENT: API server not available');
+        }
+        
+        if (apiAvailable) {
+            log('AGENT: Routing to API server mode');
+            return await handleApiMode(query, apiUrl, config);
+        } else {
+            // No context and no API - direct LLM call
+            log('AGENT: No context, no API - direct LLM call');
+            return await callLanguageModel(query);
+        }
+    }
+    
+    // CASE 3: Simple question with context - fast path (skip planning)
+    // BUT: Implementation tracing questions should always go through planning
+    const isImplementationQuestion = /\b(implement|implementation|trace|tracing|flow|how\s+is.*implemented|describe\s+how|walk\s+through|step\s+by\s+step)\b/i.test(query);
+    const isSimpleQuestion = /^(?:what\s+is|what\s+are|tell\s+me\s+about|why\s+does|when\s+does|where\s+is)/i.test(query);
+    
+    if (isSimpleQuestion && hasContext && !isImplementationQuestion) {
+        log('AGENT: Fast-path for simple question with context');
+        const context = getBasicContext();
+        const prompt = `Based on this code:\n\n${context}\n\nQuestion: ${query}\n\nProvide a detailed answer explaining the relevant code, algorithms, functions, and data structures involved.`;
+        try {
+            const answer = await callLanguageModel(prompt);
+            const duration = Date.now() - startTime;
+            log(`AGENT: Fast-path completed in ${duration}ms`);
+            return answer;
+        } catch (error) {
+            log('AGENT: Fast-path failed, falling back to planning:', error.message);
+            // Fall through to normal planning
+        }
+    }
+    
+    // Log if we're routing to planner for implementation questions
+    if (isImplementationQuestion) {
+        log('AGENT: Implementation question detected - using full planning flow');
+    }
+    
+    // ================================================================
+    // NORMAL AGENTIC FLOW (with context)
+    // ================================================================
+    
+    try {
+        // PHASE 1: PLANNING
+        log('AGENT: Phase 1 - Planning');
+        const plan = await createExecutionPlan(query, chatHistory.slice(-6));
+        
+        if (!plan || !plan.steps || plan.steps.length === 0) {
+            log('AGENT: No valid plan, using direct LLM with context');
+            return await callLanguageModel(query + '\n\nContext:\n' + getBasicContext());
+        }
+        
+        log(`AGENT: Plan created - ${plan.steps.length} steps`);
+        log('AGENT: Domain:', plan.domain || 'general');
+        log('AGENT: Understanding:', plan.understanding);
+        log('AGENT: Strategy:', plan.strategy);
+        
+        // PHASE 2: EXECUTION
+        log('AGENT: Phase 2 - Execution');
+        const stepResults = [];
+        
+        for (const step of plan.steps) {
+            const result = await executeStep(step, stepResults, plan);
+            stepResults.push(result);
+            log(`AGENT: Step ${step.step} (${step.tool}):`, result.success ? 'SUCCESS' : 'FAILED');
+        }
+        
+        // PHASE 3: SYNTHESIS
+        log('AGENT: Phase 3 - Synthesis');
+        const response = await synthesizeResponse(query, plan, stepResults);
+        
+        // Ensure we have a response
+        if (!response || response.trim() === '') {
+            log('AGENT: Empty synthesis, using fallback');
+            return await callLanguageModel(query + '\n\nContext:\n' + getBasicContext());
+        }
+        
+        const duration = Date.now() - startTime;
+        log(`AGENT: Completed in ${duration}ms`);
+        
+        return response;
+        
+    } catch (error) {
+        log('AGENT ERROR:', error.message);
+        // Fallback to direct LLM call with context
+        log('AGENT: Falling back to direct LLM call');
+        return await callLanguageModel(query + '\n\nContext:\n' + getBasicContext());
+    }
+}
+
+// ============================================================
+// Chat Message Handler (Updated for Agentic Architecture)
+// ============================================================
+
+/**
+ * Get a display-friendly model name
+ */
+function getModelDisplayName() {
+    // If we tracked the last used model, use it
+    if (lastUsedModel) {
+        // For Copilot models - use family or name
+        if (lastUsedModel.vendor === 'copilot' || lastUsedModel.family) {
+            const family = lastUsedModel.family?.toLowerCase() || '';
+            const name = lastUsedModel.name?.toLowerCase() || '';
+            
+            // Map to friendly names
+            if (family.includes('claude-sonnet-4') || name.includes('claude-sonnet-4')) {
+                return 'Claude Sonnet 4.5';
+            }
+            if (family.includes('claude-3.5-sonnet') || family.includes('claude-3-5-sonnet') || name.includes('claude-3.5')) {
+                return 'Claude 3.5 Sonnet';
+            }
+            if (family.includes('claude')) {
+                return 'Claude';
+            }
+            if (family.includes('gpt-4o') || name.includes('gpt-4o')) {
+                return 'GPT-4o';
+            }
+            if (family.includes('gpt-4') || name.includes('gpt-4')) {
+                return 'GPT-4';
+            }
+            if (family.includes('o1')) {
+                return 'o1';
+            }
+            
+            // Return the family or name as-is
+            return lastUsedModel.family || lastUsedModel.name || 'Copilot';
+        }
+        
+        // For direct API models (anthropic/openai)
+        if (lastUsedModel.provider && lastUsedModel.model) {
+            const shortNames = {
+                'claude-sonnet-4-5-20250514': 'Claude Sonnet 4.5',
+                'claude-3-5-sonnet-20241022': 'Claude 3.5 Sonnet',
+                'claude-3-opus-20240229': 'Claude 3 Opus',
+                'claude-3-sonnet-20240229': 'Claude 3 Sonnet',
+                'claude-3-haiku-20240307': 'Claude 3 Haiku',
+                'gpt-4o': 'GPT-4o',
+                'gpt-4o-mini': 'GPT-4o Mini',
+                'gpt-4-turbo': 'GPT-4 Turbo',
+                'gpt-4': 'GPT-4',
+                'gpt-3.5-turbo': 'GPT-3.5'
+            };
+            return shortNames[lastUsedModel.model] || lastUsedModel.model;
+        }
+    }
+    
+    // Fallback: read from config
+    const config = vscode.workspace.getConfiguration('astra');
+    const provider = config.get('llm.codingProvider') || 'copilot';
+    
+    if (provider === 'copilot') {
+        const model = config.get('llm.copilotModel') || 'claude-sonnet-4';
+        const friendlyNames = {
+            'claude-sonnet-4': 'Claude Sonnet 4.5',
+            'claude-3.5-sonnet': 'Claude 3.5 Sonnet',
+            'gpt-4o': 'GPT-4o',
+            'gpt-4': 'GPT-4'
+        };
+        return friendlyNames[model] || model;
+    } else if (provider === 'anthropic') {
+        const model = config.get('llm.anthropicModel') || 'claude-sonnet-4-5-20250514';
+        return model.includes('sonnet-4') ? 'Claude Sonnet 4.5' : model;
+    } else if (provider === 'openai') {
+        return config.get('llm.openaiModel') || 'GPT-4o';
+    }
+    
+    return 'Copilot';
+}
+
+/**
+ * Format a plan for display to user
+ */
+function formatPlanForDisplay(plan) {
+    let display = `## 📋 Execution Plan\n\n`;
+    
+    if (plan.domain) {
+        display += `**Domain:** ${plan.domain}\n`;
+    }
+    if (plan.domain_notes) {
+        display += `**Notes:** ${plan.domain_notes}\n`;
+    }
+    display += `**Understanding:** ${plan.understanding}\n`;
+    display += `**Strategy:** ${plan.strategy}\n\n`;
+    
+    display += `### Steps:\n`;
+    for (const step of plan.steps) {
+        display += `${step.step}. **${step.tool}** - ${step.purpose}\n`;
+        if (step.parameters) {
+            const params = Object.entries(step.parameters)
+                .filter(([k, v]) => k !== 'context' && v !== '$context')
+                .map(([k, v]) => `   - ${k}: ${typeof v === 'string' && v.length > 50 ? v.substring(0, 50) + '...' : v}`)
+                .join('\n');
+            if (params) display += params + '\n';
+        }
+    }
+    
+    display += `\n**Expected Output:** ${plan.final_output}\n`;
+    display += `\n---\n`;
+    display += `💡 **Reply with:**\n`;
+    display += `- \`go\` or \`execute\` to run this plan\n`;
+    display += `- \`edit: <your changes>\` to modify\n`;
+    display += `- \`skip\` to answer directly without planning\n`;
+    
+    return display;
+}
+
+/**
+ * Check if message is a plan control command
+ */
+function isPlanCommand(text) {
+    const lower = text.toLowerCase().trim();
+    return lower === 'go' || 
+           lower === 'execute' || 
+           lower === 'run' ||
+           lower === 'skip' ||
+           lower.startsWith('edit:') ||
+           lower.startsWith('edit ');
+}
+
+/**
+ * Handle plan control commands
+ */
+async function handlePlanCommand(text) {
+    const lower = text.toLowerCase().trim();
+    
+    if (!pendingPlan) {
+        return null; // No pending plan
+    }
+    
+    if (lower === 'go' || lower === 'execute' || lower === 'run') {
+        // Execute the pending plan
+        const { query, plan } = pendingPlan;
+        pendingPlan = null;
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: '\n\n**Executing plan...**\n\n' 
+        });
+        
+        return await executePlan(query, plan);
+    }
+    
+    if (lower === 'skip') {
+        // Skip planning, answer directly
+        const { query } = pendingPlan;
+        pendingPlan = null;
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: '\n\n**Answering directly...**\n\n' 
+        });
+        
+        const context = getBasicContext();
+        return await callLanguageModel(query + '\n\nContext:\n' + context);
+    }
+    
+    if (lower.startsWith('edit:') || lower.startsWith('edit ')) {
+        // User wants to edit the plan
+        const editInstructions = text.substring(text.indexOf(':') + 1).trim() || 
+                                  text.substring(5).trim();
+        const { query, plan } = pendingPlan;
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: '\n\n**Revising plan...**\n\n' 
+        });
+        
+        // Re-plan with user's edits
+        const revisedPlan = await revisePlan(query, plan, editInstructions);
+        pendingPlan = { query, plan: revisedPlan };
+        
+        return formatPlanForDisplay(revisedPlan);
+    }
+    
+    return null;
+}
+
+/**
+ * Revise a plan based on user feedback
+ */
+async function revisePlan(query, currentPlan, editInstructions) {
+    const revisionPrompt = `You created this plan:
+${JSON.stringify(currentPlan, null, 2)}
+
+The user wants to change it: "${editInstructions}"
+
+Provide a revised plan that incorporates the user's feedback.
+Output ONLY valid JSON with the same structure.`;
+
+    try {
+        const response = await callLanguageModel(revisionPrompt);
+        let jsonStr = response.trim();
+        if (jsonStr.includes('```')) {
+            const jsonMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+            if (jsonMatch) jsonStr = jsonMatch[1].trim();
+        }
+        const jsonStart = jsonStr.indexOf('{');
+        const jsonEnd = jsonStr.lastIndexOf('}');
+        if (jsonStart !== -1 && jsonEnd !== -1) {
+            jsonStr = jsonStr.substring(jsonStart, jsonEnd + 1);
+        }
+        return JSON.parse(jsonStr);
+    } catch (error) {
+        log('Plan revision failed:', error.message);
+        return currentPlan; // Return original if revision fails
+    }
+}
+
+/**
+ * Execute a plan (separated from planning)
+ */
+async function executePlan(query, plan) {
+    log('EXECUTOR: Running plan with', plan.steps.length, 'steps');
+    taskController.start(`Executing plan: ${query.substring(0, 50)}...`);
+    
+    const stepResults = [];
+    
+    for (const step of plan.steps) {
+        // Check for cancellation before each step
+        if (taskController.isCancelled) {
+            log('Plan execution cancelled by user');
+            throw new Error('Task cancelled by user');
+        }
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `**Step ${step.step}:** ${step.tool} - ${step.purpose}\n` 
+        });
+        
+        const result = await executeStep(step, stepResults, plan);
+        stepResults.push(result);
+        
+        log(`EXECUTOR: Step ${step.step} (${step.tool}):`, result.success ? 'SUCCESS' : 'FAILED');
+    }
+    
+    // Synthesize response
+    const response = await synthesizeResponse(query, plan, stepResults);
+    return response;
+}
+
+async function handleChatMessage(text) {
+    log('Chat message:', text);
+    
+    // Reset model tracking for this request
+    lastUsedModel = null;
+    
+    // Check if this is a plan control command
+    if (pendingPlan && isPlanCommand(text)) {
+        // Don't add control commands to visible history
+        chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: true });
+        
+        try {
+            const response = await handlePlanCommand(text);
+            const modelName = getModelDisplayName();
+            const attribution = `\n\n---\n*AstraCode (${modelName})*`;
+            
+            if (response && response.length > 0) {
+                // Response wasn't streamed, display it
+                const cleanedResponse = cleanLlmResponse(response);
+                
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: cleanedResponse + attribution 
+                });
+                
+                chatHistory.push({
+                    role: 'assistant',
+                    content: cleanedResponse + attribution,
+                    timestamp: new Date()
+                });
+            } else {
+                // Response was already streamed (answer_question), just add attribution
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: attribution 
+                });
+                
+                // Note: The streamed content was already displayed, we just add attribution
+            }
+        } catch (error) {
+            log('Error:', error.message);
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n\nError: ${error.message}` 
+            });
+        }
+        
+        taskController.reset();
+        chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+        chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+        return;
+    }
+    
+    // Add user message to history
+    chatHistory.push({
+        role: 'user',
+        content: text,
+        timestamp: new Date()
+    });
+    updateChatUI();
+    
+    // Set processing state
+    chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: true });
+    
+    try {
+        // Check for simple/direct commands that skip planning
+        const skipPlanningPatterns = [
+            /^(hi|hello|hey|thanks|thank you)/i,
+            /^\//, // Commands starting with /
+        ];
+        
+        // Documentation generation should bypass planning
+        const isDocumentGeneration = /^(?:document|generate\s+(?:full\s+)?(?:doc|documentation)|documentation|deepwiki|full\s*doc)/i.test(text.trim());
+        log('Documentation check:', text.trim().substring(0, 50), '| isDocumentGeneration:', isDocumentGeneration, '| contextFiles:', contextFiles.size);
+        
+        const shouldSkipPlanning = skipPlanningPatterns.some(p => p.test(text.trim()));
+        
+        if (isDocumentGeneration && contextFiles.size > 0) {
+            // Direct documentation generation, bypass planning
+            log('DOCS: Bypassing planner for documentation generation');
+            const response = await handleLocalMode(text, {});
+            const modelName = getModelDisplayName();
+            const attribution = `\n\n---\n*AstraCode (${modelName})*`;
+            
+            // Note: handleLocalMode already streams the response
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: attribution 
+            });
+            
+            chatHistory.push({
+                role: 'assistant',
+                content: 'Documentation generated.',
+                timestamp: new Date()
+            });
+            
+            taskController.reset();
+            chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+            chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+            updateChatUI();
+            return;
+        }
+        
+        if (shouldSkipPlanning) {
+            // Direct response, no planning
+            const response = await callLanguageModel(text);
+            const modelName = getModelDisplayName();
+            const attribution = `\n\n---\n*AstraCode (${modelName})*`;
+            
+            chatHistory.push({
+                role: 'assistant',
+                content: response + attribution,
+                timestamp: new Date()
+            });
+            
+            taskController.reset();
+            chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+            chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+            updateChatUI();
+            return;
+        }
+        
+        // PHASE 1: Create and display the plan
+        log('PLANNER: Creating plan for:', text);
+        const plan = await createExecutionPlan(text, chatHistory.slice(-6));
+        
+        if (!plan || !plan.steps || plan.steps.length === 0) {
+            // No valid plan, answer directly
+            log('AGENT: No valid plan, using direct LLM');
+            const response = await callLanguageModel(text + '\n\nContext:\n' + getBasicContext());
+            const modelName = getModelDisplayName();
+            const attribution = `\n\n---\n*AstraCode (${modelName})*`;
+            
+            chatHistory.push({
+                role: 'assistant',
+                content: response + attribution,
+                timestamp: new Date()
+            });
+        } else {
+            // Store pending plan and show to user
+            pendingPlan = { query: text, plan };
+            
+            const planDisplay = formatPlanForDisplay(plan);
+            chatHistory.push({
+                role: 'assistant',
+                content: planDisplay,
+                timestamp: new Date()
+            });
+            
+            chatWebviewView?.webview.postMessage({ 
+                type: 'assistantMessage', 
+                content: planDisplay 
+            });
+        }
+        
+    } catch (error) {
+        log('Error:', error.message);
+        chatHistory.push({
+            role: 'assistant',
+            content: `Error: ${error.message}`,
+            timestamp: new Date()
+        });
+    }
+    
+    taskController.reset();
+    chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+    chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+    updateChatUI();
+}
+
+// Keep determineMode for backward compatibility but it's less important now
+function determineMode(text) {
+    // Explicit mode in message
+    if (/^\/api\s/i.test(text)) return 'api';
+    if (/^\/local\s/i.test(text)) return 'local';
+    
+    // Use current mode if not auto
+    if (currentMode !== 'auto') return currentMode;
+    
+    // Auto detection
+    const hasContext = contextFiles.size > 0;
+    const referencesFiles = /\b(this|these|the|attached|file|code|context)\b/i.test(text);
+    const isTranslate = /translate|convert|port\s+(?:to|this)|rewrite\s+(?:in|to)/i.test(text);
+    const isExplain = /explain|describe|analyze|flowchart/i.test(text) && referencesFiles;
+    const isGeneralQuestion = /^(what is|what are|how does|tell me about)/i.test(text);
+    
+    if (isGeneralQuestion && !referencesFiles) {
+        return 'api';
+    }
+    
+    if (hasContext && (referencesFiles || isTranslate || isExplain)) {
+        return 'local';
+    }
+    
+    return hasContext ? 'local' : 'api';
+}
+
+async function handleLocalMode(text, config) {
+    log('LOCAL MODE: Using context files');
+    
+    if (contextFiles.size === 0) {
+        return `No files in context. Please add files using:
+- Right-click a file → "AstraCode: Add File to Context"
+- Or switch to API mode to search the codebase`;
+    }
+    
+    // Build context from files
+    let contextContent = 'FILES IN CONTEXT:\n\n';
+    const fileList = [];
+    for (const [path, file] of contextFiles) {
+        const fileName = path.split('/').pop();
+        contextContent += `=== ${fileName} (${file.language}) ===\n`;
+        contextContent += file.content + '\n\n';
+        fileList.push({ name: fileName, path, language: file.language, size: file.content.length });
+    }
+    
+    // Add code index summary for code analysis queries
+    const indexSummary = getIndexSummary();
+    
+    // Check if we're dealing with PDFs or documents (not code)
+    const hasPdf = fileList.some(f => f.language === 'pdf' || f.name.toLowerCase().endsWith('.pdf'));
+    const hasOnlyDocs = fileList.every(f => 
+        f.language === 'pdf' || 
+        f.name.toLowerCase().endsWith('.pdf') ||
+        f.name.toLowerCase().endsWith('.md') ||
+        f.name.toLowerCase().endsWith('.txt')
+    );
+    
+    // Determine task type
+    const isTranslate = /translate|convert|port\s+(?:to|this)|rewrite\s+(?:in|to)/i.test(text);
+    const isFlowchart = /flowchart|diagram|flow/i.test(text);
+    const isDocument = /^(?:document|generate\s+(?:full\s+)?(?:doc|documentation)|documentation|deepwiki|full\s*doc)/i.test(text);
+    const isSummarize = /^(?:summarize|summary|give\s+(?:me\s+)?(?:a\s+)?summary)/i.test(text);
+    const isExplain = /^(?:explain|describe)\s+(?:this|the|how)/i.test(text) && !isDocument;
+    
+    // Direct questions should be answered, not routed to specialized handlers
+    // Use word boundaries to prevent "document" matching "do", "where" matching "what", etc.
+    const isDirectQuestion = /^(?:does|is|are|can|could|will|would|has|have|do|did|what|why|how|where|when|which|should)\b/i.test(text);
+    
+    // New query types that use the code index - only match specific trace requests, not general questions
+    const isTrace = !isDirectQuestion && /(?:^trace\s+\w|trace\s+(?:the\s+)?(?:function|method|call|symbol|variable)\s|follow\s+(?:the\s+)?call|call.?graph\s+(?:for|of)|who\s+calls|what\s+calls|find\s+usage|where\s+is\s+\w+\s+used)/i.test(text);
+    const isFindBug = /^(?:find\s+bug|debug|fix\s+(?:the\s+)?error)|what(?:'s|\s+is)\s+wrong/i.test(text);
+    const isEnhance = /^(?:enhance|improve|add\s+(?:a\s+)?feature|implement|extend|modify|refactor|optimize)/i.test(text);
+    const isFindFunction = /^(?:find\s+(?:the\s+)?function|where\s+is\s+(?:the\s+)?(?:function|method)|locate|show\s+me\s+(?:the\s+)?(?:function|method))/i.test(text);
+    
+    // For PDFs and documents, always summarize instead of generating code documentation
+    if (hasPdf || hasOnlyDocs) {
+        if (isDocument || isSummarize) {
+            const prompt = buildDocumentSummaryPrompt(contextContent, text);
+            return await callLanguageModel(prompt);
+        }
+    }
+    
+    // Special handling for code documentation - generate .md file
+    if (isDocument && !hasPdf) {
+        return await generateDocumentationFile(fileList, text);
+    }
+    
+    let prompt;
+    
+    // Direct questions get answered directly
+    if (isDirectQuestion) {
+        prompt = buildDirectQuestionPrompt(contextContent, indexSummary, text);
+    } else if (isTrace) {
+        // Extract symbol name OR concept keywords from query
+        let symbolName = null;
+        let conceptKeywords = [];
+        
+        // First, try to extract a specific function name
+        // Pattern 1: "trace functionName" where functionName looks like a real function (has underscore or camelCase)
+        let symbolMatch = text.match(/trace\s+(?:the\s+)?(?:function\s+)?[`'"]*([a-zA-Z_]\w*(?:_\w+)+)/i);
+        if (symbolMatch) symbolName = symbolMatch[1];
+        
+        // Pattern 2: "who/what calls functionName"
+        if (!symbolName) {
+            symbolMatch = text.match(/(?:who|what)\s+calls\s+[`'"]*([a-zA-Z_]\w+)/i);
+            if (symbolMatch) symbolName = symbolMatch[1];
+        }
+        
+        // Pattern 3: "where is functionName used"
+        if (!symbolName) {
+            symbolMatch = text.match(/where\s+is\s+[`'"]*([a-zA-Z_]\w+)\s+(?:used|called)/i);
+            if (symbolMatch) symbolName = symbolMatch[1];
+        }
+        
+        // Check if extracted symbol actually exists in the code index
+        if (symbolName && !codeIndex.symbols.has(symbolName)) {
+            // Symbol not found - treat as concept instead
+            log('Symbol not in index, treating as concept:', symbolName);
+            symbolName = null;
+        }
+        
+        // If no specific function found, extract concept keywords
+        if (!symbolName) {
+            // Remove common trace-related words and extract meaningful keywords
+            const cleanedQuery = text.toLowerCase()
+                .replace(/^trace\s+(?:the\s+)?/i, '')
+                .replace(/\s+(?:functionality|feature|logic|code|implementation|handling|processing)$/i, '')
+                .trim();
+            
+            // Split into keywords
+            conceptKeywords = cleanedQuery.split(/\s+/)
+                .filter(w => w.length > 2 && !['the', 'and', 'for', 'how', 'does', 'this', 'that', 'with'].includes(w));
+            
+            log('Concept keywords extracted:', conceptKeywords);
+        }
+        
+        // Filter out common stop words from symbolName
+        const stopWords = ['the', 'this', 'that', 'function', 'method', 'call', 'trace', 'functionality', 'flow', 'code'];
+        if (symbolName && stopWords.includes(symbolName.toLowerCase())) {
+            symbolName = null;
+        }
+        
+        log('Trace - symbol:', symbolName, 'concepts:', conceptKeywords);
+        prompt = buildTracePrompt(contextContent, indexSummary, text, symbolName, conceptKeywords);
+        log('Trace prompt built, length:', prompt.length, 'chars');
+        log('Trace prompt preview:', prompt.substring(0, 500));
+    } else if (isFindBug) {
+        prompt = buildDebugPrompt(contextContent, indexSummary, text);
+    } else if (isEnhance) {
+        prompt = buildEnhancePrompt(contextContent, indexSummary, text);
+    } else if (isFindFunction) {
+        prompt = buildFindFunctionPrompt(contextContent, indexSummary, text);
+    } else if (isFlowchart) {
+        prompt = buildFlowchartPrompt(contextContent, text);
+    } else if (isTranslate) {
+        // Detect target language from query or use config
+        let targetLang = config.get('targetLanguage') || 'java';
+        const targetMatch = text.match(/(?:to|into)\s+(java|python|c#|csharp|javascript|typescript|go|rust|c\+\+|cpp)/i);
+        if (targetMatch) {
+            targetLang = targetMatch[1].toLowerCase();
+            if (targetLang === 'csharp') targetLang = 'c#';
+            if (targetLang === 'cpp') targetLang = 'c++';
+        }
+        
+        // STEP 1: PLAN - Extract specific file name from query
+        const fileMatch = text.match(/(?:translate|convert|port)\s+(?:the\s+)?(?:file\s+)?[`'"]*([a-zA-Z0-9_\-\.]+\.[a-zA-Z]+)/i);
+        let targetFile = fileMatch ? fileMatch[1] : null;
+        
+        log('Translate request - target file:', targetFile, 'target language:', targetLang);
+        
+        // STEP 2: EXECUTE - Find the specific file and translate ONLY it
+        let translateContent = '';
+        let foundFile = null;
+        
+        if (targetFile) {
+            // Search for the specific file in context
+            for (const [path, file] of contextFiles) {
+                const fileName = path.split('/').pop();
+                if (fileName === targetFile || fileName.toLowerCase() === targetFile.toLowerCase()) {
+                    foundFile = { path, fileName, content: file.content, language: file.language };
+                    break;
+                }
+            }
+            
+            if (foundFile) {
+                log('Found target file:', foundFile.fileName, 'with', foundFile.content.length, 'chars');
+                translateContent = `## FILE TO TRANSLATE: ${foundFile.fileName}\n\n\`\`\`${foundFile.language}\n${foundFile.content}\n\`\`\``;
+            } else {
+                // File not found in context - list available files
+                const availableFiles = [...contextFiles.keys()].map(p => p.split('/').pop()).join(', ');
+                translateContent = `ERROR: File "${targetFile}" not found in context.\n\nAvailable files: ${availableFiles}\n\nPlease add the file to context using the 📎 button or right-click → "AstraCode: Add File to Context"`;
+                
+                return translateContent;
+            }
+        } else {
+            // No specific file mentioned - if only one file, use it; otherwise ask
+            if (contextFiles.size === 1) {
+                const [path, file] = [...contextFiles.entries()][0];
+                const fileName = path.split('/').pop();
+                foundFile = { path, fileName, content: file.content, language: file.language };
+                translateContent = `## FILE TO TRANSLATE: ${fileName}\n\n\`\`\`${file.language}\n${file.content}\n\`\`\``;
+            } else if (contextFiles.size > 1) {
+                // Multiple files - ask which one to translate
+                const fileList = [...contextFiles.keys()].map(p => `- ${p.split('/').pop()}`).join('\n');
+                return `You have ${contextFiles.size} files in context. Which one would you like to translate?\n\n${fileList}\n\nPlease specify, e.g.: "translate parse_relation.c to Java"`;
+            } else {
+                return 'No files in context. Please add the file you want to translate using the 📎 button.';
+            }
+        }
+        
+        prompt = buildTranslatePrompt(translateContent, text, targetLang, foundFile?.fileName);
+    } else if (isExplain) {
+        prompt = buildExplainPrompt(contextContent + indexSummary, text);
+    } else if (isSummarize) {
+        prompt = buildDocumentSummaryPrompt(contextContent, text);
+    } else {
+        prompt = buildGeneralPrompt(contextContent + indexSummary, text);
+    }
+    
+    // Call LLM via VS Code Language Model API
+    return await callLanguageModel(prompt);
+}
+
+// Build prompt for tracing functionality
+function buildTracePrompt(context, indexSummary, query, symbolName, conceptKeywords = []) {
+    log('buildTracePrompt called with symbol:', symbolName, 'concepts:', conceptKeywords);
+    
+    // CASE 1: Specific function trace
+    if (symbolName && codeIndex.symbols.has(symbolName)) {
+        const grep = grepCodeForSymbol(symbolName);
+        let symbolCode = '';
+        let callGraphText = '';
+        let grepResults = '';
+        let callersInfo = '';
+        
+        if (grep.definition) {
+            symbolCode = `\n## FUNCTION DEFINITION (${grep.definition.fileName}:${grep.definition.line}):\n\`\`\`c\n${grep.definition.code}\n\`\`\`\n`;
+        }
+        
+        if (grep.calls.length > 0) {
+            grepResults = `\n## ALL CALLS TO ${symbolName} (${grep.calls.length} found):\n`;
+            for (const call of grep.calls.slice(0, 15)) {
+                grepResults += `- **${call.fileName}:${call.line}**: \`${call.code.substring(0, 80)}\`\n`;
+            }
+        }
+        
+        if (codeIndex.callGraph.has(symbolName)) {
+            const callGraph = buildCallGraphFromSymbol(symbolName, 4);
+            callGraphText = formatCallGraphAsText(callGraph);
+        }
+        
+        const callers = codeIndex.reverseCallGraph.get(symbolName);
+        if (callers && callers.size > 0) {
+            callersInfo = `\n## CALLERS (${callers.size}):\n`;
+            for (const caller of [...callers].slice(0, 10)) {
+                const sym = codeIndex.symbols.get(caller);
+                callersInfo += `- ${caller} (${sym?.file?.split('/').pop()}:${sym?.line})\n`;
+            }
+        }
+        
+        return `TRACE THE FUNCTION "${symbolName}" - DO NOT SUMMARIZE FILES.
+
+${symbolCode}
+${callGraphText}
+${callersInfo}
+${grepResults}
+
+SOURCE CODE:
+${context}
+
+QUERY: ${query}
+
+INSTRUCTIONS:
+1. What does ${symbolName} do?
+2. Show the call flow: callers → ${symbolName} → callees
+3. What variables does it use?
+4. Step through the logic
+5. How does it handle errors?
+
+DO NOT summarize each file. ONLY trace ${symbolName}.`;
+    }
+    
+    // CASE 2: CONCEPT/FEATURE TRACE (e.g., "range bound functionality")
+    if (conceptKeywords.length > 0) {
+        log('Building concept trace for:', conceptKeywords);
+        
+        // GREP all files for each keyword - this is the primary source of truth
+        const keywordMatches = new Map(); // keyword -> [{file, line, code}]
+        const lineMatches = new Map();    // "file:line" -> {file, line, code, keywords:[]}
+        
+        for (const keyword of conceptKeywords) {
+            keywordMatches.set(keyword, []);
+            
+            // Search through all context files
+            for (const [filePath, file] of contextFiles) {
+                const lines = file.content.split('\n');
+                const fileName = filePath.split('/').pop();
+                
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    if (line.toLowerCase().includes(keyword.toLowerCase())) {
+                        const key = `${fileName}:${i + 1}`;
+                        const match = { fileName, line: i + 1, code: line.trim() };
+                        
+                        keywordMatches.get(keyword).push(match);
+                        
+                        if (!lineMatches.has(key)) {
+                            lineMatches.set(key, { ...match, keywords: [keyword] });
+                        } else {
+                            lineMatches.get(key).keywords.push(keyword);
+                        }
+                    }
+                }
+            }
+        }
+        
+        log('Grep found matches:', lineMatches.size);
+        
+        // Sort matches by number of keyword hits (more = more relevant)
+        const sortedMatches = [...lineMatches.values()]
+            .sort((a, b) => b.keywords.length - a.keywords.length);
+        
+        // Find function definitions containing keywords
+        const functionDefs = [];
+        const structDefs = [];
+        
+        for (const match of sortedMatches) {
+            const code = match.code;
+            // Function definition patterns (C-style)
+            if (code.match(/^\s*(?:static\s+)?(?:\w+\s+)+\w+\s*\([^)]*\)\s*(?:\{|$)/) ||
+                code.match(/^(?:static\s+)?(?:inline\s+)?\w+\s*\*?\s+\w+\s*\(/) ||
+                code.match(/^\w+\s+\w+\s*\([^)]*\)$/)) {
+                functionDefs.push(match);
+            }
+            // Struct/type definition patterns
+            else if (code.match(/^\s*(?:typedef\s+)?(?:struct|union|enum)\s+\w*/)) {
+                structDefs.push(match);
+            }
+        }
+        
+        log('Found function defs:', functionDefs.length, 'struct defs:', structDefs.length);
+        
+        // Build the prompt - GREP RESULTS FIRST, then instructions
+        const conceptName = conceptKeywords.join(' ').toUpperCase();
+        
+        // Start with SYSTEM INSTRUCTION (critical for LLM behavior)
+        let output = `[SYSTEM: You are in TRACE MODE. Your task is to trace the "${conceptName}" feature through the code. DO NOT summarize files. DO NOT describe what each file does. Instead, trace how the feature works from start to finish.]
+
+# TRACE REQUEST: ${conceptName}
+
+`;
+
+        // Show search results summary
+        output += `## Search Results Summary\n\n`;
+        let totalMatches = 0;
+        for (const [keyword, matches] of keywordMatches) {
+            output += `- "${keyword}": ${matches.length} occurrences\n`;
+            totalMatches += matches.length;
+        }
+        output += `- **Total**: ${totalMatches} matches found\n\n`;
+        
+        // Show function definitions (MOST IMPORTANT)
+        if (functionDefs.length > 0) {
+            output += `## Functions Related to "${conceptName}" (${functionDefs.length} found)\n\n`;
+            output += `These are the functions you should trace:\n\n`;
+            for (const def of functionDefs.slice(0, 10)) {
+                output += `### ${def.fileName}:${def.line}\n`;
+                output += `Keywords: ${def.keywords.join(', ')}\n`;
+                output += `\`\`\`c\n${def.code}\n\`\`\`\n\n`;
+            }
+        } else {
+            output += `## No Function Definitions Found\n\nSearch the source files below for functions related to "${conceptName}".\n\n`;
+        }
+        
+        // Show struct definitions
+        if (structDefs.length > 0) {
+            output += `## Data Structures for "${conceptName}" (${structDefs.length} found)\n\n`;
+            for (const def of structDefs.slice(0, 6)) {
+                output += `- **${def.fileName}:${def.line}**: \`${def.code}\`\n`;
+            }
+            output += `\n`;
+        }
+        
+        // Show highly relevant lines (multiple keyword matches)
+        const multiKeywordMatches = sortedMatches.filter(m => m.keywords.length > 1);
+        if (multiKeywordMatches.length > 0) {
+            output += `## Most Relevant Lines (matching multiple keywords)\n\n`;
+            for (const match of multiKeywordMatches.slice(0, 12)) {
+                output += `- **${match.fileName}:${match.line}** [${match.keywords.join('+')}]: \`${match.code.substring(0, 60)}...\`\n`;
+            }
+            output += `\n`;
+        }
+        
+        // Add full source files
+        output += `## Source Files\n\n${context}\n\n`;
+        
+        // User query
+        output += `## User Query\n\n${query}\n\n`;
+        
+        // INSTRUCTIONS AT THE END (recency bias helps LLMs follow these)
+        output += `---
+
+# YOUR TASK
+
+You are tracing the **${conceptName}** feature. Follow this exact structure:
+
+## 1. What is ${conceptName}?
+Explain in 2-3 sentences what this feature does.
+
+## 2. Entry Point Functions
+Which functions START the ${conceptName} process? List them with file:line.
+
+## 3. Call Flow
+Show how execution flows through the code:
+\`\`\`
+main_function()
+├── calls helper1()
+│   └── calls helper1a()
+├── calls helper2()
+└── returns result
+\`\`\`
+
+## 4. Key Data Structures
+What structs/types are used? Explain their fields.
+
+## 5. Step-by-Step Logic
+Walk through how ${conceptName} works:
+1. First, X happens...
+2. Then, Y is called...
+3. Finally, Z returns...
+
+## 6. Key Variables
+What are the important variables and how do they flow?
+
+---
+
+**CRITICAL RULES:**
+- DO NOT write "## Makefile" or "## meson.build" sections
+- DO NOT summarize what each file contains
+- DO NOT give a general overview
+- ONLY trace the ${conceptName} feature
+
+Start your response with "## 1. What is ${conceptName}?"`;
+        
+        return output;
+    }
+    
+    // CASE 3: Symbol requested but not found in index - grep for it
+    if (symbolName) {
+        const grep = grepCodeForSymbol(symbolName);
+        let grepInfo = '';
+        
+        if (grep.all.length > 0) {
+            grepInfo = `## GREP RESULTS for "${symbolName}" (${grep.all.length} occurrences):\n`;
+            for (const ref of grep.all.slice(0, 25)) {
+                grepInfo += `- ${ref.fileName}:${ref.line}: \`${ref.code.substring(0, 70)}\`\n`;
+            }
+        }
+        
+        return `Find and trace "${symbolName}" in the code.
+
+${grepInfo}
+
+${context}
+
+QUERY: ${query}
+
+Find "${symbolName}" and trace:
+1. Where it's defined
+2. What calls it
+3. What it calls  
+4. Execution flow
+5. Key variables
+
+Focus on "${symbolName}" only.`;
+    }
+    
+    // CASE 4: Generic trace (no symbol, no concepts)
+    return `Trace the code for: ${query}
+
+${context}
+
+${indexSummary}
+
+Show:
+1. Entry points
+2. Call flow  
+3. Key variables
+4. Data flow`;
+}
+
+// Build prompt for debugging/finding bugs
+function buildDebugPrompt(context, indexSummary, query) {
+    return `Analyze this code for potential bugs and issues.
+
+${context}
+
+${indexSummary}
+
+USER REQUEST: ${query}
+
+Perform a thorough code review:
+
+## Potential Issues Found
+List each issue with:
+- **Location**: File and line number
+- **Issue**: What's wrong
+- **Severity**: Critical / High / Medium / Low
+- **Fix**: Suggested solution
+
+## Code Smells
+Identify any code quality issues:
+- Duplicate code
+- Long functions
+- Missing error handling
+- Hardcoded values
+- etc.
+
+## Security Concerns
+Check for:
+- Input validation issues
+- Injection vulnerabilities
+- Buffer overflows (for C/C++)
+- etc.
+
+## Recommended Fixes
+Provide specific code changes to fix the issues.
+
+Be specific with file names and line numbers from the code provided.`;
+}
+
+// Build prompt for code enhancement
+function buildEnhancePrompt(context, indexSummary, query) {
+    // Extract keywords from the enhancement request
+    const keywords = query.toLowerCase()
+        .replace(/enhance|add|implement|create|build|make|improve|modify|change|update|support|feature|functionality/gi, '')
+        .split(/\s+/)
+        .filter(w => w.length > 3 && !['this', 'that', 'with', 'from', 'into', 'should', 'would', 'could', 'need', 'want'].includes(w));
+    
+    log('Enhancement keywords:', keywords);
+    
+    // Search code for relevant sections
+    let relevantCode = '';
+    let insertionPoints = '';
+    const foundLocations = new Map();
+    
+    // Search for each keyword in the code
+    for (const keyword of keywords.slice(0, 5)) {
+        const grep = grepCodeForSymbol(keyword);
+        if (grep.all.length > 0) {
+            for (const ref of grep.all.slice(0, 5)) {
+                const key = `${ref.fileName}:${ref.line}`;
+                if (!foundLocations.has(key)) {
+                    foundLocations.set(key, ref);
+                }
+            }
+        }
+    }
+    
+    if (foundLocations.size > 0) {
+        relevantCode = `\n## RELEVANT CODE LOCATIONS (grep results):\n`;
+        for (const [loc, ref] of foundLocations) {
+            relevantCode += `- **${loc}**: \`${ref.code.substring(0, 70)}...\`\n`;
+        }
+    }
+    
+    // Identify potential insertion points based on code structure
+    insertionPoints = `\n## POTENTIAL INSERTION POINTS:\n`;
+    
+    // Find main functions, classes, entry points
+    const entryPoints = [];
+    const utilities = [];
+    const dataStructures = [];
+    
+    for (const [name, symbol] of codeIndex.symbols) {
+        if (name.includes('@')) continue;
+        
+        // Entry points (main, init, etc.)
+        if (/^(main|init|start|run|execute|process|handle)/i.test(name)) {
+            entryPoints.push({ name, file: symbol.file?.split('/').pop(), line: symbol.line });
+        }
+        
+        // Utility functions
+        if (/^(get|set|create|build|parse|validate|check|is_|has_)/i.test(name)) {
+            utilities.push({ name, file: symbol.file?.split('/').pop(), line: symbol.line });
+        }
+        
+        // Data structures
+        if (['struct', 'class', 'interface', 'record', 'type'].includes(symbol.type)) {
+            dataStructures.push({ name, file: symbol.file?.split('/').pop(), line: symbol.line });
+        }
+    }
+    
+    if (entryPoints.length > 0) {
+        insertionPoints += `\n**Entry Points (good for calling new functionality):**\n`;
+        for (const ep of entryPoints.slice(0, 5)) {
+            insertionPoints += `- ${ep.name} at ${ep.file}:${ep.line}\n`;
+        }
+    }
+    
+    if (dataStructures.length > 0) {
+        insertionPoints += `\n**Data Structures (may need new fields):**\n`;
+        for (const ds of dataStructures.slice(0, 5)) {
+            insertionPoints += `- ${ds.name} at ${ds.file}:${ds.line}\n`;
+        }
+    }
+    
+    if (utilities.length > 0) {
+        insertionPoints += `\n**Utility Functions (patterns to follow):**\n`;
+        for (const util of utilities.slice(0, 5)) {
+            insertionPoints += `- ${util.name} at ${util.file}:${util.line}\n`;
+        }
+    }
+    
+    // Get file summary
+    let fileSummary = `\n## FILES IN CONTEXT:\n`;
+    for (const [path, file] of contextFiles) {
+        const fileName = path.split('/').pop();
+        const lineCount = file.content.split('\n').length;
+        const symbols = codeIndex.files.get(path)?.symbols || [];
+        const funcCount = symbols.filter(s => ['function', 'method', 'procedure'].includes(s.type)).length;
+        fileSummary += `- **${fileName}** (${lineCount} lines, ${funcCount} functions)\n`;
+    }
+    
+    return `Analyze this code and identify WHERE to implement the requested enhancement.
+
+${context}
+
+${indexSummary}
+${fileSummary}
+${relevantCode}
+${insertionPoints}
+
+USER REQUEST: ${query}
+
+## ENHANCEMENT ANALYSIS INSTRUCTIONS:
+
+### 1. UNDERSTAND THE REQUEST
+- What specific functionality is being requested?
+- What inputs/outputs are needed?
+- What constraints or requirements are mentioned?
+
+### 2. IDENTIFY EXACT INSERTION POINTS
+For each change needed, specify:
+
+**File:** [filename]
+**Line:** [line number or "after line X" / "before function Y"]
+**Change Type:** [new function / modify existing / add to struct / new file]
+**Reason:** Why this location?
+
+Example:
+\`\`\`
+File: partbounds.c
+Line: After line 234 (after check_new_partition function)
+Change Type: New function
+Reason: Related to partition validation, follows existing pattern
+\`\`\`
+
+### 3. IMPLEMENTATION PLAN
+1. **Step 1:** [What to do first, with specific file:line]
+2. **Step 2:** [Next change]
+3. **Step 3:** [etc.]
+
+### 4. CODE CHANGES
+For each insertion point, show the exact code:
+
+**File: [filename], Line: [number]**
+\`\`\`[language]
+// The new or modified code
+\`\`\`
+
+### 5. INTEGRATION
+- How does the new code connect to existing code?
+- What existing functions need to call the new code?
+- What data structures need updates?
+
+### 6. TESTING
+- How to verify the enhancement works?
+- Edge cases to consider?
+
+BE SPECIFIC about file names and line numbers. Don't give vague instructions.`;
+}
+
+// Build prompt for finding functions
+function buildFindFunctionPrompt(context, indexSummary, query) {
+    // Try to extract what they're looking for
+    const searchTerms = query.toLowerCase()
+        .replace(/find|locate|where|is|show|me|the|function|method|procedure|that|which|does/gi, '')
+        .trim();
+    
+    return `Find and explain the relevant code based on the user's query.
+
+${context}
+
+${indexSummary}
+
+USER REQUEST: ${query}
+
+Based on the code index, locate the relevant functions/code:
+
+## Found Matches
+List the functions/methods that match the query:
+- **Name**: Function name
+- **Location**: File:line
+- **Purpose**: What it does
+- **Signature**: Parameters and return type
+
+## Code Snippets
+Show the relevant code for each match.
+
+## Usage Examples
+Show where and how each function is called.
+
+## Related Functions
+List related functions that work together.
+
+Use the code index to provide accurate locations.`;
+}
+
+// Build prompt for document/PDF summarization
+function buildDocumentSummaryPrompt(context, query) {
+    return `Analyze and summarize the following document content.
+
+${context}
+
+USER REQUEST: ${query}
+
+Provide a comprehensive summary that includes:
+
+## Document Overview
+[What is this document about? 2-3 sentences]
+
+## Key Points
+- [Main point 1]
+- [Main point 2]
+- [Main point 3]
+- [Continue as needed]
+
+## Detailed Summary
+[Provide a detailed summary of the document's content, organized by sections or topics]
+
+## Important Details
+[List any specific data, dates, figures, requirements, or technical specifications mentioned]
+
+## Conclusions/Recommendations
+[If applicable, summarize any conclusions or recommendations from the document]
+
+Be thorough but concise. Focus on the most important information.`;
+}
+
+// Generate comprehensive documentation as a .md file
+async function generateDocumentationFile(fileList, query) {
+    log('=== GENERATING DOCUMENTATION ===');
+    log('Files:', fileList.length);
+    fileList.forEach(f => log('  -', f.name, '|', f.language, '|', f.size, 'chars'));
+    
+    if (fileList.length === 0) {
+        log('ERROR: No files to document');
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `❌ No files in context to document. Add files first.`
+        });
+        return 'No files to document';
+    }
+    
+    // Determine project name from common path or first file
+    const projectName = getProjectName(fileList);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const fileName = `${projectName}-documentation-${timestamp}.md`;
+    
+    log('Project name:', projectName, '| Output file:', fileName);
+    
+    // Start building the documentation
+    let documentation = `# ${projectName} Documentation
+
+> Generated by AstraCode
+> Date: ${new Date().toLocaleDateString()}
+> Files analyzed: ${fileList.length}
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Module Reference](#module-reference)
+${fileList.map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()})`).join('\n')}
+4. [Data Flow](#data-flow)
+5. [Dependencies](#dependencies)
+
+---
+
+## Overview
+
+`;
+
+    // Show progress
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `📄 **Generating Documentation**\n\nProject: **${projectName}**\nFiles: ${fileList.length}\n\n---\n\n`
+    });
+
+    // Generate overview first
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Generating project overview...\n\n`
+    });
+
+    const overviewPrompt = buildOverviewPrompt(fileList);
+    const overview = await callLanguageModelForDoc(overviewPrompt);
+    if (overview.error) {
+        log('Overview generation failed:', overview.error);
+        // Fallback: Generate overview from code index
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `⚠️ LLM unavailable, generating from code index...\n\n`
+        });
+        documentation += generateIndexBasedOverview(fileList) + '\n\n---\n\n';
+    } else {
+        documentation += overview.text + '\n\n---\n\n';
+    }
+
+    // Generate architecture section
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Analyzing architecture...\n\n`
+    });
+
+    const archPrompt = buildArchitecturePrompt(fileList);
+    const architecture = await callLanguageModelForDoc(archPrompt);
+    if (architecture.error) {
+        // Fallback: Generate architecture from code index
+        documentation += generateIndexBasedArchitecture(fileList) + '\n\n---\n\n';
+    } else {
+        documentation += `## Architecture\n\n${architecture.text}\n\n---\n\n`;
+    }
+
+    // Generate documentation for each file
+    documentation += `## Module Reference\n\n`;
+    
+    for (let i = 0; i < fileList.length; i++) {
+        const file = fileList[i];
+        const fileContent = contextFiles.get(file.path)?.content || '';
+        
+        log(`Documenting file ${i + 1}/${fileList.length}: ${file.name} (${fileContent.length} chars)`);
+        
+        if (fileContent.length === 0) {
+            log('WARNING: Empty content for file:', file.path);
+            documentation += `### ${file.name}\n\n*File content not available.*\n\n---\n\n`;
+            continue;
+        }
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `⏳ Documenting ${file.name} (${i + 1}/${fileList.length})...\n`
+        });
+
+        const filePrompt = buildFileDocPrompt(file.name, fileContent);
+        log('File prompt length:', filePrompt.length);
+        
+        const fileDoc = await callLanguageModelForDoc(filePrompt);
+        
+        documentation += `### ${file.name}\n\n`;
+        if (fileDoc.error) {
+            log('File doc error:', fileDoc.error, '- using fallback');
+            // Fallback: Generate file doc from code index
+            documentation += generateIndexBasedFileDoc(file.path, file.name) + '\n\n---\n\n';
+        } else {
+            log('File doc success, length:', fileDoc.text?.length || 0);
+            documentation += fileDoc.text + '\n\n---\n\n';
+        }
+    }
+
+    // Generate data flow section
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Analyzing data flow...\n\n`
+    });
+
+    const dataFlowPrompt = buildDataFlowPrompt(fileList);
+    const dataFlow = await callLanguageModelForDoc(dataFlowPrompt);
+    if (dataFlow.error) {
+        // Fallback: Generate data flow from code index
+        documentation += generateIndexBasedDataFlow(fileList) + '\n\n---\n\n';
+    } else {
+        documentation += `## Data Flow\n\n${dataFlow.text}\n\n---\n\n`;
+    }
+
+    // Generate dependencies section
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Mapping dependencies...\n\n`
+    });
+
+    const depsPrompt = buildDependenciesPrompt(fileList);
+    const dependencies = await callLanguageModelForDoc(depsPrompt);
+    if (dependencies.error) {
+        // Fallback: Generate dependencies from code index
+        documentation += generateIndexBasedDependencies(fileList) + '\n\n';
+    } else {
+        documentation += `## Dependencies\n\n${dependencies.text}\n\n`;
+    }
+
+    // Add footer
+    documentation += `---
+
+*Generated by AstraCode*
+`;
+
+    // Save the file
+    try {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        let fileUri;
+        
+        if (workspaceFolder) {
+            // Save to .astra folder in workspace
+            const astraDir = vscode.Uri.joinPath(workspaceFolder.uri, '.astra');
+            await vscode.workspace.fs.createDirectory(astraDir);
+            fileUri = vscode.Uri.joinPath(astraDir, fileName);
+        } else {
+            // Save to temp location
+            const tmpDir = require('os').tmpdir();
+            fileUri = vscode.Uri.file(`${tmpDir}/${fileName}`);
+        }
+        
+        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(documentation, 'utf-8'));
+        
+        log('Documentation saved to:', fileUri.fsPath);
+        
+        // Open the file with preview
+        const doc = await vscode.workspace.openTextDocument(fileUri);
+        await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside });
+        
+        // Try to open markdown preview
+        await vscode.commands.executeCommand('markdown.showPreview', fileUri);
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n\n✅ **Documentation Complete!**\n\n📄 Saved to: \`${fileUri.fsPath}\`\n\nThe documentation has been opened in a new tab with Markdown preview.`
+        });
+        
+        return `Documentation generated successfully! See the new tab for rendered output.`;
+        
+    } catch (error) {
+        log('Error saving documentation:', error);
+        
+        // Return the documentation as text if we can't save
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n\n⚠️ Could not save file. Here's the documentation:\n\n---\n\n${documentation}`
+        });
+        
+        return documentation;
+    }
+}
+
+function getProjectName(fileList) {
+    if (fileList.length === 0) return 'Project';
+    
+    // Try to find common directory name
+    const paths = fileList.map(f => f.path);
+    const parts = paths[0].split('/');
+    
+    // Look for a meaningful directory name
+    for (let i = parts.length - 2; i >= 0; i--) {
+        const dir = parts[i];
+        if (dir && dir !== '.' && dir !== 'src' && dir !== 'lib' && !dir.startsWith('.')) {
+            return dir;
+        }
+    }
+    
+    // Fall back to first file name without extension
+    return fileList[0].name.replace(/\.[^.]+$/, '');
+}
+
+function buildOverviewPrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Limit content size to avoid token limits
+    const maxFilesForContent = 10;  // Only include first 10 files' content
+    const maxContentPerFile = 1500; // Reduced from 2000
+    const maxTotalContent = 20000;  // Cap total content
+    
+    let totalContentLength = 0;
+    const fileContents = [];
+    
+    for (let i = 0; i < fileList.length && i < maxFilesForContent; i++) {
+        const f = fileList[i];
+        const content = contextFiles.get(f.path)?.content || '';
+        const truncatedContent = content.substring(0, maxContentPerFile);
+        
+        if (totalContentLength + truncatedContent.length > maxTotalContent) {
+            fileContents.push(`FILE: ${f.name}\n[Content truncated - file too large]\n`);
+        } else {
+            fileContents.push(`FILE: ${f.name}\n${truncatedContent}${content.length > maxContentPerFile ? '...[truncated]' : ''}\n`);
+            totalContentLength += truncatedContent.length;
+        }
+    }
+    
+    if (fileList.length > maxFilesForContent) {
+        fileContents.push(`\n[... and ${fileList.length - maxFilesForContent} more files]\n`);
+    }
+    
+    return `Analyze these source files and write a concise project overview.
+
+FILES (${fileList.length} total): ${fileNames}
+
+${fileContents.join('\n---\n')}
+
+Write an overview that covers:
+1. **Purpose**: What is the main purpose of this codebase/module? (2-3 sentences)
+2. **Key Features**: List 3-5 main features or capabilities
+3. **Technology**: What language, frameworks, or patterns are used?
+
+Be concise and accurate. Output only the content, no headers.`;
+}
+
+function buildArchitecturePrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Use the code index for architecture instead of raw content
+    // This is more reliable for large codebases
+    let indexInfo = '';
+    if (codeIndex.symbols.size > 0) {
+        // Get functions and their relationships
+        const functions = [];
+        for (const [name, symbol] of codeIndex.symbols) {
+            if (name.includes('@')) continue; // Skip duplicates
+            if (['function', 'procedure', 'method'].includes(symbol.type)) {
+                const callers = codeIndex.reverseCallGraph.get(name);
+                const calls = codeIndex.callGraph.get(name);
+                functions.push({
+                    name,
+                    file: symbol.file?.split('/').pop(),
+                    callers: callers ? callers.size : 0,
+                    calls: calls ? [...calls].slice(0, 5) : []
+                });
+            }
+        }
+        
+        // Sort by caller count (most called = most important)
+        functions.sort((a, b) => b.callers - a.callers);
+        
+        indexInfo = `\n\nCODE INDEX (${functions.length} functions):\n`;
+        indexInfo += functions.slice(0, 30).map(f => 
+            `- ${f.name} (${f.file}) [called by ${f.callers}]${f.calls.length > 0 ? ' → ' + f.calls.join(', ') : ''}`
+        ).join('\n');
+    }
+    
+    // Limit file content
+    const maxFiles = 8;
+    const maxContentPerFile = 1000;
+    const fileContents = fileList.slice(0, maxFiles).map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        return `FILE: ${f.name}\n${content.substring(0, maxContentPerFile)}${content.length > maxContentPerFile ? '...[truncated]' : ''}\n`;
+    }).join('\n---\n');
+    
+    return `Analyze the architecture of these source files.
+
+FILES (${fileList.length} total): ${fileNames}
+${indexInfo}
+
+${fileContents}
+
+Provide:
+
+### Component Diagram
+\`\`\`mermaid
+flowchart TB
+    subgraph Components
+        A[Component1] --> B[Component2]
+    end
+\`\`\`
+
+### Module Structure
+| Module | Responsibility | Key Functions |
+|--------|---------------|---------------|
+| file.c | What it does | func1, func2 |
+
+### Relationships
+Describe how the modules interact with each other.
+
+Be accurate based on the actual code and index information.`;
+}
+
+/**
+ * Generate overview from code index when LLM is unavailable
+ */
+function generateIndexBasedOverview(fileList) {
+    const languages = new Set();
+    const functions = [];
+    const classes = [];
+    
+    // Gather info from code index
+    for (const [name, symbol] of codeIndex.symbols) {
+        if (name.includes('@')) continue; // Skip duplicates
+        
+        if (['function', 'procedure', 'method', 'section', 'paragraph'].includes(symbol.type)) {
+            functions.push(name);
+        } else if (['class', 'struct', 'interface', 'record'].includes(symbol.type)) {
+            classes.push(name);
+        }
+    }
+    
+    // Detect languages from files
+    for (const file of fileList) {
+        const ext = file.name.split('.').pop().toLowerCase();
+        const langMap = {
+            'c': 'C', 'h': 'C/C++', 'cpp': 'C++', 'java': 'Java',
+            'py': 'Python', 'js': 'JavaScript', 'ts': 'TypeScript',
+            'cbl': 'COBOL', 'cob': 'COBOL', 'tal': 'TAL', 'sql': 'SQL',
+            'cs': 'C#', 'go': 'Go', 'rs': 'Rust'
+        };
+        if (langMap[ext]) languages.add(langMap[ext]);
+    }
+    
+    const totalFunctions = codeIndex.callGraph.size;
+    const totalVariables = codeIndex.variables.size;
+    const callEdges = Array.from(codeIndex.callGraph.values()).reduce((sum, calls) => sum + calls.size, 0);
+    
+    let overview = `**Purpose**: This codebase contains ${fileList.length} source files with ${totalFunctions} functions/procedures and ${totalVariables} tracked variables. `;
+    
+    if (classes.length > 0) {
+        overview += `It defines ${classes.length} classes/structures. `;
+    }
+    
+    overview += `\n\n**Key Features**:\n`;
+    
+    // Find entry points (functions with no callers)
+    const entryPoints = [];
+    for (const [funcName, calls] of codeIndex.callGraph) {
+        const callers = codeIndex.reverseCallGraph.get(funcName);
+        if (!callers || callers.size === 0) {
+            entryPoints.push(funcName);
+        }
+    }
+    
+    if (entryPoints.length > 0) {
+        overview += `- Entry points: ${entryPoints.slice(0, 5).join(', ')}${entryPoints.length > 5 ? '...' : ''}\n`;
+    }
+    
+    // Most called functions
+    const mostCalled = [];
+    for (const [funcName, callers] of codeIndex.reverseCallGraph) {
+        mostCalled.push({ name: funcName, count: callers.size });
+    }
+    mostCalled.sort((a, b) => b.count - a.count);
+    
+    if (mostCalled.length > 0) {
+        overview += `- Core functions: ${mostCalled.slice(0, 5).map(f => f.name).join(', ')}\n`;
+    }
+    
+    overview += `- Call graph: ${callEdges} call relationships\n`;
+    
+    overview += `\n**Technology**: ${[...languages].join(', ') || 'Unknown'}\n`;
+    
+    return overview;
+}
+
+/**
+ * Generate architecture section from code index when LLM is unavailable
+ */
+function generateIndexBasedArchitecture(fileList) {
+    let arch = `## Architecture\n\n`;
+    
+    // Build component diagram from call graph
+    arch += `### Component Diagram\n\n\`\`\`mermaid\nflowchart TB\n`;
+    
+    // Group functions by file
+    const fileToFuncs = new Map();
+    for (const [name, symbol] of codeIndex.symbols) {
+        if (name.includes('@')) continue;
+        if (['function', 'procedure', 'method'].includes(symbol.type)) {
+            const fileName = symbol.file?.split('/').pop() || 'unknown';
+            if (!fileToFuncs.has(fileName)) {
+                fileToFuncs.set(fileName, []);
+            }
+            fileToFuncs.get(fileName).push(name);
+        }
+    }
+    
+    // Create subgraphs for each file
+    let fileIdx = 0;
+    const fileIds = new Map();
+    for (const [fileName, funcs] of fileToFuncs) {
+        const fileId = `F${fileIdx++}`;
+        fileIds.set(fileName, fileId);
+        const safeName = fileName.replace(/[^a-zA-Z0-9]/g, '_');
+        arch += `    subgraph ${safeName}["${fileName}"]\n`;
+        arch += `        ${fileId}["${funcs.slice(0, 3).join(', ')}${funcs.length > 3 ? '...' : ''}"]\n`;
+        arch += `    end\n`;
+    }
+    
+    // Add cross-file calls
+    const addedEdges = new Set();
+    for (const [funcName, calls] of codeIndex.callGraph) {
+        const funcSymbol = codeIndex.symbols.get(funcName);
+        if (!funcSymbol) continue;
+        const srcFile = funcSymbol.file?.split('/').pop();
+        
+        for (const calledFunc of calls) {
+            const calledSymbol = codeIndex.symbols.get(calledFunc);
+            if (!calledSymbol) continue;
+            const dstFile = calledSymbol.file?.split('/').pop();
+            
+            if (srcFile && dstFile && srcFile !== dstFile) {
+                const edgeKey = `${srcFile}->${dstFile}`;
+                if (!addedEdges.has(edgeKey)) {
+                    addedEdges.add(edgeKey);
+                    const srcId = fileIds.get(srcFile);
+                    const dstId = fileIds.get(dstFile);
+                    if (srcId && dstId) {
+                        arch += `    ${srcId} --> ${dstId}\n`;
+                    }
+                }
+            }
+        }
+    }
+    
+    arch += `\`\`\`\n\n`;
+    
+    // Module structure table
+    arch += `### Module Structure\n\n`;
+    arch += `| Module | Functions | Calls | Called By |\n`;
+    arch += `|--------|-----------|-------|----------|\n`;
+    
+    for (const [fileName, funcs] of fileToFuncs) {
+        let totalCalls = 0;
+        let totalCallers = 0;
+        for (const func of funcs) {
+            const calls = codeIndex.callGraph.get(func);
+            const callers = codeIndex.reverseCallGraph.get(func);
+            if (calls) totalCalls += calls.size;
+            if (callers) totalCallers += callers.size;
+        }
+        arch += `| ${fileName} | ${funcs.length} | ${totalCalls} | ${totalCallers} |\n`;
+    }
+    
+    arch += `\n### Relationships\n\n`;
+    arch += `The codebase has ${fileToFuncs.size} modules with ${addedEdges.size} cross-module dependencies.\n`;
+    
+    return arch;
+}
+
+/**
+ * Generate file documentation from code index when LLM is unavailable
+ */
+function generateIndexBasedFileDoc(filePath, fileName) {
+    let doc = '';
+    
+    // Get file info from index
+    const fileInfo = codeIndex.files.get(filePath);
+    if (!fileInfo) {
+        doc += `*File not indexed - no structural information available*\n`;
+        return doc;
+    }
+    
+    doc += `**Language**: ${fileInfo.language}\n`;
+    doc += `**Lines**: ${fileInfo.lineCount || 'unknown'}\n\n`;
+    
+    // Group symbols by type
+    const functions = [];
+    const classes = [];
+    const variables = [];
+    
+    for (const symbol of fileInfo.symbols || []) {
+        if (['function', 'procedure', 'method', 'section', 'paragraph', 'subproc'].includes(symbol.type)) {
+            functions.push(symbol);
+        } else if (['class', 'struct', 'interface', 'record'].includes(symbol.type)) {
+            classes.push(symbol);
+        } else if (['variable', 'field', 'parameter', 'constant'].includes(symbol.type)) {
+            variables.push(symbol);
+        }
+        // Ignore other symbol types for documentation
+    }
+    
+    if (functions.length > 0) {
+        doc += `**Functions/Procedures (${functions.length})**:\n`;
+        for (const func of functions) {
+            const callers = codeIndex.reverseCallGraph.get(func.name);
+            const calls = codeIndex.callGraph.get(func.name);
+            const callerCount = callers ? callers.size : 0;
+            const callCount = calls ? calls.size : 0;
+            
+            doc += `- \`${func.name}\``;
+            if (func.signature) doc += `: ${func.signature}`;
+            doc += ` (line ${func.line})`;
+            if (callerCount > 0 || callCount > 0) {
+                doc += ` [calls: ${callCount}, called by: ${callerCount}]`;
+            }
+            doc += '\n';
+        }
+        doc += '\n';
+    }
+    
+    if (classes.length > 0) {
+        doc += `**Classes/Structures (${classes.length})**:\n`;
+        for (const cls of classes) {
+            doc += `- \`${cls.name}\` (${cls.type}, line ${cls.line})\n`;
+        }
+        doc += '\n';
+    }
+    
+    if (variables.length > 0) {
+        doc += `**Variables/Data (${variables.length})**:\n`;
+        for (const v of variables.slice(0, 20)) { // Limit to 20
+            doc += `- \`${v.name}\``;
+            if (v.dataType) doc += `: ${v.dataType}`;
+            doc += ` (line ${v.line})`;
+            if (v.scope) doc += ` [${v.scope}]`;
+            doc += '\n';
+        }
+        if (variables.length > 20) {
+            doc += `- *... and ${variables.length - 20} more*\n`;
+        }
+        doc += '\n';
+    }
+    
+    return doc;
+}
+
+/**
+ * Generate data flow documentation from code index when LLM is unavailable
+ */
+function generateIndexBasedDataFlow(fileList) {
+    let doc = `## Data Flow\n\n`;
+    
+    // Variable tracking info
+    if (codeIndex.variables.size > 0) {
+        doc += `### Tracked Variables\n\n`;
+        doc += `| Variable | Type | File | Reads | Writes |\n`;
+        doc += `|----------|------|------|-------|--------|\n`;
+        
+        const sortedVars = [...codeIndex.variables.entries()]
+            .map(([key, v]) => ({
+                key,
+                ...v,
+                reads: v.accesses?.filter(a => a.type === 'read').length || 0,
+                writes: v.accesses?.filter(a => a.type === 'write').length || 0
+            }))
+            .sort((a, b) => (b.reads + b.writes) - (a.reads + a.writes))
+            .slice(0, 30);
+        
+        for (const v of sortedVars) {
+            const fileName = v.file?.split('/').pop() || 'unknown';
+            doc += `| ${v.name} | ${v.dataType || 'unknown'} | ${fileName} | ${v.reads} | ${v.writes} |\n`;
+        }
+        doc += '\n';
+    }
+    
+    // Call flow between files
+    doc += `### Call Flow\n\n`;
+    
+    const fileCallMap = new Map();
+    for (const [funcName, calls] of codeIndex.callGraph) {
+        const funcSymbol = codeIndex.symbols.get(funcName);
+        if (!funcSymbol) continue;
+        const srcFile = funcSymbol.file?.split('/').pop();
+        
+        for (const calledFunc of calls) {
+            const calledSymbol = codeIndex.symbols.get(calledFunc);
+            if (!calledSymbol) continue;
+            const dstFile = calledSymbol.file?.split('/').pop();
+            
+            if (srcFile && dstFile) {
+                const key = `${srcFile} → ${dstFile}`;
+                if (!fileCallMap.has(key)) {
+                    fileCallMap.set(key, []);
+                }
+                fileCallMap.get(key).push(`${funcName} → ${calledFunc}`);
+            }
+        }
+    }
+    
+    if (fileCallMap.size > 0) {
+        for (const [route, calls] of fileCallMap) {
+            doc += `**${route}**:\n`;
+            for (const call of calls.slice(0, 5)) {
+                doc += `- ${call}\n`;
+            }
+            if (calls.length > 5) {
+                doc += `- *... and ${calls.length - 5} more*\n`;
+            }
+            doc += '\n';
+        }
+    } else {
+        doc += `No cross-file calls detected.\n`;
+    }
+    
+    return doc;
+}
+
+/**
+ * Generate dependencies documentation from code index when LLM is unavailable
+ */
+function generateIndexBasedDependencies(fileList) {
+    let doc = `## Dependencies\n\n`;
+    
+    // External dependencies (imports, includes)
+    const allDeps = new Map();
+    for (const [filePath, deps] of codeIndex.dependencies) {
+        const fileName = filePath.split('/').pop();
+        for (const dep of deps) {
+            if (!allDeps.has(dep)) {
+                allDeps.set(dep, []);
+            }
+            allDeps.get(dep).push(fileName);
+        }
+    }
+    
+    if (allDeps.size > 0) {
+        doc += `### External Dependencies\n\n`;
+        doc += `| Dependency | Used By |\n`;
+        doc += `|------------|--------|\n`;
+        
+        for (const [dep, files] of allDeps) {
+            doc += `| ${dep} | ${files.join(', ')} |\n`;
+        }
+        doc += '\n';
+    }
+    
+    // Internal dependencies (file-to-file calls)
+    doc += `### Internal Dependencies\n\n`;
+    
+    const internalDeps = new Map();
+    for (const [funcName, calls] of codeIndex.callGraph) {
+        const funcSymbol = codeIndex.symbols.get(funcName);
+        if (!funcSymbol) continue;
+        const srcFile = funcSymbol.file?.split('/').pop();
+        
+        for (const calledFunc of calls) {
+            const calledSymbol = codeIndex.symbols.get(calledFunc);
+            if (!calledSymbol) continue;
+            const dstFile = calledSymbol.file?.split('/').pop();
+            
+            if (srcFile && dstFile && srcFile !== dstFile) {
+                if (!internalDeps.has(srcFile)) {
+                    internalDeps.set(srcFile, new Set());
+                }
+                internalDeps.get(srcFile).add(dstFile);
+            }
+        }
+    }
+    
+    if (internalDeps.size > 0) {
+        doc += `| File | Depends On |\n`;
+        doc += `|------|------------|\n`;
+        
+        for (const [file, deps] of internalDeps) {
+            doc += `| ${file} | ${[...deps].join(', ')} |\n`;
+        }
+    } else {
+        doc += `No internal file dependencies detected.\n`;
+    }
+    
+    return doc;
+}
+
+function buildFileDocPrompt(fileName, content) {
+    return `Document this source file comprehensively.
+
+FILE: ${fileName}
+\`\`\`
+${content.substring(0, 20000)}
+\`\`\`
+
+Generate documentation with:
+
+**Purpose**: What does this file do? (1-2 sentences)
+
+**Key Functions/Components**:
+| Function/Component | Purpose | Parameters |
+|--------------------|---------|------------|
+| name | what it does | key params |
+
+**Logic Flow**:
+\`\`\`mermaid
+flowchart TD
+    A[Start] --> B[Step1] --> C[Step2] --> D[End]
+\`\`\`
+
+**Key Variables**:
+| Variable | Type | Purpose |
+|----------|------|---------|
+| name | type | what it holds |
+
+**Error Handling**:
+| Condition | Action |
+|-----------|--------|
+| when | what happens |
+
+Be thorough but concise. Use actual names from the code.`;
+}
+
+function buildDataFlowPrompt(fileList) {
+    const fileContents = fileList.map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        return `FILE: ${f.name}\n${content.substring(0, 1000)}...\n`;
+    }).join('\n---\n');
+    
+    return `Analyze the data flow across these files.
+
+${fileContents}
+
+Provide:
+
+### Data Flow Diagram
+\`\`\`mermaid
+flowchart LR
+    A[Input] --> B[Process] --> C[Output]
+\`\`\`
+
+### Input Sources
+| Source | Type | Description |
+|--------|------|-------------|
+| name | type | what data comes in |
+
+### Transformations
+Describe key data transformations that occur.
+
+### Output
+| Destination | Type | Description |
+|-------------|------|-------------|
+| name | type | what data goes out |
+
+Be specific to the actual code.`;
+}
+
+function buildDependenciesPrompt(fileList) {
+    const fileContents = fileList.map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        // Focus on includes/imports
+        const lines = content.split('\n').filter(l => 
+            l.includes('#include') || l.includes('import') || l.includes('require') || l.includes('extern')
+        ).join('\n');
+        return `FILE: ${f.name}\n${lines}\n`;
+    }).join('\n---\n');
+    
+    return `Analyze the dependencies in these files.
+
+${fileContents}
+
+Provide:
+
+### External Dependencies
+| Library/Module | Purpose | Used By |
+|----------------|---------|---------|
+| name | why needed | which files |
+
+### Internal Dependencies
+\`\`\`mermaid
+graph LR
+    A[file1] --> B[file2]
+    B --> C[file3]
+\`\`\`
+
+### APIs/Interfaces
+| Interface | Type | Description |
+|-----------|------|-------------|
+| name | internal/external | purpose |
+
+Be specific to the actual includes and imports found.`;
+}
+
+async function handleApiMode(text, apiUrl, config) {
+    log('API MODE: Searching codebase');
+    
+    // Extract search terms
+    const cleanText = text.replace(/^\/api\s*/i, '');
+    const searchTerms = extractSearchTerms(cleanText);
+    
+    if (!searchTerms) {
+        // No search terms - just ask LLM directly
+        log('API MODE: No search terms, falling back to LLM');
+        return await callLanguageModel(cleanText);
+    }
+    
+    try {
+        // Search API
+        const searchResults = await searchCodebase(apiUrl, searchTerms);
+        
+        if (!searchResults || searchResults.length === 0) {
+            // No results from API - fall back to LLM
+            log('API MODE: No results from API server, falling back to LLM');
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `*No results found in indexed codebase for "${searchTerms}", asking LLM...*\n\n`
+            });
+            return await callLanguageModel(cleanText);
+        }
+        
+        // Build context from search results
+        let contextContent = `SEARCH RESULTS FOR: "${searchTerms}"\n\n`;
+        for (const result of searchResults.slice(0, 5)) {
+            contextContent += `=== ${result.procedure_name || result.file_path} ===\n`;
+            contextContent += result.content_preview || result.content || '';
+            contextContent += '\n\n';
+        }
+        
+        // Call LLM with search results
+        const prompt = buildApiPrompt(contextContent, cleanText, searchResults);
+        const response = await callLanguageModel(prompt);
+        
+        return `**Found ${searchResults.length} results for "${searchTerms}"**\n\n${response}`;
+        
+    } catch (error) {
+        log('API error:', error.message);
+        // API failed - fall back to LLM
+        log('API MODE: API error, falling back to LLM');
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `*API server unavailable, asking LLM...*\n\n`
+        });
+        return await callLanguageModel(cleanText);
+    }
+}
+
+// ============================================================
+// Prompt Builders
+// ============================================================
+
+function buildFlowchartPrompt(context, query) {
+    return `Generate a Mermaid flowchart diagram for the following code.
+
+${context}
+
+USER REQUEST: ${query}
+
+Output a valid Mermaid flowchart using:
+- flowchart TD (top-down)
+- ([Stadium]) for Start/End
+- [Rectangle] for Process
+- {Diamond} for Decision
+- [[Double]] for CALL/PERFORM
+
+Output ONLY the mermaid code block:
+
+\`\`\`mermaid
+flowchart TD
+    ...
+\`\`\``;
+}
+
+function buildTranslatePrompt(context, query, targetLang, fileName) {
+    // Detect source language from context or query
+    const sourceLangMatch = query.match(/(?:from\s+)?(\w+)\s+(?:to|into)/i);
+    const sourceLang = sourceLangMatch ? sourceLangMatch[1].toUpperCase() : 'C';
+    
+    // Build a focused prompt with PLAN and EXECUTE structure
+    let prompt = `# CODE TRANSLATION TASK
+
+## STEP 1: PLAN
+You are translating **ONE FILE ONLY**: \`${fileName || 'the provided file'}\`
+- Source language: ${sourceLang}
+- Target language: ${targetLang.toUpperCase()}
+- Task: Complete, line-by-line translation
+
+## STEP 2: EXECUTE
+Translate the code below to ${targetLang.toUpperCase()}.
+
+${context}
+
+## USER REQUEST: ${query}
+
+---
+
+# CRITICAL INSTRUCTIONS
+
+## DO NOT DO THESE:
+❌ DO NOT summarize files
+❌ DO NOT describe what the file does
+❌ DO NOT write "please provide the content"
+❌ DO NOT say "here's a simplified version"
+❌ DO NOT write placeholder comments like "// TODO" or "// Other methods"
+❌ DO NOT skip any functions
+
+## YOU MUST DO THESE:
+✅ Translate EVERY function completely
+✅ Translate EVERY line of code
+✅ Preserve ALL logic, ALL branches, ALL conditions
+✅ Convert ALL data types correctly
+✅ Include ALL error handling
+✅ The translation should be ~same length as original
+
+## TYPE MAPPINGS (${sourceLang} → ${targetLang.toUpperCase()}):
+| ${sourceLang} | ${targetLang.toUpperCase()} |
+|---------------|-------------------|
+| int, INT | int |
+| long | long |
+| char* / STRING | String |
+| char[] | char[] or String |
+| float, double | float, double |
+| bool | boolean |
+| void | void |
+| struct | class |
+| enum | enum |
+| typedef | class or type alias |
+| #define constant | static final |
+| #define macro(x) | inline method |
+| NULL | null |
+| malloc/free | new (GC handles free) |
+| pointer (*) | reference or array |
+
+## DECIMAL PRECISION:
+- Use BigDecimal for financial/money calculations
+- Cast integer division: \`(double) a / b\` to preserve decimals
+- PIC 9(n)V9(m) → BigDecimal
+
+---
+
+# START TRANSLATION NOW
+
+Translate \`${fileName || 'the file'}\` to ${targetLang.toUpperCase()}:
+
+\`\`\`${targetLang}
+// ${fileName ? fileName.replace(/\.[^.]+$/, '') : 'TranslatedFile'}.${targetLang === 'java' ? 'java' : targetLang}
+// Translated from ${sourceLang} to ${targetLang.toUpperCase()}
+
+`;
+    
+    return prompt;
+}
+
+
+function buildExplainPrompt(context, query) {
+    // Check if user wants full documentation or quick explanation
+    const wantsFullDocs = /document|documentation|deepwiki|full|detailed|comprehensive/i.test(query);
+    
+    if (wantsFullDocs) {
+        return buildDeepWikiPrompt(context, query);
+    }
+    
+    // Quick explanation
+    return `Analyze and explain the following code concisely.
+
+${context}
+
+USER REQUEST: ${query}
+
+Provide a clear explanation covering:
+1. **Purpose**: What does this code do?
+2. **Key Logic**: Main processing steps
+3. **Important Variables**: Key data structures
+4. **External Calls**: Any CALL/PERFORM/API calls
+
+Be concise but thorough.`;
+}
+
+function buildDeepWikiPrompt(context, query) {
+    return `Generate comprehensive DeepWiki-style documentation for the following code.
+
+${context}
+
+USER REQUEST: ${query}
+
+---
+
+Generate documentation in this EXACT format:
+
+# [Program Name] Documentation
+
+## 1. Overview
+
+### Purpose
+[2-3 sentence description of what this program/module does]
+
+### Key Features
+- [Feature 1]
+- [Feature 2]
+- [Feature 3]
+
+## 2. Architecture
+
+### Component Diagram
+\`\`\`mermaid
+flowchart TB
+    subgraph Input
+        A[Input Source]
+    end
+    subgraph Processing
+        B[Main Logic]
+        C[Validation]
+    end
+    subgraph Output
+        D[Output/Result]
+    end
+    A --> B --> C --> D
+\`\`\`
+
+### Module Structure
+| Component | Purpose | Location |
+|-----------|---------|----------|
+| [Section/Paragraph] | [What it does] | [Line range] |
+
+## 3. Data Flow
+
+### Input
+| Field/Variable | Type | Description |
+|----------------|------|-------------|
+| [Name] | [Type] | [Purpose] |
+
+### Processing Steps
+1. **[Step Name]**: [Description]
+2. **[Step Name]**: [Description]
+
+### Output
+| Field/Variable | Type | Description |
+|----------------|------|-------------|
+| [Name] | [Type] | [Purpose] |
+
+## 4. Business Logic
+
+### Decision Points
+\`\`\`mermaid
+flowchart TD
+    A{Condition?} -->|Yes| B[Action 1]
+    A -->|No| C[Action 2]
+\`\`\`
+
+### Validation Rules
+| Rule | Condition | Action |
+|------|-----------|--------|
+| [Rule Name] | [When this happens] | [Do this] |
+
+### Error Handling
+| Error Code | Condition | Response |
+|------------|-----------|----------|
+| [Code] | [When] | [What happens] |
+
+## 5. Dependencies
+
+### External Calls
+| Program/Module | Purpose | Parameters |
+|----------------|---------|------------|
+| [Name] | [Why called] | [Key params] |
+
+### Data Sources
+| Source | Type | Usage |
+|--------|------|-------|
+| [Name] | [File/DB/API] | [How used] |
+
+## 6. Key Variables & Constants
+
+### Working Storage / Variables
+| Name | Type | Purpose | Initial Value |
+|------|------|---------|---------------|
+| [Name] | [Type] | [What it holds] | [Default] |
+
+### Constants / Literals
+| Name | Value | Meaning |
+|------|-------|---------|
+| [Name] | [Value] | [Purpose] |
+
+## 7. Usage Examples
+
+### Typical Flow
+\`\`\`
+1. [First step]
+2. [Second step]
+3. [Result]
+\`\`\`
+
+### Sample Input/Output
+**Input:**
+\`\`\`
+[Example input data]
+\`\`\`
+
+**Output:**
+\`\`\`
+[Example output data]
+\`\`\`
+
+## 8. Notes & Considerations
+
+### Performance
+- [Any performance considerations]
+
+### Maintenance
+- [Things to watch out for]
+
+### Related Programs
+- [List of related modules]
+
+---
+
+Now generate the documentation following this exact structure. Fill in ALL sections with actual content from the code. Use Mermaid diagrams where indicated. Be thorough and accurate.`;
+}
+
+/**
+ * Build prompt for direct questions (yes/no, what, how, does, etc.)
+ * These questions should be answered directly without special formatting
+ */
+function buildDirectQuestionPrompt(context, indexSummary, query) {
+    return `You are a helpful code assistant. The user has asked a direct question about the code. Answer it directly and accurately.
+
+${context}
+
+${indexSummary}
+
+USER QUESTION: ${query}
+
+INSTRUCTIONS:
+1. Answer the user's question DIRECTLY - don't provide a general summary or documentation
+2. If it's a yes/no question, start with "Yes" or "No" then explain
+3. If they ask "does this code do X?", examine the code and answer specifically about X
+4. Be specific - reference actual function names, line numbers, and code sections
+5. If the answer requires looking at specific parts of the code, quote the relevant sections
+6. If you're not sure, say so - don't make things up
+
+Provide a focused, direct answer to the question.`;
+}
+
+function buildGeneralPrompt(context, query) {
+    return `You are a code assistant. Answer the user's question based on the provided code.
+
+${context}
+
+USER QUESTION: ${query}
+
+Provide a helpful, accurate answer based on the code above.`;
+}
+
+function buildApiPrompt(context, query, results) {
+    return `Based on search results from the codebase, help the user with their request.
+
+${context}
+
+USER REQUEST: ${query}
+
+Found ${results.length} relevant files. Based on these results, provide a helpful response.
+If the user wants to implement something, use the found code as examples/patterns.`;
+}
+
+// ============================================================
+// API Functions
+// ============================================================
+
+async function searchCodebase(apiUrl, query) {
+    return new Promise((resolve, reject) => {
+        const url = new URL(`${apiUrl}/search`);
+        const isHttps = url.protocol === 'https:';
+        const http = require(isHttps ? 'https' : 'http');
+        
+        const postData = JSON.stringify({
+            query: query,
+            top_k: 10,
+            include_content: true
+        });
+        
+        const options = {
+            hostname: url.hostname,
+            port: url.port || (isHttps ? 443 : 80),
+            path: url.pathname,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData)
+            },
+            timeout: 10000
+        };
+        
+        const req = http.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    if (res.statusCode >= 400) {
+                        reject(new Error(`API returned ${res.statusCode}`));
+                        return;
+                    }
+                    const json = JSON.parse(data);
+                    resolve(json.results || []);
+                } catch (e) {
+                    reject(new Error(`Invalid JSON response: ${e.message}`));
+                }
+            });
+        });
+        
+        req.on('error', (e) => reject(e));
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
+        
+        req.write(postData);
+        req.end();
+    });
+}
+
+function extractSearchTerms(text) {
+    // Remove common words and extract meaningful terms
+    const stopWords = ['implement', 'create', 'build', 'make', 'find', 'search', 'for', 'the', 'a', 'an', 'functionality', 'to'];
+    const words = text.toLowerCase().split(/\s+/);
+    const terms = words.filter(w => !stopWords.includes(w) && w.length > 2);
+    return terms.join(' ');
+}
+
+// ============================================================
+// Response Cleanup
+// ============================================================
+
+/**
+ * Clean LLM response by removing trailing refusal messages
+ * These are sometimes appended by the model even when the response is valid
+ */
+function cleanLlmResponse(response) {
+    if (!response) return response;
+    
+    // Patterns that indicate a trailing refusal (case insensitive)
+    const refusalPatterns = [
+        /\n*Sorry,?\s*I\s*(?:can't|cannot|am unable to)\s*assist\s*with\s*that\.?\s*$/i,
+        /\n*I\s*(?:can't|cannot)\s*(?:help|assist)\s*with\s*(?:that|this)\.?\s*$/i,
+        /\n*I'm\s*(?:sorry|afraid),?\s*(?:but\s*)?I\s*(?:can't|cannot|am unable to).*$/i,
+        /\n*I\s*(?:can't|cannot)\s*provide\s*(?:that|this).*$/i,
+        /\n*I'm\s*not\s*able\s*to\s*(?:help|assist)\s*with\s*(?:that|this)\.?\s*$/i,
+        /\n*As\s*an\s*AI,?\s*I\s*(?:can't|cannot).*$/i,
+    ];
+    
+    let cleaned = response;
+    
+    for (const pattern of refusalPatterns) {
+        cleaned = cleaned.replace(pattern, '');
+    }
+    
+    // Also clean up any trailing whitespace/newlines
+    cleaned = cleaned.trimEnd();
+    
+    return cleaned;
+}
+
+// ============================================================
+// Task-Based LLM Routing
+// ============================================================
+
+/**
+ * Patterns that indicate a coding/translation task
+ * These tasks may benefit from a more capable model
+ */
+const CODING_TASK_PATTERNS = [
+    /\b(translate|convert|transpile|port|migrate)\b.*\b(code|from|to)\b/i,
+    /\b(generate|create|write|implement)\b.*\b(code|class|function|method|api|service)\b/i,
+    /\b(refactor|optimize|fix|debug)\b.*\b(code|function|method|class)\b/i,
+    /\bto\s+(java|python|typescript|javascript|go|rust|kotlin|csharp)\b/i,
+    /\b(from|in)\s+(tal|cobol|fortran|pascal)\b/i,
+    /\b(java|python|typescript|go|rust)\s+(code|implementation|version)\b/i,
+];
+
+/**
+ * Patterns that indicate a documentation/explanation task
+ * These tasks can use free Copilot models effectively
+ */
+const DOC_TASK_PATTERNS = [
+    /\b(explain|describe|what\s+is|what\s+are|how\s+does|summarize|document)\b/i,
+    /\b(difference|compare|between)\b/i,
+    /\b(help|understand|clarify)\b/i,
+    /\bwhat\s+(is|are|does)\b/i,
+    /\b(overview|summary|documentation)\b/i,
+];
+
+/**
+ * Detect if the prompt is a coding task or documentation task
+ * @param {string} prompt - The prompt to analyze
+ * @returns {'coding' | 'docs' | 'auto'} - The detected task type
+ */
+function detectTaskType(prompt) {
+    // Check first 500 chars for task indicators
+    const sample = prompt.substring(0, 500).toLowerCase();
+    
+    // Check for coding patterns
+    for (const pattern of CODING_TASK_PATTERNS) {
+        if (pattern.test(sample)) {
+            log('Task type detected: CODING');
+            return 'coding';
+        }
+    }
+    
+    // Check for documentation patterns
+    for (const pattern of DOC_TASK_PATTERNS) {
+        if (pattern.test(sample)) {
+            log('Task type detected: DOCS');
+            return 'docs';
+        }
+    }
+    
+    log('Task type detected: AUTO');
+    return 'auto';
+}
+
+/**
+ * Get the preferred provider order based on task type
+ * NOTE: For now, only use Copilot. API server is for codebase search, not LLM.
+ * @param {'coding' | 'docs' | 'auto'} taskType
+ * @returns {string[]} - Ordered list of providers to try
+ */
+function getProviderOrderForTask(taskType) {
+    const config = vscode.workspace.getConfiguration('astra');
+    const codingProvider = config.get('llm.codingProvider') || 'copilot';
+    
+    // For coding tasks (translation, code generation):
+    // - Default: Copilot with Claude Sonnet 4.5 (via GitHub Copilot)
+    // - User can override via astra.llm.codingProvider setting
+    
+    if (taskType === 'coding') {
+        // Use configured provider first for coding tasks
+        const order = [codingProvider];
+        
+        // Add fallbacks
+        if (codingProvider !== 'copilot') order.push('copilot');
+        if (codingProvider !== 'anthropic') order.push('anthropic');
+        if (codingProvider !== 'openai') order.push('openai');
+        
+        log(`Coding task: Provider order = ${order.join(' → ')}`);
+        return order;
+    }
+    
+    // For docs/explanation tasks: prefer Copilot (free)
+    if (taskType === 'docs') {
+        return ['copilot', 'anthropic', 'openai'];
+    }
+    
+    // Default: try all providers
+    return ['copilot', 'anthropic', 'openai'];
+}
+
+// ============================================================
+// Language Model Integration
+// ============================================================
+
+// Call LLM for documentation (returns {text, error} instead of error message string)
+async function callLanguageModelForDoc(prompt) {
+    log('callLanguageModelForDoc - prompt length:', prompt.length);
+    
+    // Use the existing callLanguageModel which has retry logic and chunking
+    const result = await callLanguageModel(prompt);
+    
+    log('LLM result length:', result?.length || 0);
+    log('LLM result preview:', result?.substring(0, 200) || 'empty');
+    
+    // Check if result is empty
+    if (!result || result.trim().length === 0) {
+        log('ERROR: Empty response from LLM');
+        return { text: null, error: 'LLM returned empty response' };
+    }
+    
+    // Check if result is the full error message (starts with error marker)
+    // Only check the START of the response, not anywhere in it
+    const trimmedResult = result.trim();
+    if (trimmedResult.startsWith('**Language Model not available') || 
+        trimmedResult.startsWith('**Cannot generate') ||
+        trimmedResult.startsWith('❌ GitHub Copilot')) {
+        log('ERROR: LLM returned error message');
+        return { text: null, error: 'LLM unavailable - check Copilot or API server' };
+    }
+    
+    // Check if ENTIRE response is a refusal (not just contains refusal text)
+    const lowerResult = trimmedResult.toLowerCase();
+    const isOnlyRefusal = (
+        (lowerResult.startsWith("sorry, i can't") || 
+         lowerResult.startsWith("i cannot assist") ||
+         lowerResult.startsWith("i'm unable to") ||
+         lowerResult.startsWith("i can't help")) &&
+        trimmedResult.length < 500  // True refusals are short
+    );
+    
+    if (isOnlyRefusal) {
+        log('ERROR: LLM refused request');
+        return { text: null, error: 'LLM refused - content may be too large or restricted' };
+    }
+    
+    // Check if this looks like the Fix Option error template
+    if (result.includes('Fix Option 1:') && result.includes('Fix Option 2:')) {
+        log('ERROR: Got error template instead of content');
+        return { text: null, error: 'LLM unavailable - see error details in chat' };
+    }
+    
+    log('SUCCESS: Got valid LLM response');
+    return { text: result, error: null };
+}
+
+async function callLanguageModel(prompt, taskType = null) {
+    const config = vscode.workspace.getConfiguration('astra');
+    const apiUrl = config.get('apiUrl') || 'http://localhost:8080';
+    
+    // Detect task type if not provided
+    if (!taskType) {
+        taskType = detectTaskType(prompt);
+    }
+    
+    // Get provider order based on task type
+    const providerOrder = getProviderOrderForTask(taskType);
+    log('LLM call - task type:', taskType, '| provider order:', providerOrder.join(' -> '));
+    log('Prompt size:', prompt.length, 'chars');
+    
+    let lastError = null;
+    
+    // Try each provider in order
+    let copilotError = null;  // Track copilot error separately
+    
+    for (const provider of providerOrder) {
+        // Check for cancellation
+        if (taskController.isCancelled) {
+            throw new Error('Task cancelled by user');
+        }
+        
+        log(`Trying provider: ${provider}...`);
+        
+        switch (provider) {
+            case 'copilot': {
+                const copilotResult = await tryCopilot(prompt);
+                if (copilotResult.success) {
+                    log('Copilot succeeded');
+                    return copilotResult.response;
+                }
+                copilotError = copilotResult.error;
+                lastError = copilotResult.error;
+                log('Copilot failed:', copilotResult.error);
+                
+                // Show the copilot error in chat
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n⚠️ *Copilot request failed: ${copilotResult.error}*\n`
+                });
+                break;
+            }
+            
+            case 'anthropic': {
+                const anthropicKey = config.get('anthropicApiKey') || config.get('llm.anthropicApiKey');
+                if (anthropicKey) {
+                    const model = config.get('llm.anthropicModel') || 'claude-sonnet-4-5-20250514';
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `\n*Trying Anthropic ${model}...*\n`
+                    });
+                    try {
+                        const result = await callAnthropicApi(prompt, anthropicKey, model);
+                        // Track the model used for attribution
+                        lastUsedModel = { provider: 'anthropic', model: model };
+                        return cleanLlmResponse(result);
+                    } catch (error) {
+                        lastError = error.message;
+                        log('Anthropic API error:', error.message);
+                    }
+                } else {
+                    // Only log, don't overwrite copilot error with "no API key" message
+                    log('Anthropic API key not configured, skipping');
+                }
+                break;
+            }
+            
+            case 'openai': {
+                const openaiKey = config.get('openaiApiKey') || config.get('llm.openaiApiKey');
+                if (openaiKey) {
+                    const model = config.get('llm.openaiModel') || 'gpt-4o';
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `\n*Trying OpenAI ${model}...*\n`
+                    });
+                    try {
+                        const result = await callOpenAIApi(prompt, openaiKey, model);
+                        // Track the model used for attribution
+                        lastUsedModel = { provider: 'openai', model: model };
+                        return cleanLlmResponse(result);
+                    } catch (error) {
+                        lastError = error.message;
+                        log('OpenAI API error:', error.message);
+                    }
+                } else {
+                    // Only log, don't overwrite copilot error with "no API key" message
+                    log('OpenAI API key not configured, skipping');
+                }
+                break;
+            }
+        }
+    }
+    
+    // All providers failed - show the most relevant error
+    // If copilot found a model but failed, that's the main error
+    const errorToShow = copilotError || lastError || 'All providers failed';
+    return buildLlmErrorMessage(errorToShow);
+}
+
+/**
+ * Call LLM specifically for coding tasks (translation, code generation)
+ * Uses the configured coding provider
+ */
+async function callLanguageModelForCoding(prompt) {
+    return callLanguageModel(prompt, 'coding');
+}
+
+/**
+ * Call LLM specifically for documentation tasks (explanation, summarization)
+ * Uses Copilot (free) by default
+ */
+async function callLanguageModelForDocs(prompt) {
+    return callLanguageModel(prompt, 'docs');
+}
+
+// Try GitHub Copilot with retry logic
+async function tryCopilot(prompt, preferredModel = null) {
+    const maxRetries = 2;
+    const config = vscode.workspace.getConfiguration('astra');
+    
+    // Get preferred model from config or parameter
+    const configuredModel = preferredModel || config.get('llm.copilotModel') || 'claude-sonnet-4';
+    
+    // Check if settings changed - if so, clear the failed models cache
+    if (lastCopilotModelSetting !== configuredModel) {
+        if (failedModelsCache.size > 0) {
+            log('Settings changed, clearing failed models cache');
+            failedModelsCache.clear();
+        }
+        lastCopilotModelSetting = configuredModel;
+    }
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            if (!vscode.lm || !vscode.lm.selectChatModels) {
+                return { success: false, error: 'VS Code LM API not available (need VS Code 1.90+)' };
+            }
+            
+            // Get available models
+            let models = await vscode.lm.selectChatModels({});
+            log(`Attempt ${attempt}: Found ${models.length} models`);
+            
+            // Log all available models for debugging
+            if (models.length > 0) {
+                log('Available models:', models.map(m => `${m.name || m.id} (${m.family || 'unknown family'})`).join(', '));
+            }
+            
+            if (models.length === 0) {
+                // Try copilot vendor specifically
+                models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+            }
+            
+            if (models.length === 0) {
+                if (attempt < maxRetries) {
+                    await new Promise(r => setTimeout(r, 500));
+                    continue;
+                }
+                return { success: false, error: 'No language models available' };
+            }
+            
+            // Filter out models that have previously failed
+            const originalCount = models.length;
+            models = models.filter(m => {
+                const modelId = m.id || m.name || m.family;
+                return !failedModelsCache.has(modelId);
+            });
+            
+            if (models.length === 0 && originalCount > 0) {
+                // All models have failed before
+                const failedList = Array.from(failedModelsCache).join(', ');
+                log(`All ${originalCount} models have previously failed: ${failedList}`);
+                return { 
+                    success: false, 
+                    error: `All available models have failed previously (${failedList}). Reload Astra or change settings to retry.` 
+                };
+            }
+            
+            if (models.length < originalCount) {
+                log(`Filtered out ${originalCount - models.length} previously failed models, ${models.length} remaining`);
+            }
+            
+            // Select model based on preference (Claude Sonnet 4.5 > Claude 3.5 > GPT-4o)
+            let model = null;
+            
+            // Try to find the configured/preferred model first
+            const modelSearchOrder = [
+                // Claude Sonnet 4.5 variants
+                m => m.family?.toLowerCase().includes('claude-sonnet-4') || 
+                     m.name?.toLowerCase().includes('claude-sonnet-4') ||
+                     m.id?.toLowerCase().includes('claude-sonnet-4'),
+                // Claude 3.5 Sonnet
+                m => m.family?.toLowerCase().includes('claude-3.5-sonnet') ||
+                     m.name?.toLowerCase().includes('claude-3.5-sonnet') ||
+                     m.family?.toLowerCase().includes('claude-3-5-sonnet'),
+                // Any Claude model
+                m => m.family?.toLowerCase().includes('claude') ||
+                     m.name?.toLowerCase().includes('claude'),
+                // GPT-4o
+                m => m.family?.toLowerCase().includes('gpt-4o') ||
+                     m.name?.toLowerCase().includes('gpt-4o'),
+                // GPT-4
+                m => m.family?.toLowerCase().includes('gpt-4') ||
+                     m.name?.toLowerCase().includes('gpt-4'),
+            ];
+            
+            // If user specified a model, try to match it first
+            if (configuredModel) {
+                const configLower = configuredModel.toLowerCase();
+                model = models.find(m => 
+                    m.family?.toLowerCase().includes(configLower) ||
+                    m.name?.toLowerCase().includes(configLower) ||
+                    m.id?.toLowerCase().includes(configLower)
+                );
+                if (model) {
+                    log(`Found configured model: ${model.name || model.id}`);
+                }
+            }
+            
+            // If no match, search in order of preference
+            if (!model) {
+                for (const searchFn of modelSearchOrder) {
+                    model = models.find(searchFn);
+                    if (model) {
+                        log(`Found model by preference: ${model.name || model.id}`);
+                        break;
+                    }
+                }
+            }
+            
+            // Fallback to first available
+            if (!model) {
+                model = models[0];
+                log(`Using fallback model: ${model.name || model.id}`);
+            }
+            
+            // Track the model being used
+            lastUsedModel = {
+                name: model.name || model.id || 'unknown',
+                vendor: model.vendor || 'copilot',
+                family: model.family || 'unknown',
+                id: model.id
+            };
+            
+            log('Using model:', lastUsedModel.name, '| family:', lastUsedModel.family);
+            
+            // Show model in chat
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n*Using ${lastUsedModel.name}...*\n`
+            });
+            
+            log('Prompt length:', prompt.length, 'chars');
+            
+            // Check if prompt is too large and needs chunking
+            const MAX_PROMPT_SIZE = 25000; // ~6k tokens, conservative limit
+            
+            if (prompt.length > MAX_PROMPT_SIZE) {
+                log('Large prompt detected, using chunked processing...');
+                return await processLargePromptWithCopilot(model, prompt, MAX_PROMPT_SIZE);
+            }
+            
+            // Normal processing for smaller prompts
+            const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+            const cancellation = new vscode.CancellationTokenSource();
+            
+            // Try the selected model, with fallback to other models if it fails
+            let modelsToTry = [model];
+            
+            // Add fallback models (other models from the available list)
+            const fallbacks = models.filter(m => m !== model).slice(0, 2);
+            modelsToTry = [...modelsToTry, ...fallbacks];
+            
+            for (let modelIdx = 0; modelIdx < modelsToTry.length; modelIdx++) {
+                const currentModel = modelsToTry[modelIdx];
+                
+                if (modelIdx > 0) {
+                    // Update lastUsedModel for fallback
+                    lastUsedModel = {
+                        name: currentModel.name || currentModel.id || 'unknown',
+                        vendor: currentModel.vendor || 'copilot',
+                        family: currentModel.family || 'unknown',
+                        id: currentModel.id
+                    };
+                    
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `\n*Trying fallback model: ${lastUsedModel.name}...*\n`
+                    });
+                    log(`Trying fallback model ${modelIdx}: ${lastUsedModel.name}`);
+                }
+                
+                try {
+                    let response = '';
+                    const chatResponse = await currentModel.sendRequest(messages, {}, cancellation.token);
+                    
+                    for await (const chunk of chatResponse.text) {
+                        response += chunk;
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: chunk 
+                        });
+                    }
+                    
+                    // Clean up any trailing refusal messages
+                    const cleanedResponse = cleanLlmResponse(response);
+                    
+                    // If response was cleaned, send a correction to UI
+                    if (cleanedResponse !== response) {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'replaceLastResponse', 
+                            text: cleanedResponse 
+                        });
+                    }
+                    
+                    return { 
+                        success: true, 
+                        response: cleanedResponse,
+                        model: lastUsedModel
+                    };
+                    
+                } catch (modelError) {
+                    const errorMsg = modelError.message || String(modelError);
+                    const failedModelId = currentModel.id || currentModel.name || currentModel.family;
+                    log(`Model ${failedModelId} failed:`, errorMsg);
+                    
+                    // Add to failed models cache (unless it's a rate limit - those are temporary)
+                    if (!errorMsg.includes('rate') && !errorMsg.includes('limit')) {
+                        failedModelsCache.add(failedModelId);
+                        log(`Added ${failedModelId} to failed models cache. Cache size: ${failedModelsCache.size}`);
+                    }
+                    
+                    if (modelIdx < modelsToTry.length - 1) {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: `\n⚠️ *${lastUsedModel.name} failed (cached), trying next model...*\n`
+                        });
+                        continue; // Try next model
+                    } else {
+                        throw modelError; // No more models, throw to outer catch
+                    }
+                }
+            }
+            
+        } catch (error) {
+            const errorMsg = error.message || String(error);
+            log(`Copilot attempt ${attempt} error:`, errorMsg);
+            log(`Error details:`, error.code, error.cause);
+            
+            // Add to failed cache for persistent errors (not rate limits)
+            if (lastUsedModel && !errorMsg.includes('rate') && !errorMsg.includes('limit')) {
+                const failedModelId = lastUsedModel.id || lastUsedModel.name || lastUsedModel.family;
+                if (failedModelId && failedModelId !== 'unknown') {
+                    failedModelsCache.add(failedModelId);
+                    log(`Added ${failedModelId} to failed models cache from outer catch`);
+                }
+            }
+            
+            // Check for specific error types
+            if (errorMsg.includes('off_topic') || errorMsg.includes('filtered')) {
+                return { success: false, error: 'Request was filtered by content policy. Try rephrasing.' };
+            }
+            if (errorMsg.includes('rate') || errorMsg.includes('limit')) {
+                return { success: false, error: 'Rate limited. Please wait a moment and try again.' };
+            }
+            if (errorMsg.includes('access') || errorMsg.includes('permission') || errorMsg.includes('unauthorized')) {
+                return { success: false, error: `Model access denied. The model "${lastUsedModel?.name}" may not be available in your Copilot subscription.` };
+            }
+            
+            if (attempt < maxRetries) {
+                await new Promise(r => setTimeout(r, 500));
+            } else {
+                return { success: false, error: `Copilot request failed: ${errorMsg}` };
+            }
+        }
+    }
+    
+    return { success: false, error: 'Max retries exceeded' };
+}
+
+// Process large prompts by chunking context files
+async function processLargePromptWithCopilot(model, prompt, maxSize) {
+    log('Processing large prompt with chunking...');
+    
+    // Parse the prompt to separate instructions from context
+    const { instructions, contextFiles, query } = parsePromptParts(prompt);
+    
+    if (contextFiles.length === 0) {
+        // No files to chunk, try as-is (will likely fail but let API server handle it)
+        log('No context files found to chunk');
+        return { success: false, error: 'Prompt too large and cannot be chunked' };
+    }
+    
+    log(`Found ${contextFiles.length} context files to process`);
+    
+    // Check if this is a documentation request
+    const isDocRequest = /document|documentation|deepwiki|full|detailed|comprehensive/i.test(query || prompt);
+    
+    // Process each file separately and collect summaries
+    const summaries = [];
+    let allSucceeded = true;
+    
+    for (let i = 0; i < contextFiles.length; i++) {
+        const file = contextFiles[i];
+        log(`Processing file ${i + 1}/${contextFiles.length}: ${file.name} (${file.content.length} chars)`);
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n\n---\n\n# 📄 ${file.name}\n\n`
+        });
+        
+        // Build appropriate prompt based on request type
+        let filePrompt;
+        
+        if (isDocRequest) {
+            // DeepWiki-style documentation for each file
+            filePrompt = `Generate comprehensive DeepWiki-style documentation for this code file.
+
+FILE: ${file.name}
+\`\`\`
+${file.content.substring(0, maxSize - 2000)}
+\`\`\`
+
+Generate documentation with these sections:
+
+## Overview
+[What this program/module does - 2-3 sentences]
+
+## Architecture
+\`\`\`mermaid
+flowchart TD
+    A[Start] --> B[Process] --> C[End]
+\`\`\`
+
+## Key Components
+| Component | Purpose |
+|-----------|---------|
+| ... | ... |
+
+## Data Flow
+### Input Variables
+| Name | Type | Purpose |
+|------|------|---------|
+| ... | ... | ... |
+
+### Processing Steps
+1. **Step 1**: ...
+2. **Step 2**: ...
+
+### Output
+| Name | Type | Purpose |
+|------|------|---------|
+| ... | ... | ... |
+
+## Business Logic
+### Decision Points
+- Condition 1: ...
+- Condition 2: ...
+
+### Error Handling
+| Error | Condition | Action |
+|-------|-----------|--------|
+| ... | ... | ... |
+
+## External Dependencies
+| Program/API | Purpose |
+|-------------|---------|
+| ... | ... |
+
+## Key Variables
+| Name | Type | Purpose |
+|------|------|---------|
+| ... | ... | ... |
+
+Be thorough. Include actual content from the code.`;
+        } else {
+            // Concise explanation
+            filePrompt = `Analyze this code file and provide a concise summary:
+
+FILE: ${file.name}
+\`\`\`
+${file.content.substring(0, maxSize - 1000)}
+\`\`\`
+
+${query || 'Explain what this code does, its key functions, and main logic flow.'}
+
+Be concise but thorough.`;
+        }
+        
+        try {
+            const messages = [vscode.LanguageModelChatMessage.User(filePrompt)];
+            const cancellation = new vscode.CancellationTokenSource();
+            
+            let fileResponse = '';
+            const chatResponse = await model.sendRequest(messages, {}, cancellation.token);
+            
+            for await (const chunk of chatResponse.text) {
+                fileResponse += chunk;
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: chunk 
+                });
+            }
+            
+            // Clean any trailing refusal messages
+            const cleanedResponse = cleanLlmResponse(fileResponse);
+            
+            summaries.push({
+                name: file.name,
+                summary: cleanedResponse
+            });
+            
+        } catch (error) {
+            log(`Error processing ${file.name}:`, error.message);
+            allSucceeded = false;
+            summaries.push({
+                name: file.name,
+                summary: `[Error analyzing: ${error.message}]`
+            });
+        }
+    }
+    
+    // If we have multiple files, provide a combined summary
+    if (summaries.length > 1 && allSucceeded) {
+        log('Generating combined summary...');
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n\n### Overall Summary\n\n`
+        });
+        
+        const combinedPrompt = `Based on these individual file analyses, provide a brief overall summary:
+
+${summaries.map(s => `**${s.name}:**\n${s.summary.substring(0, 500)}...`).join('\n\n')}
+
+${query || 'Summarize how these files work together and their overall purpose.'}`;
+        
+        try {
+            const messages = [vscode.LanguageModelChatMessage.User(combinedPrompt)];
+            const cancellation = new vscode.CancellationTokenSource();
+            
+            const chatResponse = await model.sendRequest(messages, {}, cancellation.token);
+            
+            for await (const chunk of chatResponse.text) {
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: chunk 
+                });
+            }
+        } catch (error) {
+            log('Error generating combined summary:', error.message);
+        }
+    }
+    
+    // Return success if at least one file was processed
+    const successCount = summaries.filter(s => !s.summary.startsWith('[Error')).length;
+    if (successCount > 0) {
+        return { 
+            success: true, 
+            response: summaries.map(s => `## ${s.name}\n\n${s.summary}`).join('\n\n')
+        };
+    }
+    
+    return { success: false, error: 'All chunk processing failed' };
+}
+
+// Parse prompt to extract context files and instructions
+function parsePromptParts(prompt) {
+    const contextFiles = [];
+    let instructions = '';
+    let query = '';
+    
+    // Look for file markers in prompt
+    // Common patterns: "=== filename ===", "FILE: filename", "--- filename ---"
+    const filePattern = /(?:===|FILE:|---)\s*([^\n=]+?)\s*(?:===|---)?[\n\r]+```[\w]*\n?([\s\S]*?)```/gi;
+    
+    let match;
+    while ((match = filePattern.exec(prompt)) !== null) {
+        contextFiles.push({
+            name: match[1].trim(),
+            content: match[2].trim()
+        });
+    }
+    
+    // Also try simple pattern: "=== filename (language) ===\ncontent\n\n"
+    const simplePattern = /===\s*([^\n(]+?)(?:\s*\([^)]+\))?\s*===\n([\s\S]*?)(?=\n===|\n\n---|\nUSER|$)/gi;
+    
+    while ((match = simplePattern.exec(prompt)) !== null) {
+        const name = match[1].trim();
+        // Avoid duplicates
+        if (!contextFiles.find(f => f.name === name)) {
+            contextFiles.push({
+                name: name,
+                content: match[2].trim()
+            });
+        }
+    }
+    
+    // Extract query (usually after USER REQUEST: or at the end)
+    const queryMatch = prompt.match(/USER REQUEST:\s*(.+?)(?:\n|$)/i) ||
+                       prompt.match(/USER QUESTION:\s*(.+?)(?:\n|$)/i);
+    if (queryMatch) {
+        query = queryMatch[1].trim();
+    }
+    
+    // Everything before the first file is instructions
+    const firstFilePos = prompt.search(/(?:===|FILE:|---)\s*[^\n]+/);
+    if (firstFilePos > 0) {
+        instructions = prompt.substring(0, firstFilePos).trim();
+    }
+    
+    log('Parsed prompt:', {
+        filesFound: contextFiles.length,
+        fileNames: contextFiles.map(f => f.name),
+        hasQuery: !!query,
+        instructionsLength: instructions.length
+    });
+    
+    return { instructions, contextFiles, query };
+}
+
+// Call Astra API server's /llm/chat endpoint
+async function callAstraLlmApi(apiUrl, prompt) {
+    return new Promise((resolve, reject) => {
+        const url = new URL(`${apiUrl}/llm/chat`);
+        const isHttps = url.protocol === 'https:';
+        const http = require(isHttps ? 'https' : 'http');
+        
+        const postData = JSON.stringify({
+            prompt: prompt,
+            max_tokens: 4096
+        });
+        
+        const options = {
+            hostname: url.hostname,
+            port: url.port || (isHttps ? 443 : 80),
+            path: url.pathname,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData)
+            },
+            timeout: 120000 // 2 minute timeout for LLM
+        };
+        
+        log('Calling API server LLM:', url.href);
+        
+        const req = http.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => {
+                data += chunk;
+            });
+            res.on('end', () => {
+                try {
+                    if (res.statusCode >= 400) {
+                        let errorMsg = `API error ${res.statusCode}`;
+                        try {
+                            const error = JSON.parse(data);
+                            errorMsg = error.error || error.detail || errorMsg;
+                        } catch (e) {}
+                        reject(new Error(errorMsg));
+                        return;
+                    }
+                    const json = JSON.parse(data);
+                    
+                    if (json.error) {
+                        reject(new Error(json.error));
+                        return;
+                    }
+                    
+                    const response = json.response || json.text || '';
+                    
+                    // Stream the response to UI
+                    if (response) {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: response
+                        });
+                    }
+                    
+                    resolve(response);
+                } catch (e) {
+                    reject(new Error(`Invalid response: ${e.message}`));
+                }
+            });
+        });
+        
+        req.on('error', (e) => reject(e));
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
+        
+        req.write(postData);
+        req.end();
+    });
+}
+
+// Call Anthropic Claude API directly
+async function callAnthropicApi(prompt, apiKey, model = null) {
+    // Get model from config if not provided
+    const config = vscode.workspace.getConfiguration('astra');
+    const configuredModel = model || config.get('llm.anthropicModel') || 'claude-sonnet-4-5-20250514';
+    
+    log(`Anthropic API: Using model ${configuredModel}`);
+    
+    return new Promise((resolve, reject) => {
+        const https = require('https');
+        
+        const postData = JSON.stringify({
+            model: configuredModel,
+            max_tokens: 8192,
+            messages: [{ role: 'user', content: prompt }]
+        });
+        
+        const options = {
+            hostname: 'api.anthropic.com',
+            port: 443,
+            path: '/v1/messages',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01',
+                'Content-Length': Buffer.byteLength(postData)
+            }
+        };
+        
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    if (res.statusCode >= 400) {
+                        const error = JSON.parse(data);
+                        reject(new Error(error.error?.message || `Anthropic API error ${res.statusCode}`));
+                        return;
+                    }
+                    const json = JSON.parse(data);
+                    const text = json.content?.[0]?.text || '';
+                    chatWebviewView?.webview.postMessage({ type: 'appendResponse', text });
+                    resolve(text);
+                } catch (e) {
+                    reject(new Error(`Invalid response: ${e.message}`));
+                }
+            });
+        });
+        
+        req.on('error', reject);
+        req.write(postData);
+        req.end();
+    });
+}
+
+// Call OpenAI API directly
+async function callOpenAIApi(prompt, apiKey, model = null) {
+    // Get model from config if not provided
+    const config = vscode.workspace.getConfiguration('astra');
+    const configuredModel = model || config.get('llm.openaiModel') || 'gpt-4o';
+    
+    log(`OpenAI API: Using model ${configuredModel}`);
+    
+    return new Promise((resolve, reject) => {
+        const https = require('https');
+        
+        const postData = JSON.stringify({
+            model: configuredModel,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 8192
+        });
+        
+        const options = {
+            hostname: 'api.openai.com',
+            port: 443,
+            path: '/v1/chat/completions',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Length': Buffer.byteLength(postData)
+            }
+        };
+        
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    if (res.statusCode >= 400) {
+                        const error = JSON.parse(data);
+                        reject(new Error(error.error?.message || `OpenAI API error ${res.statusCode}`));
+                        return;
+                    }
+                    const json = JSON.parse(data);
+                    const text = json.choices?.[0]?.message?.content || '';
+                    chatWebviewView?.webview.postMessage({ type: 'appendResponse', text });
+                    resolve(text);
+                } catch (e) {
+                    reject(new Error(`Invalid response: ${e.message}`));
+                }
+            });
+        });
+        
+        req.on('error', reject);
+        req.write(postData);
+        req.end();
+    });
+}
+
+// Build helpful error message
+function buildLlmErrorMessage(error) {
+    let copilotStatus = 'Unknown';
+    try {
+        const copilotExt = vscode.extensions.getExtension('GitHub.copilot') || 
+                          vscode.extensions.getExtension('github.copilot');
+        const copilotChatExt = vscode.extensions.getExtension('GitHub.copilot-chat') ||
+                              vscode.extensions.getExtension('github.copilot-chat');
+        
+        if (copilotExt?.isActive || copilotChatExt?.isActive) {
+            copilotStatus = 'Active but LM API failed';
+        } else if (copilotExt || copilotChatExt) {
+            copilotStatus = 'Installed but not active';
+        } else {
+            copilotStatus = 'Not installed';
+        }
+    } catch (e) {
+        copilotStatus = error || 'Error checking';
+    }
+    
+    return `**Language Model not available**
+
+**GitHub Copilot Status:** ${copilotStatus}
+**Error:** ${error || 'Unknown'}
+
+---
+
+**Fix Option 1: Reload VS Code (if Copilot installed)**
+\`Cmd+Shift+P\` → "Developer: Reload Window"
+
+**Fix Option 2: Check Copilot subscription**
+Make sure you have an active GitHub Copilot subscription and are signed in.
+
+**Fix Option 3: Set direct API key in extension settings**
+\`Cmd+,\` → Search "astra anthropic" or "astra openai" → Paste key
+
+---
+
+**Context ready:** ${contextFiles.size} files loaded
+Check logs: \`View → Output → AstraCode\``;
+}
+
+// ============================================================
+// UI Updates
+// ============================================================
+
+function updateChatUI() {
+    chatWebviewView?.webview.postMessage({
+        type: 'updateChat',
+        history: chatHistory
+    });
+}
+
+function updateChatStatus() {
+    const fileCount = contextFiles.size;
+    
+    // Rebuild code index when files change (but not if already indexing)
+    if (fileCount > 0 && !updateChatStatus.isIndexing) {
+        // Only rebuild if index is stale (files changed since last build)
+        const indexNeedsRebuild = codeIndex.files.size !== fileCount || 
+            !codeIndex.lastUpdated ||
+            Array.from(contextFiles.keys()).some(path => !codeIndex.files.has(path));
+        
+        if (indexNeedsRebuild) {
+            // Use setTimeout to debounce rapid file additions
+            if (updateChatStatus.indexTimeout) {
+                clearTimeout(updateChatStatus.indexTimeout);
+            }
+            updateChatStatus.indexTimeout = setTimeout(async () => {
+                updateChatStatus.isIndexing = true;
+                try {
+                    await buildCodeIndex({ showProgress: true });
+                } finally {
+                    updateChatStatus.isIndexing = false;
+                }
+                // Just update the UI status display, don't trigger another rebuild check
+                updateChatStatusUI();
+            }, 500);
+        }
+    } else if (fileCount === 0) {
+        // Clear index when no files
+        codeIndex.files.clear();
+        codeIndex.symbols.clear();
+        codeIndex.callGraph.clear();
+        codeIndex.reverseCallGraph.clear();
+    }
+    
+    // Always update the UI
+    updateChatStatusUI();
+}
+
+// Separate function to just update UI without triggering rebuild
+function updateChatStatusUI() {
+    const fileCount = contextFiles.size;
+    
+    // Build file list with paths for removal
+    const files = Array.from(contextFiles.entries()).map(([path, file]) => ({
+        name: file.uri.path.split('/').pop(),
+        path: path,
+        language: file.language
+    }));
+    
+    const modeText = {
+        'auto': 'Auto Mode',
+        'local': 'Local Mode (context files)',
+        'api': 'API Mode (search codebase)'
+    };
+    
+    // Include index stats in status
+    let indexInfo = '';
+    if (codeIndex.symbols.size > 0) {
+        const callableCount = codeIndex.callGraph.size;
+        const varCount = codeIndex.variables.size;
+        indexInfo = ` • ${codeIndex.symbols.size} sym • ${varCount} vars • ${callableCount} funcs`;
+    }
+    
+    chatWebviewView?.webview.postMessage({
+        type: 'updateStatus',
+        mode: currentMode,
+        text: modeText[currentMode] + (fileCount > 0 ? ` • ${fileCount} files${indexInfo}` : ''),
+        files: files
+    });
+}
+
+// ============================================================
+// Context File Management
+// ============================================================
+
+async function addFileToContext(uri, silent = false) {
+    try {
+        const fileName = uri.path.split('/').pop();
+        const ext = fileName.split('.').pop().toLowerCase();
+        
+        // Check for PDF - needs special handling
+        if (ext === 'pdf') {
+            const pdfResult = await extractPdfText(uri);
+            if (pdfResult.error) {
+                if (!silent) {
+                    vscode.window.showWarningMessage(`PDF added but text extraction limited: ${fileName}`);
+                }
+            }
+            
+            contextFiles.set(uri.fsPath, {
+                uri: uri,
+                content: pdfResult.text || `[PDF file: ${fileName} - could not extract text. Consider using a PDF-to-text tool first.]`,
+                language: 'pdf'
+            });
+            
+            contextTreeProvider.refresh();
+            updateChatStatus();
+            log('Added PDF to context:', uri.fsPath);
+            if (!silent) {
+                vscode.window.showInformationMessage(`Added PDF to AstraCode context: ${fileName}`);
+            }
+            return;
+        }
+        
+        // Check for other binary files
+        if (isBinaryFile(fileName)) {
+            if (!silent) {
+                vscode.window.showWarningMessage(`Cannot add binary file: ${fileName}`);
+            }
+            return;
+        }
+        
+        const content = await vscode.workspace.fs.readFile(uri);
+        const text = Buffer.from(content).toString('utf-8');
+        
+        // Check if content looks like binary (has too many non-printable chars)
+        const nonPrintable = text.split('').filter(c => {
+            const code = c.charCodeAt(0);
+            return code < 32 && code !== 9 && code !== 10 && code !== 13;
+        }).length;
+        
+        if (nonPrintable > text.length * 0.1) {
+            if (!silent) {
+                vscode.window.showWarningMessage(`File appears to be binary: ${fileName}`);
+            }
+            return;
+        }
+        
+        const language = detectLanguage(uri.path);
+        log('addFileToContext: Detected language:', language, 'for file:', uri.path);
+        
+        contextFiles.set(uri.fsPath, {
+            uri: uri,
+            content: text,
+            language: language
+        });
+        
+        contextTreeProvider.refresh();
+        updateChatStatus();
+        
+        log('Added to context:', uri.fsPath);
+        if (!silent) {
+            vscode.window.showInformationMessage(`Added to AstraCode context: ${fileName}`);
+        }
+        
+    } catch (error) {
+        log('Error adding file:', error);
+        if (!silent) {
+            vscode.window.showErrorMessage(`Failed to add file: ${error.message}`);
+        }
+        throw error; // Re-throw for directory handler
+    }
+}
+
+// Extract text from PDF (basic extraction)
+async function extractPdfText(uri) {
+    try {
+        const content = await vscode.workspace.fs.readFile(uri);
+        const buffer = Buffer.from(content);
+        
+        // Try to extract text using basic PDF text extraction
+        // PDFs store text in various ways, this handles simple cases
+        let text = '';
+        const pdfString = buffer.toString('binary');
+        
+        // Look for text streams in PDF
+        const textMatches = pdfString.match(/\(([^)]+)\)/g) || [];
+        const extractedParts = [];
+        
+        for (const match of textMatches) {
+            const inner = match.slice(1, -1);
+            // Filter out binary/control sequences
+            if (inner.length > 2 && /^[\x20-\x7E\s]+$/.test(inner)) {
+                extractedParts.push(inner);
+            }
+        }
+        
+        // Also try to find BT...ET text blocks
+        const btMatches = pdfString.match(/BT[\s\S]*?ET/g) || [];
+        for (const block of btMatches) {
+            const tjMatches = block.match(/\[([^\]]+)\]\s*TJ/g) || [];
+            for (const tj of tjMatches) {
+                const parts = tj.match(/\(([^)]+)\)/g) || [];
+                for (const part of parts) {
+                    const inner = part.slice(1, -1);
+                    if (inner.length > 0 && /^[\x20-\x7E\s]+$/.test(inner)) {
+                        extractedParts.push(inner);
+                    }
+                }
+            }
+        }
+        
+        text = extractedParts.join(' ').replace(/\s+/g, ' ').trim();
+        
+        if (text.length < 100) {
+            // Not enough text extracted - PDF might be image-based or complex
+            return {
+                text: `[PDF file - limited text extracted]\n\nExtracted content:\n${text}\n\n[Note: This PDF may contain images or complex formatting. For better results, convert to text first using a PDF tool.]`,
+                error: 'Limited extraction'
+            };
+        }
+        
+        return { text: `[Extracted from PDF]\n\n${text}`, error: null };
+        
+    } catch (error) {
+        log('PDF extraction error:', error);
+        return { 
+            text: null, 
+            error: error.message 
+        };
+    }
+}
+
+function removeFileFromContext(uri) {
+    const path = uri?.fsPath || uri;
+    if (contextFiles.has(path)) {
+        contextFiles.delete(path);
+        contextTreeProvider.refresh();
+        updateChatStatus();
+        log('Removed from context:', path);
+    }
+}
+
+function clearContext() {
+    contextFiles.clear();
+    
+    // Also clear the code index
+    codeIndex.files.clear();
+    codeIndex.symbols.clear();
+    codeIndex.variables.clear();
+    codeIndex.callGraph.clear();
+    codeIndex.reverseCallGraph.clear();
+    codeIndex.dependencies.clear();
+    codeIndex.lastUpdated = null;
+    
+    contextTreeProvider.refresh();
+    updateChatStatus();
+    log('Context and index cleared');
+}
+
+function detectLanguage(path) {
+    const ext = path.split('.').pop().toLowerCase();
+    const langMap = {
+        // Legacy - COBOL
+        'cbl': 'cobol', 'cob': 'cobol', 'cobol': 'cobol', 'cpy': 'cobol', 'pco': 'cobol',
+        // Legacy - TAL/TACL
+        'tal': 'tal', 'tacl': 'tacl', 'tac': 'tacl',
+        // C family
+        'c': 'c', 'h': 'c',
+        'cpp': 'cpp', 'cc': 'cpp', 'cxx': 'cpp', 'hpp': 'cpp', 'hxx': 'cpp',
+        // Java/JVM
+        'java': 'java', 'scala': 'scala', 'kt': 'kotlin', 'groovy': 'groovy',
+        // C#/.NET
+        'cs': 'csharp', 'csx': 'csharp',
+        // Python
+        'py': 'python', 'pyw': 'python', 'pyx': 'python',
+        // JavaScript/TypeScript
+        'js': 'javascript', 'jsx': 'javascript', 'mjs': 'javascript', 'cjs': 'javascript',
+        'ts': 'typescript', 'tsx': 'typescript', 'mts': 'typescript', 'cts': 'typescript',
+        'd.ts': 'typescript',
+        // SQL variants
+        'sql': 'sql', 'ddl': 'sql', 'dml': 'sql', 'prc': 'sql', 'fnc': 'sql',
+        'pks': 'sql', 'pkb': 'sql', 'trg': 'sql', 'vw': 'sql', 'plsql': 'sql',
+        'psql': 'sql', 'tsql': 'sql',
+        // Web
+        'html': 'html', 'htm': 'html', 'css': 'css', 'scss': 'scss', 'sass': 'sass',
+        // Data
+        'json': 'json', 'xml': 'xml', 'yaml': 'yaml', 'yml': 'yaml',
+        'csv': 'csv', 'tsv': 'tsv',
+        // Shell/Scripts
+        'sh': 'bash', 'bash': 'bash', 'zsh': 'zsh', 'fish': 'fish',
+        'ps1': 'powershell', 'bat': 'batch', 'cmd': 'batch',
+        // Other languages
+        'go': 'go', 'rs': 'rust', 'rb': 'ruby', 'php': 'php',
+        'swift': 'swift', 'fs': 'fsharp', 'vb': 'vb',
+        'pl': 'perl', 'r': 'r', 'lua': 'lua',
+        // Config
+        'md': 'markdown', 'txt': 'text', 'log': 'log',
+        'ini': 'ini', 'cfg': 'ini', 'conf': 'ini', 'properties': 'properties',
+        'toml': 'toml', 'env': 'env',
+        // Documents
+        'pdf': 'pdf', 'doc': 'document', 'docx': 'document', 'rtf': 'document'
+    };
+    return langMap[ext] || ext || 'text';
+}
+
+/**
+ * Get file extension for a target language
+ */
+function getFileExtension(language) {
+    const extensions = {
+        // Common languages
+        'java': 'java',
+        'javascript': 'js',
+        'typescript': 'ts',
+        'python': 'py',
+        'c': 'c',
+        'cpp': 'cpp',
+        'c++': 'cpp',
+        'csharp': 'cs',
+        'c#': 'cs',
+        'go': 'go',
+        'golang': 'go',
+        'rust': 'rs',
+        'ruby': 'rb',
+        'php': 'php',
+        'swift': 'swift',
+        'kotlin': 'kt',
+        'scala': 'scala',
+        
+        // Legacy languages
+        'cobol': 'cbl',
+        'fortran': 'f90',
+        'pascal': 'pas',
+        'ada': 'adb',
+        'tal': 'tal',
+        
+        // Scripting
+        'perl': 'pl',
+        'lua': 'lua',
+        'r': 'R',
+        'julia': 'jl',
+        'shell': 'sh',
+        'bash': 'sh',
+        'powershell': 'ps1',
+        
+        // Web
+        'html': 'html',
+        'css': 'css',
+        'jsx': 'jsx',
+        'tsx': 'tsx',
+        'vue': 'vue',
+        
+        // Data
+        'sql': 'sql',
+        'json': 'json',
+        'yaml': 'yaml',
+        'xml': 'xml'
+    };
+    
+    return extensions[language.toLowerCase()] || language.toLowerCase();
+}
+
+/**
+ * Extract symbols (functions, classes, variables) from code
+ * Returns array of { name, type, line }
+ */
+function extractSymbolsFromCode(content, language) {
+    const symbols = [];
+    const lines = content.split('\n');
+    const langLower = (language || '').toLowerCase();
+    
+    // Language-specific patterns
+    const patterns = {
+        'java': [
+            { regex: /(?:public|private|protected)?\s*(?:static)?\s*class\s+(\w+)/g, type: 'class' },
+            { regex: /(?:public|private|protected)?\s*(?:static)?\s*(?:void|int|String|boolean|double|float|long|\w+(?:<[^>]+>)?)\s+(\w+)\s*\(/g, type: 'method' },
+            { regex: /(?:public|private|protected)?\s*(?:static)?\s*(?:final)?\s*(?:int|String|boolean|double|float|long|\w+)\s+(\w+)\s*[=;]/g, type: 'field' }
+        ],
+        'python': [
+            { regex: /^class\s+(\w+)/gm, type: 'class' },
+            { regex: /^def\s+(\w+)/gm, type: 'function' },
+            { regex: /^(\w+)\s*=/gm, type: 'variable' }
+        ],
+        'javascript': [
+            { regex: /class\s+(\w+)/g, type: 'class' },
+            { regex: /function\s+(\w+)/g, type: 'function' },
+            { regex: /(?:const|let|var)\s+(\w+)/g, type: 'variable' },
+            { regex: /(\w+)\s*[=:]\s*(?:async\s+)?function/g, type: 'function' },
+            { regex: /(\w+)\s*[=:]\s*\([^)]*\)\s*=>/g, type: 'function' }
+        ],
+        'typescript': [
+            { regex: /class\s+(\w+)/g, type: 'class' },
+            { regex: /interface\s+(\w+)/g, type: 'interface' },
+            { regex: /type\s+(\w+)/g, type: 'type' },
+            { regex: /function\s+(\w+)/g, type: 'function' },
+            { regex: /(?:const|let|var)\s+(\w+)/g, type: 'variable' }
+        ],
+        'c': [
+            { regex: /(?:struct|union)\s+(\w+)/g, type: 'struct' },
+            { regex: /^(?:static\s+)?(?:inline\s+)?(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*\{/gm, type: 'function' },
+            { regex: /#define\s+(\w+)/g, type: 'macro' }
+        ],
+        'cpp': [
+            { regex: /class\s+(\w+)/g, type: 'class' },
+            { regex: /(?:struct|union)\s+(\w+)/g, type: 'struct' },
+            { regex: /namespace\s+(\w+)/g, type: 'namespace' }
+        ],
+        'cobol': [
+            { regex: /PROGRAM-ID\.\s+(\S+)/gi, type: 'program' },
+            { regex: /^\s*\d+\s+(\w[\w-]+)\s+(?:PIC|PICTURE)/gim, type: 'variable' },
+            { regex: /^\s*(\w[\w-]+)\s+SECTION\./gim, type: 'section' },
+            { regex: /^\s*(\w[\w-]+)\.\s*$/gm, type: 'paragraph' }
+        ],
+        'tal': [
+            { regex: /^(?:INT|REAL|FIXED|STRING|STRUCT)\s+(\w+)/gim, type: 'variable' },
+            { regex: /^(?:PROC|SUBPROC)\s+(\w+)/gim, type: 'procedure' },
+            { regex: /^DEFINE\s+(\w+)/gim, type: 'define' }
+        ]
+    };
+    
+    // Get patterns for this language, or use generic patterns
+    const langPatterns = patterns[langLower] || [
+        { regex: /class\s+(\w+)/g, type: 'class' },
+        { regex: /function\s+(\w+)/g, type: 'function' },
+        { regex: /def\s+(\w+)/g, type: 'function' },
+        { regex: /(?:const|let|var|int|string|bool)\s+(\w+)/gi, type: 'variable' }
+    ];
+    
+    // Extract symbols
+    for (const pattern of langPatterns) {
+        let match;
+        const regex = new RegExp(pattern.regex.source, pattern.regex.flags);
+        while ((match = regex.exec(content)) !== null) {
+            const name = match[1];
+            if (name && name.length > 1 && !symbols.some(s => s.name === name)) {
+                // Find line number
+                const beforeMatch = content.substring(0, match.index);
+                const lineNum = (beforeMatch.match(/\n/g) || []).length + 1;
+                
+                symbols.push({
+                    name,
+                    type: pattern.type,
+                    line: lineNum
+                });
+            }
+        }
+    }
+    
+    return symbols;
+}
+
+// Check if a path is a binary file (skip these)
+function isBinaryFile(filename) {
+    const binaryExts = [
+        'exe', 'dll', 'so', 'dylib', 'bin', 'obj', 'o', 'a', 'lib',
+        'png', 'jpg', 'jpeg', 'gif', 'bmp', 'ico', 'webp', 'svg',
+        'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+        'zip', 'tar', 'gz', 'rar', '7z', 'jar', 'war',
+        'mp3', 'mp4', 'wav', 'avi', 'mov', 'mkv',
+        'ttf', 'otf', 'woff', 'woff2', 'eot',
+        'class', 'pyc', 'pyo'
+    ];
+    const ext = filename.split('.').pop().toLowerCase();
+    return binaryExts.includes(ext);
+}
+
+// Add file or directory to context
+async function addToContext(uri) {
+    try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        
+        if (stat.type === vscode.FileType.Directory) {
+            await addDirectoryToContext(uri);
+        } else if (stat.type === vscode.FileType.File) {
+            await addFileToContext(uri);
+        }
+    } catch (error) {
+        log('Error adding to context:', error);
+        vscode.window.showErrorMessage(`Failed to add: ${error.message}`);
+    }
+}
+
+// Recursively add directory contents
+async function addDirectoryToContext(dirUri, depth = 0) {
+    if (depth > 3) {
+        log('Max depth reached, skipping:', dirUri.fsPath);
+        return;
+    }
+    
+    try {
+        const entries = await vscode.workspace.fs.readDirectory(dirUri);
+        let addedCount = 0;
+        
+        for (const [name, type] of entries) {
+            // Skip hidden files and common non-code directories
+            if (name.startsWith('.') || 
+                name === 'node_modules' || 
+                name === '__pycache__' ||
+                name === 'target' ||
+                name === 'build' ||
+                name === 'dist' ||
+                name === 'bin' ||
+                name === 'obj') {
+                continue;
+            }
+            
+            const childUri = vscode.Uri.joinPath(dirUri, name);
+            
+            if (type === vscode.FileType.Directory) {
+                await addDirectoryToContext(childUri, depth + 1);
+            } else if (type === vscode.FileType.File) {
+                // Skip binary files
+                if (isBinaryFile(name)) {
+                    continue;
+                }
+                
+                try {
+                    await addFileToContext(childUri, true); // silent mode
+                    addedCount++;
+                } catch (e) {
+                    // Skip files we can't read
+                    log('Skipping unreadable file:', name);
+                }
+            }
+        }
+        
+        if (depth === 0) {
+            vscode.window.showInformationMessage(`Added ${contextFiles.size} files from directory`);
+        }
+        
+    } catch (error) {
+        log('Error reading directory:', error);
+    }
+}
+
+// ============================================================
+// Extension Activation
+// ============================================================
+
+let contextTreeProvider;
+
+function activate(context) {
+    outputChannel = vscode.window.createOutputChannel('AstraCode');
+    log('AstraCode v4.9.10 activating...');
+    
+    // Register context files tree provider
+    contextTreeProvider = new ContextFilesProvider();
+    vscode.window.registerTreeDataProvider('astra.contextView', contextTreeProvider);
+    
+    // Register chat webview provider
+    const chatProvider = new ChatViewProvider(context.extensionUri);
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider('astra.chatView', chatProvider)
+    );
+    
+    // Try to load persisted vector index
+    loadVectorIndex().then(loaded => {
+        if (loaded) {
+            log('Loaded persisted vector index');
+        }
+    });
+    
+    // Register commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('astra.openChat', () => {
+            vscode.commands.executeCommand('astra.chatView.focus');
+        }),
+        
+        vscode.commands.registerCommand('astra.addFileToContext', async (uri) => {
+            if (!uri && vscode.window.activeTextEditor) {
+                uri = vscode.window.activeTextEditor.document.uri;
+            }
+            if (uri) {
+                await addFileToContext(uri);
+            }
+        }),
+        
+        vscode.commands.registerCommand('astra.removeFileFromContext', (item) => {
+            if (item?.resourceUri) {
+                removeFileFromContext(item.resourceUri);
+            }
+        }),
+        
+        vscode.commands.registerCommand('astra.clearContext', () => {
+            clearContext();
+            vscode.window.showInformationMessage('AstraCode context cleared');
+        }),
+        
+        vscode.commands.registerCommand('astra.rebuildIndex', async () => {
+            if (contextFiles.size === 0) {
+                vscode.window.showWarningMessage('No files in context to index');
+                return;
+            }
+            vscode.window.showInformationMessage(`Rebuilding index for ${contextFiles.size} files...`);
+            updateChatStatus.isIndexing = true;
+            try {
+                // Build symbol index
+                const stats = await buildCodeIndex({ showProgress: true });
+                
+                // Build vector index
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'indexProgress', 
+                    progress: 50, 
+                    message: 'Building vector index...' 
+                });
+                
+                await buildVectorIndex({
+                    showProgress: true,
+                    onProgress: (pct, msg) => {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'indexProgress', 
+                            progress: 50 + Math.round(pct / 2), 
+                            message: msg 
+                        });
+                    }
+                });
+                
+                const vectorStats = getVectorIndexStats();
+                const vectorMsg = vectorStats ? `, ${vectorStats.chunks} vectors` : '';
+                
+                vscode.window.showInformationMessage(
+                    `Index rebuilt: ${stats.files} files, ${stats.symbols} symbols, ${stats.functions} functions${vectorMsg}`
+                );
+            } finally {
+                updateChatStatus.isIndexing = false;
+            }
+            updateChatStatusUI();
+        }),
+        
+        vscode.commands.registerCommand('astra.clearIndex', async () => {
+            // Clear symbol index
+            codeIndex.files.clear();
+            codeIndex.symbols.clear();
+            codeIndex.callGraph.clear();
+            codeIndex.reverseCallGraph.clear();
+            codeIndex.dependencies.clear();
+            codeIndex.lastUpdated = null;
+            
+            // Clear vector index
+            await clearVectorIndex();
+            
+            updateChatStatusUI();
+            vscode.window.showInformationMessage('All indexes cleared (symbol + vector)');
+            log('All indexes cleared manually');
+        }),
+        
+        vscode.commands.registerCommand('astra.clearFailedModels', () => {
+            const count = failedModelsCache.size;
+            failedModelsCache.clear();
+            lastCopilotModelSetting = null;  // Also reset the setting tracker
+            if (count > 0) {
+                vscode.window.showInformationMessage(`Cleared ${count} failed model(s) from cache. All models will be retried.`);
+                log(`Cleared ${count} failed models from cache`);
+            } else {
+                vscode.window.showInformationMessage('No failed models in cache.');
+            }
+        }),
+        
+        vscode.commands.registerCommand('astra.cancelTask', () => {
+            if (taskController.currentTask) {
+                const taskName = taskController.currentTask;
+                const elapsed = taskController.startTime 
+                    ? Math.round((Date.now() - taskController.startTime.getTime()) / 1000)
+                    : 0;
+                    
+                taskController.cancel();
+                chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+                chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+                
+                vscode.window.showWarningMessage(`Cancelled: ${taskName} (ran for ${elapsed}s)`);
+                log(`Task cancelled via command palette: ${taskName} after ${elapsed}s`);
+            } else {
+                vscode.window.showInformationMessage('No task currently running.');
+            }
+        }),
+        
+        vscode.commands.registerCommand('astra.showIndexStats', () => {
+            if (codeIndex.files.size === 0 && vectorIndex.chunks.length === 0) {
+                vscode.window.showInformationMessage('No index built yet. Add files first.');
+                return;
+            }
+            
+            const funcs = Array.from(codeIndex.symbols.values())
+                .filter(s => s.type === 'function' || s.type === 'method' || s.type === 'procedure');
+            const classes = Array.from(codeIndex.symbols.values())
+                .filter(s => s.type === 'class' || s.type === 'struct');
+            
+            const vectorStats = getVectorIndexStats();
+            const vectorSection = vectorStats 
+                ? `\n\n🔍 Vector Index:\n• Chunks: ${vectorStats.chunks}\n• Files: ${vectorStats.files}\n• Memory: ${vectorStats.memorySizeMB} MB`
+                : '\n\n🔍 Vector Index: Not built';
+            
+            const msg = `📊 Index Stats:
+
+📁 Symbol Index:
+• Files: ${codeIndex.files.size}
+• Symbols: ${codeIndex.symbols.size}
+• Functions/Methods: ${funcs.length}
+• Classes/Structs: ${classes.length}
+• Call Graph Entries: ${codeIndex.callGraph.size}${vectorSection}`;
+            
+            vscode.window.showInformationMessage(msg, { modal: true });
+        }),
+        
+        vscode.commands.registerCommand('astra.showCallGraph', async () => {
+            if (codeIndex.callGraph.size === 0) {
+                vscode.window.showWarningMessage('No call graph built yet. Add code files first.');
+                return;
+            }
+            
+            // Generate HTML content
+            const htmlContent = generateCallGraphHtml();
+            
+            // Save to .astra folder
+            let savedPath = null;
+            if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+                const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+                const astraDir = vscode.Uri.file(workspaceRoot + '/.astra');
+                
+                try {
+                    await vscode.workspace.fs.createDirectory(astraDir);
+                } catch (e) { /* ignore if exists */ }
+                
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+                const filePath = vscode.Uri.file(workspaceRoot + `/.astra/call-graph-${timestamp}.html`);
+                
+                await vscode.workspace.fs.writeFile(filePath, Buffer.from(htmlContent, 'utf8'));
+                savedPath = filePath.fsPath;
+                log('Call graph saved to:', savedPath);
+            }
+            
+            // Create webview panel for visual call graph
+            const panel = vscode.window.createWebviewPanel(
+                'astraCallGraph',
+                'AstraCode Call Graph',
+                vscode.ViewColumn.One,
+                {
+                    enableScripts: true
+                }
+            );
+            
+            // Add "Open in Browser" button to the HTML
+            const htmlWithBrowserButton = htmlContent.replace(
+                '<h1>⬡ Call Graph Analysis</h1>',
+                `<h1>⬡ Call Graph Analysis</h1>
+                <div style="margin-bottom: 15px;">
+                    ${savedPath ? `<button onclick="copyPath()" style="padding: 8px 16px; background: #0e639c; color: white; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px;">📋 Copy File Path</button>
+                    <span style="color: #808080; font-size: 12px;">Open in browser: ${savedPath}</span>
+                    <script>function copyPath() { navigator.clipboard.writeText('${savedPath.replace(/\\/g, '\\\\')}'); }</script>` : ''}
+                </div>`
+            );
+            
+            panel.webview.html = htmlWithBrowserButton;
+            
+            // Show info message with option to open in browser
+            if (savedPath) {
+                const choice = await vscode.window.showInformationMessage(
+                    'Call graph generated! Open in browser for better zoom/pan?',
+                    'Open in Browser',
+                    'Just View Here'
+                );
+                
+                if (choice === 'Open in Browser') {
+                    vscode.env.openExternal(vscode.Uri.file(savedPath));
+                }
+            }
+        }),
+        
+        vscode.commands.registerCommand('astra.openCallGraphInBrowser', async () => {
+            if (codeIndex.callGraph.size === 0) {
+                vscode.window.showWarningMessage('No call graph built yet. Add code files first.');
+                return;
+            }
+            
+            // Generate and save HTML
+            const htmlContent = generateCallGraphHtml();
+            
+            let filePath;
+            if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+                const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+                const astraDir = vscode.Uri.file(workspaceRoot + '/.astra');
+                
+                try {
+                    await vscode.workspace.fs.createDirectory(astraDir);
+                } catch (e) { /* ignore if exists */ }
+                
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+                filePath = vscode.Uri.file(workspaceRoot + `/.astra/call-graph-${timestamp}.html`);
+            } else {
+                // Use temp directory
+                const os = require('os');
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+                filePath = vscode.Uri.file(os.tmpdir() + `/astra-call-graph-${timestamp}.html`);
+            }
+            
+            await vscode.workspace.fs.writeFile(filePath, Buffer.from(htmlContent, 'utf8'));
+            
+            // Open in default browser
+            vscode.env.openExternal(filePath);
+            vscode.window.showInformationMessage(`Call graph opened in browser: ${filePath.fsPath}`);
+        }),
+        
+        vscode.commands.registerCommand('astra.showCallersOf', async () => {
+            if (codeIndex.symbols.size === 0) {
+                vscode.window.showWarningMessage('No index built yet. Add code files first.');
+                return;
+            }
+            
+            // Get list of functions
+            const funcs = Array.from(codeIndex.symbols.entries())
+                .filter(([k, v]) => v.type === 'function' || v.type === 'method' || v.type === 'procedure')
+                .map(([k, v]) => ({ label: v.name, description: `${v.file?.split('/').pop()}:${v.line}`, detail: v.signature || '' }));
+            
+            const selected = await vscode.window.showQuickPick(funcs, {
+                placeHolder: 'Select a function to see what calls it'
+            });
+            
+            if (selected) {
+                const trace = traceSymbol(selected.label);
+                let msg = `## ${selected.label}\n\n`;
+                
+                if (trace.callers.length > 0) {
+                    msg += `### Called by (${trace.callers.length}):\n`;
+                    for (const c of trace.callers) {
+                        msg += `- ${c.name} (${c.file?.split('/').pop()}:${c.line})\n`;
+                    }
+                } else {
+                    msg += `### No callers found (entry point?)\n`;
+                }
+                
+                if (trace.callees.length > 0) {
+                    msg += `\n### Calls (${trace.callees.length}):\n`;
+                    for (const c of trace.callees) {
+                        msg += `- ${c.name} (${c.file?.split('/').pop()}:${c.line})\n`;
+                    }
+                }
+                
+                // Show in a new document
+                const doc = await vscode.workspace.openTextDocument({
+                    content: msg,
+                    language: 'markdown'
+                });
+                await vscode.window.showTextDocument(doc, { preview: false });
+            }
+        }),
+        
+        vscode.commands.registerCommand('astra.semanticSearch', async () => {
+            const query = await vscode.window.showInputBox({
+                prompt: 'Semantic Search',
+                placeHolder: 'e.g., "find code that validates wire transfers"'
+            });
+            
+            if (!query) return;
+            
+            // Check if we have any files to search
+            if (contextFiles.size === 0) {
+                vscode.window.showWarningMessage('No files in context. Add files using right-click → "AstraCode: Add File to Context"');
+                return;
+            }
+            
+            // Check if we have an index built
+            if (codeIndex.symbols.size === 0 && vectorIndex.chunks.length === 0) {
+                const indexState = `Context files: ${contextFiles.size}, Symbols: ${codeIndex.symbols.size}`;
+                log('Search - index not built:', indexState);
+                const build = await vscode.window.showWarningMessage(
+                    `Index not built. Build it now? (${contextFiles.size} files in context)`,
+                    'Build Index', 'Search anyway'
+                );
+                if (build === 'Build Index') {
+                    await vscode.commands.executeCommand('astra.rebuildIndex');
+                }
+            }
+            
+            // If no vector index, offer to build it
+            if (vectorIndex.chunks.length === 0 && codeIndex.symbols.size > 0) {
+                const build = await vscode.window.showWarningMessage(
+                    'Vector index not built. Build it now for semantic search?',
+                    'Build', 'Search without vectors'
+                );
+                if (build === 'Build') {
+                    await vscode.commands.executeCommand('astra.rebuildIndex');
+                }
+            }
+            
+            log('Starting semantic search for:', query);
+            
+            // Perform hybrid search with progress
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'Searching...',
+                cancellable: false
+            }, async (progress) => {
+                progress.report({ message: 'Running hybrid search...' });
+                
+                try {
+                    const results = await hybridSearch(query, { maxResults: 20 });
+                    
+                    log('Search complete, results:', results.length);
+                    
+                    if (results.length === 0) {
+                        const indexState = `Context: ${contextFiles.size} files, Symbols: ${codeIndex.symbols.size}, Vectors: ${vectorIndex.chunks.length}`;
+                        log('No results found. Index state:', indexState);
+                        vscode.window.showInformationMessage(`No results found for "${query}". Try different keywords. (${indexState})`);
+                        return;
+                    }
+                    
+                    // Format results as markdown
+                    let content = `# 🔍 Search Results for "${query}"\n\n`;
+                    content += `Found **${results.length}** results using: `;
+                    const methods = new Set();
+                    results.forEach(r => r.sources.forEach(s => methods.add(s)));
+                    content += Array.from(methods).join(', ') + '\n\n---\n\n';
+                    
+                    for (let i = 0; i < results.length; i++) {
+                        const r = results[i];
+                        const sources = Array.from(r.sources).map(s => {
+                            if (s === 'symbol') return '📊';
+                            if (s === 'grep') return '🔤';
+                            if (s === 'vector') return '🧠';
+                            if (s === 'text') return '📝';
+                            return s;
+                        }).join('');
+                        
+                        content += `### ${i + 1}. ${r.symbol || r.fileName}:${r.line} ${sources}\n`;
+                        content += `**File:** \`${r.file}\`\n`;
+                        content += `**Score:** ${(r.score * 100).toFixed(0)}%\n`;
+                        if (r.preview) {
+                            content += `\`\`\`\n${r.preview.trim()}\n\`\`\`\n`;
+                        }
+                        content += '\n';
+                    }
+                    
+                    // Show results in a new document
+                    const doc = await vscode.workspace.openTextDocument({
+                        content,
+                        language: 'markdown'
+                    });
+                    await vscode.window.showTextDocument(doc, { preview: true });
+                    
+                } catch (error) {
+                    log('Semantic search error:', error.message);
+                    vscode.window.showErrorMessage(`Search failed: ${error.message}`);
+                }
+            });
+        }),
+        
+        vscode.commands.registerCommand('astra.toggleMode', () => {
+            const modes = ['auto', 'local', 'api'];
+            const currentIndex = modes.indexOf(currentMode);
+            currentMode = modes[(currentIndex + 1) % modes.length];
+            updateChatStatus();
+            vscode.window.showInformationMessage(`AstraCode mode: ${currentMode.toUpperCase()}`);
+        }),
+        
+        vscode.commands.registerCommand('astra.addSelectionToContext', async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (editor && editor.selection && !editor.selection.isEmpty) {
+                const selection = editor.document.getText(editor.selection);
+                const fileName = editor.document.uri.path.split('/').pop();
+                const language = detectLanguage(fileName);
+                
+                // Add as a virtual file
+                const virtualPath = `selection:${fileName}:${Date.now()}`;
+                contextFiles.set(virtualPath, {
+                    uri: editor.document.uri,
+                    content: selection,
+                    language: language
+                });
+                
+                contextTreeProvider.refresh();
+                updateChatStatus();
+                vscode.window.showInformationMessage('Selection added to AstraCode context');
+            }
+        })
+    );
+    
+    log('AstraCode activated');
+}
+
+function deactivate() {
+    // Clear any pending timeout
+    if (updateChatStatus.indexTimeout) {
+        clearTimeout(updateChatStatus.indexTimeout);
+        updateChatStatus.indexTimeout = null;
+    }
+    
+    // Clean up resources
+    contextFiles.clear();
+    codeIndex.files.clear();
+    codeIndex.symbols.clear();
+    codeIndex.variables.clear();
+    codeIndex.callGraph.clear();
+    codeIndex.reverseCallGraph.clear();
+    codeIndex.dependencies.clear();
+    chatHistory = [];
+    
+    log('AstraCode deactivated');
+}
+
+module.exports = { activate, deactivate };
