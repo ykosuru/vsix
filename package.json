@@ -1,0 +1,311 @@
+{
+  "name": "astra-standalone",
+  "displayName": "AstraCode - AI Code Assistant",
+  "description": "Standalone AI code assistant with explicit context control",
+  "version": "4.9.24",
+  "publisher": "astra",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "extensionDependencies": [],
+  "categories": [
+    "Programming Languages",
+    "Machine Learning",
+    "Chat"
+  ],
+  "keywords": [
+    "code translation",
+    "TAL",
+    "COBOL",
+    "Java",
+    "legacy modernization",
+    "AI assistant",
+    "copilot"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "astra-sidebar",
+          "title": "AstraCode",
+          "icon": "icons/astra-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "astra-sidebar": [
+        {
+          "id": "astra.contextView",
+          "name": "Context Files"
+        },
+        {
+          "type": "webview",
+          "id": "astra.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "astra.openChat",
+        "title": "AstraCode: Open Chat"
+      },
+      {
+        "command": "astra.addFileToContext",
+        "title": "AstraCode: Add File to Context"
+      },
+      {
+        "command": "astra.removeFileFromContext",
+        "title": "AstraCode: Remove from Context"
+      },
+      {
+        "command": "astra.clearContext",
+        "title": "AstraCode: Clear All Context"
+      },
+      {
+        "command": "astra.toggleMode",
+        "title": "AstraCode: Toggle API/Local Mode"
+      },
+      {
+        "command": "astra.addSelectionToContext",
+        "title": "AstraCode: Add Selection to Context"
+      },
+      {
+        "command": "astra.rebuildIndex",
+        "title": "Rebuild Index",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "astra.clearIndex",
+        "title": "Clear Index",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "astra.showIndexStats",
+        "title": "Index Stats",
+        "icon": "$(info)"
+      },
+      {
+        "command": "astra.clearContext",
+        "title": "Clear All Context",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "astra.showCallGraph",
+        "title": "AstraCode: Show Call Graph"
+      },
+      {
+        "command": "astra.openCallGraphInBrowser",
+        "title": "AstraCode: Open Call Graph in Browser"
+      },
+      {
+        "command": "astra.showCallersOf",
+        "title": "AstraCode: Show Callers Of..."
+      },
+      {
+        "command": "astra.clearFailedModels",
+        "title": "AstraCode: Clear Failed Models Cache",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "astra.semanticSearch",
+        "title": "AstraCode: Semantic Search",
+        "icon": "$(search)"
+      },
+      {
+        "command": "astra.cancelTask",
+        "title": "AstraCode: Cancel Current Task",
+        "icon": "$(stop)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "astra.rebuildIndex",
+          "when": "view == astra.contextView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "astra.clearIndex",
+          "when": "view == astra.contextView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "astra.showIndexStats",
+          "when": "view == astra.contextView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "astra.clearContext",
+          "when": "view == astra.contextView",
+          "group": "navigation@4"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "astra.addFileToContext",
+          "group": "astra@1"
+        },
+        {
+          "command": "astra.addSelectionToContext",
+          "group": "astra@2",
+          "when": "editorHasSelection"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "astra.addFileToContext",
+          "group": "astra@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "astra.removeFileFromContext",
+          "when": "view == astra.contextView",
+          "group": "inline"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "astra.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      },
+      {
+        "command": "astra.addFileToContext",
+        "key": "ctrl+shift+enter",
+        "mac": "cmd+shift+enter",
+        "when": "editorFocus"
+      }
+    ],
+    "configuration": {
+      "title": "AstraCode",
+      "properties": {
+        "astra.apiUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "URL of the AstraCode API server (provides search + LLM fallback)"
+        },
+        "astra.defaultMode": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "local", "api"],
+          "description": "Default mode: auto (smart detection), local (use context files), api (search codebase)"
+        },
+        "astra.targetLanguage": {
+          "type": "string",
+          "default": "java",
+          "enum": ["java", "python", "typescript", "go", "csharp"],
+          "description": "Default target language for translation"
+        },
+        "astra.framework": {
+          "type": "string",
+          "default": "spring_boot",
+          "description": "Default framework for generated code"
+        },
+        "astra.llm.useCopilotForDocs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use GitHub Copilot (free) for documentation and explanation tasks"
+        },
+        "astra.llm.codingProvider": {
+          "type": "string",
+          "default": "copilot",
+          "enum": ["copilot", "anthropic", "openai"],
+          "enumDescriptions": [
+            "Use GitHub Copilot (supports Claude Sonnet 4.5, GPT-4o, etc.)",
+            "Use Anthropic API directly (requires API key)",
+            "Use OpenAI API directly (requires API key)"
+          ],
+          "description": "LLM provider to use for code generation and translation tasks"
+        },
+        "astra.llm.copilotModel": {
+          "type": "string",
+          "default": "claude-sonnet-4",
+          "enum": [
+            "claude-sonnet-4",
+            "claude-3.5-sonnet",
+            "gpt-4o",
+            "gpt-4",
+            "o1-preview",
+            "o1-mini"
+          ],
+          "enumDescriptions": [
+            "Claude Sonnet 4.5 - Best for coding (recommended)",
+            "Claude 3.5 Sonnet - Great for coding",
+            "GPT-4o - OpenAI's best model",
+            "GPT-4 - Original GPT-4",
+            "o1-preview - OpenAI reasoning model",
+            "o1-mini - OpenAI reasoning (faster)"
+          ],
+          "description": "Which model to use within GitHub Copilot"
+        },
+        "astra.llm.anthropicModel": {
+          "type": "string",
+          "default": "claude-sonnet-4-5-20250514",
+          "enum": [
+            "claude-sonnet-4-5-20250514",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-3-sonnet-20240229",
+            "claude-3-haiku-20240307"
+          ],
+          "enumDescriptions": [
+            "Claude Sonnet 4.5 - Best for coding (recommended)",
+            "Claude 3.5 Sonnet - Great for coding",
+            "Claude 3 Opus - Most capable, slower",
+            "Claude 3 Sonnet - Balanced",
+            "Claude 3 Haiku - Fastest, less capable"
+          ],
+          "description": "Anthropic model to use for coding tasks"
+        },
+        "astra.llm.openaiModel": {
+          "type": "string",
+          "default": "gpt-4o",
+          "enum": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"],
+          "enumDescriptions": [
+            "GPT-4o - Best OpenAI model for coding",
+            "GPT-4o Mini - Faster, cheaper",
+            "GPT-4 Turbo - Good for coding",
+            "GPT-4 - Original GPT-4",
+            "GPT-3.5 Turbo - Fastest, less capable"
+          ],
+          "description": "OpenAI model to use for coding tasks"
+        },
+        "astra.llm.anthropicApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API key for direct Claude access"
+        },
+        "astra.llm.openaiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI API key for direct GPT access"
+        },
+        "astra.translation.maxCritiqueIterations": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum critique iterations for translation (1-20)"
+        },
+        "astra.translation.enableCompilation": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Java compilation after translation"
+        }
+      }
+    }
+  }
+}
