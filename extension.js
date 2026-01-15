@@ -1,7 +1,7 @@
 /**
- * AstraCode v4.9.77 - Agentic Code Assistant
+ * AstraCode v4.9.80 - Agentic Code Assistant
  * 
- * CLEAN 3-LAYER SEARCH ARCHITECTURE (v4.9.77)
+ * CLEAN 3-LAYER SEARCH ARCHITECTURE (v4.9.80)
  * ============================================
  * 
  * ┌─────────────────────────────────────────────────────────┐
@@ -115,6 +115,60 @@ const taskController = {
         return this.isCancelled;
     }
 };
+
+/**
+ * Default System Prompt for AstraCode
+ * This is prepended to every user query to guide the LLM's behavior
+ */
+const DEFAULT_SYSTEM_PROMPT = `You are AstraCode, an expert code analysis assistant specializing in legacy system modernization and reverse engineering.
+
+## Your Expertise
+- Deep understanding of legacy languages: COBOL, TAL, PL/I, and mainframe systems
+- Modern languages: Java, Python, JavaScript/TypeScript, C/C++, Go, Rust
+- Payment systems, banking, and financial services domain knowledge
+- Code architecture analysis and documentation
+
+## Your Approach
+1. **Be Precise**: Reference specific file names, line numbers, and function names when discussing code
+2. **Be Practical**: Provide actionable insights, not just descriptions
+3. **Be Thorough**: Consider edge cases, error handling, and data flow
+4. **Be Clear**: Use business-friendly language when explaining technical concepts
+
+## Response Guidelines
+- When analyzing code, identify the WHAT (functionality), HOW (implementation), and WHY (business purpose)
+- For questions about specific functions, trace the data flow and dependencies
+- When asked to document, focus on accuracy over comprehensiveness
+- If uncertain, say so rather than guessing
+
+## Context Awareness
+- You have access to the user's code context (files they've added)
+- Reference the code index when available for accurate symbol information
+- Consider cross-file dependencies and call relationships`;
+
+/**
+ * Get the current system prompt (user-edited or default)
+ */
+function getSystemPrompt() {
+    const config = vscode.workspace.getConfiguration('astra');
+    const customPrompt = config.get('systemPrompt');
+    return customPrompt || DEFAULT_SYSTEM_PROMPT;
+}
+
+/**
+ * Save a custom system prompt
+ */
+async function setSystemPrompt(prompt) {
+    const config = vscode.workspace.getConfiguration('astra');
+    await config.update('systemPrompt', prompt, vscode.ConfigurationTarget.Global);
+}
+
+/**
+ * Reset system prompt to default
+ */
+async function resetSystemPrompt() {
+    const config = vscode.workspace.getConfiguration('astra');
+    await config.update('systemPrompt', undefined, vscode.ConfigurationTarget.Global);
+}
 
 /**
  * Code Index - stores parsed information about the codebase
@@ -9179,10 +9233,90 @@ class ChatViewProvider {
                         vscode.commands.executeCommand('astra.semanticSearch');
                     }
                     break;
+                case 'generateDocumentation':
+                    // Generate documentation with specified type
+                    if (contextFiles.size === 0) {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: '⚠️ No files in context. Please add files first using the 📎 button.\n\n'
+                        });
+                        break;
+                    }
+                    
+                    // Build file list from context
+                    const docFileList = [];
+                    for (const [filePath, file] of contextFiles) {
+                        docFileList.push({
+                            name: pathUtils.getFileName(filePath),
+                            path: filePath,
+                            content: file.content,
+                            language: file.language,
+                            size: file.content.length
+                        });
+                    }
+                    
+                    const docType = message.docType || 'technical';
+                    debugLog('DOCS', `Generating ${docType} documentation`, { files: docFileList.length });
+                    
+                    chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: true });
+                    
+                    try {
+                        await generateDocumentationFile(docFileList, `Generate ${docType} documentation`, docType);
+                    } catch (error) {
+                        debugLog('DOCS', `Error generating documentation: ${error.message}`);
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: `❌ Error generating documentation: ${error.message}\n\n`
+                        });
+                    }
+                    
+                    chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+                    break;
                 case 'cancelTask':
                     // Cancel currently running task
                     taskController.cancel();
                     chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+                    break;
+                case 'getSystemPrompt':
+                    // Send current system prompt to webview
+                    {
+                        const config = vscode.workspace.getConfiguration('astra');
+                        const customPrompt = config.get('systemPrompt');
+                        const isDefault = !customPrompt;
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'systemPromptUpdate', 
+                            prompt: customPrompt || DEFAULT_SYSTEM_PROMPT,
+                            isDefault: isDefault
+                        });
+                    }
+                    break;
+                case 'setSystemPrompt':
+                    // Save custom system prompt
+                    {
+                        const newPrompt = message.prompt;
+                        await setSystemPrompt(newPrompt);
+                        const isDefault = !newPrompt || newPrompt === DEFAULT_SYSTEM_PROMPT;
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'systemPromptUpdate', 
+                            prompt: newPrompt || DEFAULT_SYSTEM_PROMPT,
+                            isDefault: isDefault,
+                            saved: true
+                        });
+                        log('System prompt saved');
+                    }
+                    break;
+                case 'resetSystemPrompt':
+                    // Reset to default system prompt
+                    {
+                        await resetSystemPrompt();
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'systemPromptUpdate', 
+                            prompt: DEFAULT_SYSTEM_PROMPT,
+                            isDefault: true,
+                            saved: true
+                        });
+                        log('System prompt reset to default');
+                    }
                     break;
                 case 'openFile':
                     // Open a file in the editor
@@ -9683,6 +9817,119 @@ class ChatViewProvider {
             background: var(--vscode-button-secondaryHoverBackground);
         }
         
+        /* Code Docs dropdown container */
+        .docs-dropdown {
+            position: relative;
+            display: inline-block;
+        }
+        
+        .docs-dropdown-btn {
+            padding: 4px 10px;
+            background: rgba(33, 150, 243, 0.2) !important;
+            color: #64B5F6 !important;
+            border: 1px solid rgba(33, 150, 243, 0.4) !important;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        
+        .docs-dropdown-btn:hover {
+            background: rgba(33, 150, 243, 0.35) !important;
+            border-color: rgba(33, 150, 243, 0.6) !important;
+        }
+        
+        .docs-dropdown-panel {
+            display: none;
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+            min-width: 280px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            z-index: 100;
+        }
+        
+        .docs-dropdown-panel.show {
+            display: block;
+        }
+        
+        .docs-dropdown-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--vscode-foreground);
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        
+        .docs-option {
+            display: flex;
+            align-items: flex-start;
+            padding: 8px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-bottom: 6px;
+            border: 1px solid transparent;
+            transition: all 0.15s ease;
+        }
+        
+        .docs-option:hover {
+            background: var(--vscode-list-hoverBackground);
+        }
+        
+        .docs-option.selected {
+            background: var(--vscode-list-activeSelectionBackground);
+            border-color: var(--vscode-focusBorder);
+        }
+        
+        .docs-option input[type="radio"] {
+            margin-right: 10px;
+            margin-top: 2px;
+            accent-color: var(--vscode-button-background);
+        }
+        
+        .docs-option-content {
+            flex: 1;
+        }
+        
+        .docs-option-label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--vscode-foreground);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .docs-option-desc {
+            font-size: 10px;
+            color: var(--vscode-descriptionForeground);
+            margin-top: 4px;
+            line-height: 1.4;
+        }
+        
+        .docs-generate-btn {
+            width: 100%;
+            padding: 8px 16px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            margin-top: 8px;
+        }
+        
+        .docs-generate-btn:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        
         /* Graph button - subtle green */
         .graph-btn {
             background: rgba(76, 175, 80, 0.2) !important;
@@ -9707,6 +9954,134 @@ class ChatViewProvider {
         .search-btn:hover {
             background: rgba(124, 77, 255, 0.35) !important;
             border-color: rgba(124, 77, 255, 0.6) !important;
+        }
+        
+        /* System Prompt Section */
+        .system-prompt-section {
+            border-bottom: 1px solid var(--vscode-panel-border);
+            margin-bottom: 8px;
+        }
+        
+        .system-prompt-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 0;
+            cursor: pointer;
+            user-select: none;
+        }
+        
+        .system-prompt-header:hover {
+            background: var(--vscode-list-hoverBackground);
+        }
+        
+        .system-prompt-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--vscode-foreground);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .system-prompt-toggle {
+            font-size: 10px;
+            color: var(--vscode-descriptionForeground);
+            transition: transform 0.2s ease;
+        }
+        
+        .system-prompt-toggle.expanded {
+            transform: rotate(180deg);
+        }
+        
+        .system-prompt-content {
+            display: none;
+            padding: 8px 0;
+        }
+        
+        .system-prompt-content.show {
+            display: block;
+        }
+        
+        .system-prompt-textarea {
+            width: 100%;
+            min-height: 120px;
+            max-height: 300px;
+            padding: 8px;
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            font-family: var(--vscode-editor-font-family), monospace;
+            font-size: 11px;
+            line-height: 1.4;
+            resize: vertical;
+        }
+        
+        .system-prompt-textarea:focus {
+            outline: 1px solid var(--vscode-focusBorder);
+        }
+        
+        .system-prompt-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 8px;
+            gap: 8px;
+        }
+        
+        .system-prompt-btn {
+            padding: 4px 10px;
+            font-size: 11px;
+            border-radius: 4px;
+            cursor: pointer;
+            border: 1px solid var(--vscode-button-border);
+        }
+        
+        .system-prompt-save {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+        }
+        
+        .system-prompt-save:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        
+        .system-prompt-reset {
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+        }
+        
+        .system-prompt-reset:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+        }
+        
+        .system-prompt-status {
+            font-size: 10px;
+            color: var(--vscode-descriptionForeground);
+            flex: 1;
+        }
+        
+        .system-prompt-status.saved {
+            color: #4CAF50;
+        }
+        
+        .system-prompt-indicator {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 8px;
+            background: rgba(255, 193, 7, 0.2);
+            color: #FFC107;
+        }
+        
+        .system-prompt-indicator.default {
+            background: rgba(76, 175, 80, 0.2);
+            color: #81C784;
+        }
+        
+        .system-prompt-indicator.custom {
+            background: rgba(255, 193, 7, 0.2);
+            color: #FFC107;
         }
         
         .add-files-big {
@@ -9891,6 +10266,30 @@ class ChatViewProvider {
         </div>
     </div>
     
+    <div class="system-prompt-section">
+        <div class="system-prompt-header" id="systemPromptHeader">
+            <div class="system-prompt-title">
+                <span>⚙️ System Prompt</span>
+                <span class="system-prompt-indicator default" id="systemPromptIndicator">Default</span>
+            </div>
+            <span class="system-prompt-toggle" id="systemPromptToggle">▼</span>
+        </div>
+        <div class="system-prompt-content" id="systemPromptContent">
+            <textarea class="system-prompt-textarea" id="systemPromptTextarea" placeholder="Customize how AstraCode responds. This prompt is prepended to every query.
+
+Example:
+- Focus on payment processing domain
+- Always provide code examples
+- Use formal technical language
+- Reference specific frameworks"></textarea>
+            <div class="system-prompt-actions">
+                <span class="system-prompt-status" id="systemPromptStatus">Prepended to every query</span>
+                <button class="system-prompt-btn system-prompt-reset" id="resetSystemPromptBtn">Reset to Default</button>
+                <button class="system-prompt-btn system-prompt-save" id="saveSystemPromptBtn">Save</button>
+            </div>
+        </div>
+    </div>
+    
     <div id="contextBar" class="context-bar" style="display: none;">
         <div id="contextFilesList" class="context-files-list"></div>
         <div class="context-actions">
@@ -9920,7 +10319,27 @@ class ChatViewProvider {
             <button class="quick-action-btn" data-prompt="Find bugs and issues">🐛 Debug</button>
             <button class="quick-action-btn graph-btn" data-command="openCallGraphInBrowser">⬡ Graph</button>
             <button class="quick-action-btn search-btn" data-command="semanticSearch">🧠 Search</button>
-            <button class="quick-action-btn" data-prompt="Generate full documentation (DeepWiki style)">📄 Code Docs</button>
+            <div class="docs-dropdown">
+                <button class="docs-dropdown-btn" id="docsDropdownBtn">📄 Code Docs ▾</button>
+                <div class="docs-dropdown-panel" id="docsDropdownPanel">
+                    <div class="docs-dropdown-title">Choose Documentation Type</div>
+                    <label class="docs-option selected" data-type="technical">
+                        <input type="radio" name="docType" value="technical" checked>
+                        <div class="docs-option-content">
+                            <div class="docs-option-label">🔧 Technical Documentation</div>
+                            <div class="docs-option-desc">For developers. Detailed code structure, function signatures, data flows, and implementation details.</div>
+                        </div>
+                    </label>
+                    <label class="docs-option" data-type="business">
+                        <input type="radio" name="docType" value="business">
+                        <div class="docs-option-content">
+                            <div class="docs-option-label">📊 Business Documentation</div>
+                            <div class="docs-option-desc">For product owners & stakeholders. Focus on WHAT the code does, WHY it matters, and customer value.</div>
+                        </div>
+                    </label>
+                    <button class="docs-generate-btn" id="generateDocsBtn">Generate Documentation</button>
+                </div>
+            </div>
         </div>
         <div class="input-row">
             <textarea id="chatInput" placeholder="Ask a question... (Ctrl+Enter to send)" rows="2"></textarea>
@@ -9955,6 +10374,42 @@ class ChatViewProvider {
         let currentMode = 'auto';
         let isProcessing = false;
         let contextFilesData = []; // Store file paths for removal
+        
+        // System Prompt Elements
+        const systemPromptHeader = document.getElementById('systemPromptHeader');
+        const systemPromptToggle = document.getElementById('systemPromptToggle');
+        const systemPromptContent = document.getElementById('systemPromptContent');
+        const systemPromptTextarea = document.getElementById('systemPromptTextarea');
+        const systemPromptIndicator = document.getElementById('systemPromptIndicator');
+        const systemPromptStatus = document.getElementById('systemPromptStatus');
+        const saveSystemPromptBtn = document.getElementById('saveSystemPromptBtn');
+        const resetSystemPromptBtn = document.getElementById('resetSystemPromptBtn');
+        
+        // Toggle system prompt panel
+        systemPromptHeader.addEventListener('click', () => {
+            const isExpanded = systemPromptContent.classList.toggle('show');
+            systemPromptToggle.classList.toggle('expanded', isExpanded);
+            
+            // Request current system prompt when opening
+            if (isExpanded) {
+                vscode.postMessage({ type: 'getSystemPrompt' });
+            }
+        });
+        
+        // Save system prompt
+        saveSystemPromptBtn.addEventListener('click', () => {
+            const newPrompt = systemPromptTextarea.value.trim();
+            vscode.postMessage({ type: 'setSystemPrompt', prompt: newPrompt });
+            
+            systemPromptStatus.textContent = 'Saving...';
+            systemPromptStatus.classList.remove('saved');
+        });
+        
+        // Reset to default
+        resetSystemPromptBtn.addEventListener('click', () => {
+            vscode.postMessage({ type: 'resetSystemPrompt' });
+            systemPromptStatus.textContent = 'Resetting...';
+        });
         
         // Add files button (small)
         addFilesBtn.addEventListener('click', () => {
@@ -10019,6 +10474,46 @@ class ChatViewProvider {
                     // Optionally auto-send
                     // sendMessage();
                 }
+            });
+        });
+        
+        // Documentation dropdown handlers
+        const docsDropdownBtn = document.getElementById('docsDropdownBtn');
+        const docsDropdownPanel = document.getElementById('docsDropdownPanel');
+        const generateDocsBtn = document.getElementById('generateDocsBtn');
+        const docOptions = document.querySelectorAll('.docs-option');
+        
+        // Toggle dropdown
+        docsDropdownBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            docsDropdownPanel.classList.toggle('show');
+        });
+        
+        // Close dropdown when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('.docs-dropdown')) {
+                docsDropdownPanel.classList.remove('show');
+            }
+        });
+        
+        // Handle option selection
+        docOptions.forEach(option => {
+            option.addEventListener('click', () => {
+                docOptions.forEach(o => o.classList.remove('selected'));
+                option.classList.add('selected');
+                option.querySelector('input[type="radio"]').checked = true;
+            });
+        });
+        
+        // Generate documentation button
+        generateDocsBtn.addEventListener('click', () => {
+            const selectedType = document.querySelector('input[name="docType"]:checked').value;
+            docsDropdownPanel.classList.remove('show');
+            
+            // Send message to generate documentation with selected type
+            vscode.postMessage({ 
+                type: 'generateDocumentation', 
+                docType: selectedType 
             });
         });
         
@@ -10088,6 +10583,29 @@ class ChatViewProvider {
                     break;
                 case 'summaryProgress':
                     showSummaryProgress(message.progress, message.message, message.count);
+                    break;
+                case 'systemPromptUpdate':
+                    // Update the system prompt textarea and indicator
+                    systemPromptTextarea.value = message.prompt || '';
+                    
+                    if (message.isDefault) {
+                        systemPromptIndicator.textContent = 'Default';
+                        systemPromptIndicator.classList.add('default');
+                        systemPromptIndicator.classList.remove('custom');
+                    } else {
+                        systemPromptIndicator.textContent = 'Custom';
+                        systemPromptIndicator.classList.remove('default');
+                        systemPromptIndicator.classList.add('custom');
+                    }
+                    
+                    if (message.saved) {
+                        systemPromptStatus.textContent = '✓ Saved';
+                        systemPromptStatus.classList.add('saved');
+                        setTimeout(() => {
+                            systemPromptStatus.textContent = 'Prepended to every query';
+                            systemPromptStatus.classList.remove('saved');
+                        }, 2000);
+                    }
                     break;
             }
         });
@@ -17664,10 +18182,16 @@ Be thorough but concise. Focus on the most important information.`;
 }
 
 // Generate comprehensive documentation as a .md file
-async function generateDocumentationFile(fileList, query) {
+async function generateDocumentationFile(fileList, query, docType = 'technical') {
     log('=== GENERATING DOCUMENTATION ===');
+    log('Documentation type:', docType);
     log('Files:', fileList.length);
     fileList.forEach(f => log('  -', f.name, '|', f.language, '|', f.size, 'chars'));
+    
+    debugLog('DOCS', `Starting ${docType} documentation generation`, {
+        files: fileList.length,
+        docType
+    });
     
     if (fileList.length === 0) {
         log('ERROR: No files to document');
@@ -17677,6 +18201,168 @@ async function generateDocumentationFile(fileList, query) {
         });
         return 'No files to document';
     }
+    
+    // Route to appropriate documentation generator
+    if (docType === 'business') {
+        return await generateBusinessDocumentation(fileList, query);
+    }
+    
+    // Default: Technical documentation (original behavior)
+    return await generateTechnicalDocumentation(fileList, query);
+}
+
+/**
+ * Generate Business Documentation (BRD-style)
+ * Focus on WHAT the code does, WHY it matters, customer value
+ */
+async function generateBusinessDocumentation(fileList, query) {
+    const projectName = getProjectName(fileList);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const fileName = `${projectName}-business-documentation-${timestamp}.md`;
+    
+    // Business documentation structure
+    let documentation = `# ${projectName} - Business Documentation
+    
+> **Document Type:** Business Requirements & Capabilities Overview
+> **Generated by:** AstraCode
+> **Date:** ${new Date().toLocaleDateString()}
+> **Source Files Analyzed:** ${fileList.length}
+
+---
+
+## Executive Summary
+
+`;
+
+    // Show progress
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `📊 **Generating Business Documentation**\n\nProject: **${projectName}**\nFiles: ${fileList.length}\nFocus: Business value & capabilities\n\n---\n\n`
+    });
+
+    // Generate executive summary
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Generating executive summary...\n\n`
+    });
+
+    const summaryPrompt = buildBusinessSummaryPrompt(fileList);
+    const summary = await callLanguageModelForDoc(summaryPrompt);
+    if (summary.error) {
+        documentation += `*This section describes the high-level business purpose of the system.*\n\n`;
+        documentation += generateIndexBasedBusinessSummary(fileList) + '\n\n';
+    } else {
+        documentation += summary.text + '\n\n';
+    }
+
+    documentation += `---\n\n## Business Capabilities\n\n`;
+
+    // Generate business capabilities
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Identifying business capabilities...\n\n`
+    });
+
+    const capabilitiesPrompt = buildBusinessCapabilitiesPrompt(fileList);
+    const capabilities = await callLanguageModelForDoc(capabilitiesPrompt);
+    if (capabilities.error) {
+        documentation += generateIndexBasedCapabilities(fileList) + '\n\n';
+    } else {
+        documentation += capabilities.text + '\n\n';
+    }
+
+    documentation += `---\n\n## User Stories & Use Cases\n\n`;
+
+    // Generate user stories
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Deriving user stories...\n\n`
+    });
+
+    const storiesPrompt = buildUserStoriesPrompt(fileList);
+    const stories = await callLanguageModelForDoc(storiesPrompt);
+    if (stories.error) {
+        documentation += `*User stories derived from code analysis.*\n\n`;
+    } else {
+        documentation += stories.text + '\n\n';
+    }
+
+    documentation += `---\n\n## Business Rules & Logic\n\n`;
+
+    // Generate business rules
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Extracting business rules...\n\n`
+    });
+
+    const rulesPrompt = buildBusinessRulesPrompt(fileList);
+    const rules = await callLanguageModelForDoc(rulesPrompt);
+    if (rules.error) {
+        documentation += generateIndexBasedBusinessRules(fileList) + '\n\n';
+    } else {
+        documentation += rules.text + '\n\n';
+    }
+
+    documentation += `---\n\n## Data & Information Flow\n\n`;
+
+    // Generate data flow (business perspective)
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Mapping information flow...\n\n`
+    });
+
+    const dataFlowPrompt = buildBusinessDataFlowPrompt(fileList);
+    const dataFlow = await callLanguageModelForDoc(dataFlowPrompt);
+    if (dataFlow.error) {
+        documentation += `*Information flow through the system.*\n\n`;
+    } else {
+        documentation += dataFlow.text + '\n\n';
+    }
+
+    documentation += `---\n\n## Integration Points & Dependencies\n\n`;
+
+    // Generate integrations
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Identifying integrations...\n\n`
+    });
+
+    const integrationsPrompt = buildIntegrationsPrompt(fileList);
+    const integrations = await callLanguageModelForDoc(integrationsPrompt);
+    if (integrations.error) {
+        documentation += `*External systems and integration points.*\n\n`;
+    } else {
+        documentation += integrations.text + '\n\n';
+    }
+
+    // Add glossary section
+    documentation += `---\n\n## Glossary of Business Terms\n\n`;
+    
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Building glossary...\n\n`
+    });
+
+    const glossaryPrompt = buildGlossaryPrompt(fileList);
+    const glossary = await callLanguageModelForDoc(glossaryPrompt);
+    if (!glossary.error) {
+        documentation += glossary.text + '\n\n';
+    }
+
+    // Add footer
+    documentation += `---
+
+*Generated by AstraCode - Business Documentation Mode*
+`;
+
+    // Save the file
+    return await saveDocumentationFile(documentation, fileName);
+}
+
+/**
+ * Generate Technical Documentation (original behavior)
+ */
+async function generateTechnicalDocumentation(fileList, query) {
     
     // Determine project name from common path or first file
     const projectName = getProjectName(fileList);
@@ -17819,19 +18505,79 @@ ${fileList.map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-')
     // Add footer
     documentation += `---
 
-*Generated by AstraCode*
+*Generated by AstraCode - Technical Documentation*
 `;
 
     // Save the file
+    return await saveDocumentationFile(documentation, fileName);
+}
+
+/**
+ * Clean up old documentation files (older than 4 hours)
+ * Only deletes .md files that match AstraCode naming pattern
+ */
+async function cleanupOldDocumentationFiles(astraDir) {
+    try {
+        const FOUR_HOURS_MS = 4 * 60 * 60 * 1000; // 4 hours in milliseconds
+        const now = Date.now();
+        
+        // Read directory contents
+        const entries = await vscode.workspace.fs.readDirectory(astraDir);
+        
+        let deletedCount = 0;
+        for (const [name, type] of entries) {
+            // Only process .md files that look like our generated documentation
+            if (type !== vscode.FileType.File) continue;
+            if (!name.endsWith('.md')) continue;
+            
+            // Check if it matches our naming pattern: *-documentation-*.md or *-business-documentation-*.md
+            if (!name.includes('-documentation-')) continue;
+            
+            const fileUri = vscode.Uri.joinPath(astraDir, name);
+            
+            try {
+                // Get file stats
+                const stat = await vscode.workspace.fs.stat(fileUri);
+                const fileAge = now - stat.mtime;
+                
+                if (fileAge > FOUR_HOURS_MS) {
+                    await vscode.workspace.fs.delete(fileUri);
+                    deletedCount++;
+                    log(`Cleaned up old documentation: ${name} (age: ${Math.round(fileAge / 60000)} minutes)`);
+                }
+            } catch (statError) {
+                // File might have been deleted already, skip
+                log(`Could not stat file ${name}: ${statError.message}`);
+            }
+        }
+        
+        if (deletedCount > 0) {
+            debugLog('DOCS', `Cleaned up ${deletedCount} old documentation file(s)`);
+        }
+        
+    } catch (error) {
+        // Don't fail if cleanup fails - it's not critical
+        log('Documentation cleanup error (non-critical):', error.message);
+    }
+}
+
+/**
+ * Save documentation file and show completion message
+ */
+async function saveDocumentationFile(documentation, fileName) {
     try {
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         let fileUri;
+        let astraDir;
         
         if (workspaceFolder) {
             // Save to .astra folder in workspace
-            const astraDir = vscode.Uri.joinPath(workspaceFolder.uri, '.astra');
+            astraDir = vscode.Uri.joinPath(workspaceFolder.uri, '.astra');
             await vscode.workspace.fs.createDirectory(astraDir);
             fileUri = vscode.Uri.joinPath(astraDir, fileName);
+            
+            // Clean up old documentation files (older than 4 hours)
+            await cleanupOldDocumentationFiles(astraDir);
         } else {
             // Save to temp location (use pathUtils for cross-platform compatibility)
             const tmpDir = require('os').tmpdir();
@@ -18541,6 +19287,451 @@ graph LR
 Be specific to the actual includes and imports found.`;
 }
 
+// ============================================================
+// BUSINESS DOCUMENTATION PROMPTS
+// These prompts generate documentation for business users,
+// product owners, and stakeholders - focusing on WHAT and WHY
+// ============================================================
+
+function buildBusinessSummaryPrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Build file content summary
+    const maxFilesForContent = 10;
+    const maxContentPerFile = 2000;
+    let totalContentLength = 0;
+    const fileContents = [];
+    
+    for (let i = 0; i < fileList.length && i < maxFilesForContent; i++) {
+        const f = fileList[i];
+        const content = contextFiles.get(f.path)?.content || '';
+        const truncatedContent = content.substring(0, maxContentPerFile);
+        
+        if (totalContentLength + truncatedContent.length > 25000) {
+            break;
+        }
+        fileContents.push(`FILE: ${f.name}\n${truncatedContent}${content.length > maxContentPerFile ? '...[truncated]' : ''}\n`);
+        totalContentLength += truncatedContent.length;
+    }
+    
+    return `You are a Business Analyst writing documentation for business stakeholders and product owners.
+Your audience is NON-TECHNICAL. They need to understand WHAT this system does and WHY it matters.
+
+Analyze these source files and write an EXECUTIVE SUMMARY.
+
+FILES (${fileList.length} total): ${fileNames}
+
+${fileContents.join('\n---\n')}
+
+Write an executive summary that answers:
+1. **What does this system/module do?** (Plain English, no technical jargon)
+2. **Who are the users?** (What roles or personas benefit from this?)
+3. **What business problem does it solve?** (Pain points addressed)
+4. **What is the business value?** (ROI, efficiency gains, risk reduction)
+
+Write in clear, business-friendly language. Avoid code references, function names, or technical implementation details.
+Use bullet points for key takeaways. Keep it to 200-300 words.`;
+}
+
+function buildBusinessCapabilitiesPrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Use code index to identify capabilities
+    let capabilities = '';
+    if (codeIndex.symbols.size > 0) {
+        const funcs = [];
+        for (const [key, sym] of codeIndex.symbols) {
+            if (['function', 'method', 'procedure'].includes(sym.type) && !key.includes('@')) {
+                funcs.push(sym);
+            }
+        }
+        capabilities = funcs.slice(0, 50).map(f => `- ${f.name} (${f.file})`).join('\n');
+    }
+    
+    // Get file content summary
+    const fileContents = fileList.slice(0, 5).map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        return `FILE: ${f.name}\n${content.substring(0, 1500)}...\n`;
+    }).join('\n---\n');
+    
+    return `You are a Business Analyst documenting system capabilities for product owners.
+Your audience is NON-TECHNICAL. Focus on WHAT the system can do, not HOW it does it.
+
+FILES: ${fileNames}
+
+CODE FUNCTIONS (for reference):
+${capabilities || 'No function index available'}
+
+FILE CONTENTS:
+${fileContents}
+
+Create a BUSINESS CAPABILITIES section with the following format:
+
+### Core Capabilities
+
+For each major capability, provide:
+
+| Capability | Description | Business Benefit |
+|------------|-------------|------------------|
+| [Name in business terms] | [What it does in plain English] | [Why it matters to the business] |
+
+### Feature List
+
+Group features into categories (e.g., "Data Management", "Reporting", "User Management"):
+
+**Category Name**
+- Feature 1: Brief description of what users can do
+- Feature 2: Brief description of what users can do
+
+Use business terminology. Convert technical function names to user-friendly descriptions.
+For example: "validate_ABA_routing" → "Validates bank routing numbers to prevent payment errors"`;
+}
+
+function buildUserStoriesPrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Get file content summary
+    const fileContents = fileList.slice(0, 8).map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        return `FILE: ${f.name}\n${content.substring(0, 1200)}...\n`;
+    }).join('\n---\n');
+    
+    return `You are a Business Analyst deriving user stories from existing code.
+Analyze the code to understand what users can do with this system.
+
+FILES: ${fileNames}
+
+${fileContents}
+
+Generate USER STORIES in standard Agile format. Group them by user persona/role.
+
+### User Personas
+First, identify the likely user personas based on the code (e.g., "Bank Operations User", "System Administrator", "Customer Service Rep")
+
+### User Stories by Persona
+
+For each persona, write 3-5 user stories:
+
+**As a [User Role]...**
+
+| ID | User Story | Acceptance Criteria |
+|----|------------|---------------------|
+| US-001 | As a [role], I want to [action] so that [benefit] | Given [context], when [action], then [result] |
+
+### Use Cases
+
+Describe 2-3 key use cases in narrative form:
+
+**Use Case: [Name]**
+- **Actor:** Who initiates this?
+- **Goal:** What are they trying to accomplish?
+- **Preconditions:** What must be true before starting?
+- **Main Flow:** Step-by-step what happens (business terms only)
+- **Success Outcome:** What does success look like?
+
+Focus on business outcomes, not technical implementation.`;
+}
+
+function buildBusinessRulesPrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Get file content, focusing on validation and business logic
+    const fileContents = fileList.slice(0, 8).map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        return `FILE: ${f.name}\n${content.substring(0, 1500)}...\n`;
+    }).join('\n---\n');
+    
+    return `You are a Business Analyst extracting BUSINESS RULES from code.
+Look for validation logic, calculations, conditions, and constraints.
+
+FILES: ${fileNames}
+
+${fileContents}
+
+Extract and document BUSINESS RULES in a format business users can understand.
+
+### Business Rules
+
+| Rule ID | Rule Name | Description | Condition | Action/Outcome |
+|---------|-----------|-------------|-----------|----------------|
+| BR-001 | [Descriptive name] | [What this rule enforces] | [When it applies] | [What happens] |
+
+### Validation Rules
+
+| Field/Data | Validation | Error Message (if applicable) |
+|------------|------------|-------------------------------|
+| [What's being validated] | [The rule in plain English] | [What users see if invalid] |
+
+### Calculations & Formulas
+
+| Calculation | Purpose | Formula (business terms) |
+|-------------|---------|--------------------------|
+| [Name] | [Why needed] | [Plain English explanation] |
+
+### Decision Logic
+
+For complex decisions, use decision tables:
+
+**Decision: [Name]**
+| Condition 1 | Condition 2 | Action |
+|-------------|-------------|--------|
+| Yes | Yes | Do X |
+| Yes | No | Do Y |
+
+Translate code logic into business rules. Avoid code syntax - use plain English.`;
+}
+
+function buildBusinessDataFlowPrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Get file content summary
+    const fileContents = fileList.slice(0, 6).map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        return `FILE: ${f.name}\n${content.substring(0, 1500)}...\n`;
+    }).join('\n---\n');
+    
+    return `You are a Business Analyst documenting how INFORMATION flows through the system.
+Focus on what data moves where, not technical implementation.
+
+FILES: ${fileNames}
+
+${fileContents}
+
+Create an INFORMATION FLOW section for business stakeholders.
+
+### Data Entities
+
+| Entity | Description | Key Attributes |
+|--------|-------------|----------------|
+| [Name in business terms] | [What it represents] | [Important fields in plain English] |
+
+### Information Flow Diagram
+
+Describe the flow in a business-friendly way:
+
+\`\`\`
+[Input Source] → [Process/Action] → [Output/Destination]
+\`\`\`
+
+Example:
+\`\`\`
+Customer Request → Validation → Payment Processing → Bank Confirmation → Customer Receipt
+\`\`\`
+
+### Process Steps
+
+1. **Step Name:** What happens (in business terms)
+   - Input: What data comes in
+   - Output: What data goes out
+   - Business Rule: Any rules applied
+
+### Data Touchpoints
+
+| Stage | Data Used | Data Created/Modified |
+|-------|-----------|----------------------|
+| [Stage name] | [What info is read] | [What info is written] |
+
+Use business terminology. Describe data in terms users understand (e.g., "customer information" not "struct Customer").`;
+}
+
+function buildIntegrationsPrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Look for external calls, APIs, connections
+    const fileContents = fileList.slice(0, 8).map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        return `FILE: ${f.name}\n${content.substring(0, 1500)}...\n`;
+    }).join('\n---\n');
+    
+    return `You are a Business Analyst documenting SYSTEM INTEGRATIONS for stakeholders.
+Identify how this system connects to other systems, services, or data sources.
+
+FILES: ${fileNames}
+
+${fileContents}
+
+Create an INTEGRATION POINTS section.
+
+### External Systems
+
+| System/Service | Direction | Purpose | Data Exchanged |
+|----------------|-----------|---------|----------------|
+| [Name] | Inbound/Outbound/Both | [Why we integrate] | [What data flows] |
+
+### Integration Diagram
+
+\`\`\`
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│   External   │ ──→  │  Our System  │  ──→ │   External   │
+│   System A   │      │              │      │   System B   │
+└──────────────┘      └──────────────┘      └──────────────┘
+\`\`\`
+
+### Data Sources
+
+| Source | Type | Purpose |
+|--------|------|---------|
+| [Name] | Database/File/API/etc | [What data we get] |
+
+### Downstream Consumers
+
+| Consumer | What They Receive | Frequency |
+|----------|-------------------|-----------|
+| [System/Team] | [Data/Reports/etc] | [Real-time/Daily/etc] |
+
+### Dependencies
+
+List any external services or systems this code depends on:
+- **Required:** Systems that must be available
+- **Optional:** Systems that enhance functionality
+
+Use business names for systems (e.g., "Core Banking System" not "CBS_API_v2").`;
+}
+
+function buildGlossaryPrompt(fileList) {
+    const fileNames = fileList.map(f => f.name).join(', ');
+    
+    // Get file content to extract terms
+    const fileContents = fileList.slice(0, 10).map(f => {
+        const content = contextFiles.get(f.path)?.content || '';
+        return `FILE: ${f.name}\n${content.substring(0, 1000)}...\n`;
+    }).join('\n---\n');
+    
+    return `You are a Business Analyst creating a GLOSSARY of business terms found in this codebase.
+Extract domain-specific terms, acronyms, and business concepts.
+
+FILES: ${fileNames}
+
+${fileContents}
+
+Create a GLOSSARY section for business users.
+
+### Acronyms & Abbreviations
+
+| Acronym | Full Name | Definition |
+|---------|-----------|------------|
+| [e.g., ABA] | [American Bankers Association] | [What it means in this context] |
+
+### Business Terms
+
+| Term | Definition | Related Terms |
+|------|------------|---------------|
+| [Term] | [Plain English definition] | [Related concepts] |
+
+### Domain Concepts
+
+| Concept | Description | Example |
+|---------|-------------|---------|
+| [Concept] | [What it means to the business] | [Real-world example] |
+
+Include:
+- Any industry-specific terms (banking, payments, etc.)
+- Acronyms found in variable names or comments
+- Business concepts implied by the code logic
+- Terms that non-technical stakeholders need to understand
+
+Sort alphabetically. Keep definitions concise (1-2 sentences).`;
+}
+
+// Business documentation fallback functions (when LLM is unavailable)
+
+function generateIndexBasedBusinessSummary(fileList) {
+    let summary = '';
+    
+    // Count functions and files
+    const funcCount = codeIndex.symbols.size;
+    const fileCount = fileList.length;
+    
+    summary += `This system consists of ${fileCount} source files containing approximately ${funcCount} functions and components.\n\n`;
+    
+    // Try to identify purpose from file names
+    const fileTypes = {};
+    fileList.forEach(f => {
+        const name = f.name.toLowerCase();
+        if (name.includes('payment') || name.includes('pay')) fileTypes.payments = true;
+        if (name.includes('valid') || name.includes('check')) fileTypes.validation = true;
+        if (name.includes('report') || name.includes('output')) fileTypes.reporting = true;
+        if (name.includes('user') || name.includes('auth')) fileTypes.userManagement = true;
+        if (name.includes('data') || name.includes('db')) fileTypes.dataManagement = true;
+    });
+    
+    if (Object.keys(fileTypes).length > 0) {
+        summary += `**Identified capabilities:**\n`;
+        if (fileTypes.payments) summary += `- Payment processing functionality\n`;
+        if (fileTypes.validation) summary += `- Data validation and verification\n`;
+        if (fileTypes.reporting) summary += `- Reporting and output generation\n`;
+        if (fileTypes.userManagement) summary += `- User management features\n`;
+        if (fileTypes.dataManagement) summary += `- Data management and storage\n`;
+    }
+    
+    return summary;
+}
+
+function generateIndexBasedCapabilities(fileList) {
+    let capabilities = '';
+    
+    // Group functions by apparent purpose
+    const groups = {
+        'Data Processing': [],
+        'Validation': [],
+        'Reporting': [],
+        'User Operations': [],
+        'Other': []
+    };
+    
+    for (const [key, sym] of codeIndex.symbols) {
+        if (!['function', 'method', 'procedure'].includes(sym.type)) continue;
+        const name = sym.name.toLowerCase();
+        
+        if (name.includes('valid') || name.includes('check') || name.includes('verify')) {
+            groups['Validation'].push(sym.name);
+        } else if (name.includes('report') || name.includes('print') || name.includes('output')) {
+            groups['Reporting'].push(sym.name);
+        } else if (name.includes('user') || name.includes('auth') || name.includes('login')) {
+            groups['User Operations'].push(sym.name);
+        } else if (name.includes('process') || name.includes('handle') || name.includes('parse')) {
+            groups['Data Processing'].push(sym.name);
+        } else {
+            groups['Other'].push(sym.name);
+        }
+    }
+    
+    for (const [group, items] of Object.entries(groups)) {
+        if (items.length > 0) {
+            capabilities += `### ${group}\n\n`;
+            items.slice(0, 10).forEach(item => {
+                capabilities += `- ${item}\n`;
+            });
+            if (items.length > 10) capabilities += `- ...and ${items.length - 10} more\n`;
+            capabilities += '\n';
+        }
+    }
+    
+    return capabilities || '*Capabilities will be documented when LLM is available.*';
+}
+
+function generateIndexBasedBusinessRules(fileList) {
+    let rules = '';
+    
+    // Look for validation functions as indicators of business rules
+    let ruleCount = 1;
+    for (const [key, sym] of codeIndex.symbols) {
+        if (!['function', 'method', 'procedure'].includes(sym.type)) continue;
+        const name = sym.name.toLowerCase();
+        
+        if (name.includes('valid') || name.includes('check') || name.includes('verify')) {
+            rules += `| BR-${String(ruleCount).padStart(3, '0')} | ${sym.name} | See function in ${sym.file} |\n`;
+            ruleCount++;
+            if (ruleCount > 20) break;
+        }
+    }
+    
+    if (rules) {
+        return `| Rule ID | Rule Name | Reference |\n|---------|-----------|------------|\n${rules}`;
+    }
+    return '*Business rules will be extracted when LLM is available.*';
+}
+
 async function handleApiMode(text, apiUrl, config) {
     log('API MODE: Searching codebase');
     
@@ -19166,6 +20357,16 @@ async function callLanguageModel(prompt, taskType = null) {
         taskType = detectTaskType(prompt);
     }
     
+    // Prepend system prompt (only for user-facing queries, not internal calls)
+    // Skip for classification, docs generation, and summary tasks
+    const skipSystemPromptTasks = ['classification', 'docs', 'summary'];
+    if (!skipSystemPromptTasks.includes(taskType)) {
+        const systemPrompt = getSystemPrompt();
+        if (systemPrompt) {
+            prompt = `<system_prompt>\n${systemPrompt}\n</system_prompt>\n\n${prompt}`;
+        }
+    }
+    
     // Get the appropriate model based on task type
     let preferredModel = null;
     switch (taskType) {
@@ -19186,7 +20387,8 @@ async function callLanguageModel(prompt, taskType = null) {
     debugLog('LLM', `Model selection`, {
         taskType,
         preferredModel,
-        promptSize: prompt.length
+        promptSize: prompt.length,
+        hasSystemPrompt: !skipSystemPromptTasks.includes(taskType)
     });
     
     // Get provider order based on task type
@@ -20539,7 +21741,7 @@ let contextTreeProvider;
 
 function activate(context) {
     outputChannel = vscode.window.createOutputChannel('AstraCode');
-    log('AstraCode v4.9.77 activating...');
+    log('AstraCode v4.9.80 activating...');
     
     // Create status bar item for summary progress
     summaryStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
