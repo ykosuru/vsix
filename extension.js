@@ -1,7 +1,7 @@
 /**
- * AstraCode v4.9.76 - Agentic Code Assistant
+ * AstraCode v4.9.77 - Agentic Code Assistant
  * 
- * CLEAN 3-LAYER SEARCH ARCHITECTURE (v4.9.76)
+ * CLEAN 3-LAYER SEARCH ARCHITECTURE (v4.9.77)
  * ============================================
  * 
  * ┌─────────────────────────────────────────────────────────┐
@@ -9188,12 +9188,24 @@ class ChatViewProvider {
                     // Open a file in the editor
                     if (message.filePath) {
                         try {
+                            debugLog('DOCS', 'Opening file from path', message.filePath);
                             const fileUri = vscode.Uri.file(message.filePath);
                             const doc = await vscode.workspace.openTextDocument(fileUri);
-                            await vscode.window.showTextDocument(doc, { preview: false });
+                            await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside });
                             log('Opened file:', message.filePath);
+                            
+                            // If it's a .md file, try to open preview
+                            if (message.filePath.toLowerCase().endsWith('.md')) {
+                                setTimeout(async () => {
+                                    try {
+                                        await vscode.commands.executeCommand('markdown.showPreview', fileUri);
+                                    } catch (e) {
+                                        log('Markdown preview failed:', e.message);
+                                    }
+                                }, 300);
+                            }
                         } catch (err) {
-                            log('Error opening file:', err.message);
+                            debugLog('DOCS', `Error opening file: ${err.message}`);
                             vscode.window.showErrorMessage(`Could not open file: ${message.filePath}`);
                         }
                     }
@@ -9206,6 +9218,39 @@ class ChatViewProvider {
                             await vscode.commands.executeCommand('revealFileInOS', fileUri);
                         } catch (err) {
                             log('Error revealing file:', err.message);
+                        }
+                    }
+                    break;
+                case 'openFileUri':
+                    // Open a file by URI string (used for command: links)
+                    if (message.fileUri) {
+                        try {
+                            debugLog('DOCS', 'Opening file from URI', message.fileUri);
+                            const fileUri = vscode.Uri.parse(message.fileUri);
+                            const doc = await vscode.workspace.openTextDocument(fileUri);
+                            await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside });
+                            // Also try to open markdown preview
+                            setTimeout(async () => {
+                                try {
+                                    await vscode.commands.executeCommand('markdown.showPreview', fileUri);
+                                } catch (e) {
+                                    log('Markdown preview failed:', e.message);
+                                }
+                            }, 300);
+                        } catch (err) {
+                            debugLog('DOCS', `Error opening file URI: ${err.message}`);
+                            vscode.window.showErrorMessage(`Could not open file: ${err.message}`);
+                        }
+                    }
+                    break;
+                case 'executeCommand':
+                    // Execute a VS Code command
+                    if (message.command) {
+                        try {
+                            debugLog('DOCS', 'Executing command', { command: message.command, args: message.args });
+                            await vscode.commands.executeCommand(message.command, ...(message.args || []));
+                        } catch (err) {
+                            log('Error executing command:', err.message);
                         }
                     }
                     break;
@@ -9407,6 +9452,32 @@ class ChatViewProvider {
         .message-content .file-link:hover {
             color: var(--vscode-textLink-activeForeground);
             background-color: var(--vscode-button-hoverBackground);
+        }
+        
+        .message-content .doc-link-btn {
+            cursor: pointer;
+            color: var(--vscode-button-foreground);
+            background-color: var(--vscode-button-background);
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: 500;
+            margin: 4px 0;
+            display: inline-block;
+        }
+        
+        .message-content .doc-link-btn:hover {
+            background-color: var(--vscode-button-hoverBackground);
+        }
+        
+        .message-content .external-link {
+            color: var(--vscode-textLink-foreground);
+            text-decoration: underline;
+        }
+        
+        .message-content .external-link:hover {
+            color: var(--vscode-textLink-activeForeground);
         }
         
         .message-content h1, .message-content h2, .message-content h3 {
@@ -10292,6 +10363,26 @@ class ChatViewProvider {
             // Render blockquotes
             html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
             
+            // Render markdown links [text](url)
+            // Handle command: links specially - convert to clickable buttons
+            html = html.replace(/\\[([^\\]]+)\\]\\(command:([^)]+)\\)/g, function(match, text, command) {
+                // Decode the command URL and extract the file URI
+                try {
+                    const decoded = decodeURIComponent(command);
+                    // Extract the command name and args
+                    const parts = decoded.split('?');
+                    const cmdName = parts[0];
+                    const args = parts[1] ? JSON.parse(parts[1]) : [];
+                    // Store as data attributes for click handler
+                    return '<button class="doc-link-btn" data-command="' + cmdName + '" data-args="' + encodeURIComponent(JSON.stringify(args)) + '">' + text + '</button>';
+                } catch (e) {
+                    return '<button class="doc-link-btn" data-command="' + command + '">' + text + '</button>';
+                }
+            });
+            
+            // Render regular markdown links
+            html = html.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" class="external-link">$1</a>');
+            
             // Preserve line breaks
             html = html.replace(/\\n/g, '<br>');
             
@@ -10306,9 +10397,15 @@ class ChatViewProvider {
                 // Check if it's a file path
                 const pathMatch = code.match(/<code class="inline-code">([^<]+)<\\/code>/);
                 if (pathMatch) {
-                    const path = pathMatch[1];
-                    if (/\\.(java|py|js|ts|c|cpp|go|rs|rb|cs|kt|swift|php|sql|md|txt|json|xml|html|yaml|yml|tal|cbl|cobol)$/i.test(path)) {
-                        code = '<code class="inline-code file-link" data-path="' + path + '" title="Click to open in VS Code">📄 ' + path + '</code>';
+                    const filePath = pathMatch[1];
+                    // Check for file extensions (relative or absolute paths)
+                    // Match both: myfile.md and C:\\Users\\path\\myfile.md and /tmp/myfile.md
+                    const hasFileExt = /\\.(java|py|js|ts|c|cpp|go|rs|rb|cs|kt|swift|php|sql|md|txt|json|xml|html|yaml|yml|tal|cbl|cobol)$/i.test(filePath);
+                    // Also check if it looks like a full path (starts with / or drive letter)
+                    const isFullPath = /^([A-Za-z]:|[\\/])/.test(filePath);
+                    
+                    if (hasFileExt) {
+                        code = '<code class="inline-code file-link" data-path="' + filePath + '" title="Click to open in VS Code">📄 ' + filePath + '</code>';
                     }
                 }
                 html = html.replace('___INLINECODE_' + i + '___', code);
@@ -10328,6 +10425,24 @@ class ChatViewProvider {
                 const filePath = e.target.dataset.path || e.target.textContent;
                 if (filePath) {
                     vscode.postMessage({ type: 'openFile', filePath: filePath });
+                }
+            }
+            // Handle doc-link-btn clicks (command links from markdown)
+            if (e.target.classList.contains('doc-link-btn')) {
+                const command = e.target.dataset.command;
+                let args = [];
+                try {
+                    args = JSON.parse(decodeURIComponent(e.target.dataset.args || '[]'));
+                } catch (err) {
+                    console.log('Could not parse args:', err);
+                }
+                if (command) {
+                    // For vscode.open command, extract the URI
+                    if (command === 'vscode.open' && args.length > 0) {
+                        vscode.postMessage({ type: 'openFileUri', fileUri: args[0] });
+                    } else {
+                        vscode.postMessage({ type: 'executeCommand', command: command, args: args });
+                    }
                 }
             }
             // Handle code block clicks (copy to clipboard)
@@ -17725,29 +17840,93 @@ ${fileList.map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-')
         
         await vscode.workspace.fs.writeFile(fileUri, Buffer.from(documentation, 'utf-8'));
         
-        log('Documentation saved to:', fileUri.fsPath);
+        debugLog('DOCS', 'Documentation saved', {
+            path: fileUri.fsPath,
+            platform: process.platform,
+            size: documentation.length
+        });
         
-        // Open the file with preview
-        const doc = await vscode.workspace.openTextDocument(fileUri);
-        await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside });
+        // Open the file - use async/await properly and add delays for Windows
+        let openedSuccessfully = false;
+        let previewOpened = false;
         
-        // Try to open markdown preview
-        await vscode.commands.executeCommand('markdown.showPreview', fileUri);
+        try {
+            debugLog('DOCS', 'Opening text document...');
+            const doc = await vscode.workspace.openTextDocument(fileUri);
+            
+            debugLog('DOCS', 'Showing text document...');
+            await vscode.window.showTextDocument(doc, { 
+                preview: false, 
+                viewColumn: vscode.ViewColumn.Beside,
+                preserveFocus: false  // Focus on the new document
+            });
+            openedSuccessfully = true;
+            
+            // Small delay before trying markdown preview (helps on Windows)
+            await new Promise(resolve => setTimeout(resolve, 300));
+            
+            // Try to open markdown preview
+            debugLog('DOCS', 'Opening markdown preview...');
+            try {
+                await vscode.commands.executeCommand('markdown.showPreview', fileUri);
+                previewOpened = true;
+                debugLog('DOCS', 'Markdown preview opened successfully');
+            } catch (previewError) {
+                debugLog('DOCS', `Markdown preview failed: ${previewError.message}`);
+                // Preview failed, but document is still open - that's ok
+            }
+            
+        } catch (openError) {
+            debugLog('DOCS', `Error opening document: ${openError.message}`);
+            // Try alternative method - reveal in explorer
+            try {
+                await vscode.commands.executeCommand('revealFileInOS', fileUri);
+            } catch (revealError) {
+                debugLog('DOCS', `Reveal in OS also failed: ${revealError.message}`);
+            }
+        }
+        
+        // Build completion message with clickable link
+        const filePathDisplay = fileUri.fsPath;
+        const openCommand = `command:vscode.open?${encodeURIComponent(JSON.stringify([fileUri.toString()]))}`;
+        
+        let completionMessage = `\n\n✅ **Documentation Complete!**\n\n`;
+        completionMessage += `📄 **File saved to:** \`${filePathDisplay}\`\n\n`;
+        
+        // Add clickable link to open the file
+        completionMessage += `👉 **[Click here to open the documentation](${openCommand})**\n\n`;
+        
+        if (openedSuccessfully) {
+            if (previewOpened) {
+                completionMessage += `*The documentation has been opened with Markdown preview.*`;
+            } else {
+                completionMessage += `*The documentation has been opened. Use Ctrl+Shift+V (Cmd+Shift+V on Mac) to open Markdown preview.*`;
+            }
+        } else {
+            completionMessage += `*Could not auto-open the file. Please open it manually from the path above.*`;
+        }
         
         chatWebviewView?.webview.postMessage({ 
             type: 'appendResponse', 
-            text: `\n\n✅ **Documentation Complete!**\n\n📄 Saved to: \`${fileUri.fsPath}\`\n\nThe documentation has been opened in a new tab with Markdown preview.`
+            text: completionMessage
+        });
+        
+        // Also send a separate message with just the file link for easy access
+        chatWebviewView?.webview.postMessage({ 
+            type: 'documentationComplete', 
+            filePath: fileUri.fsPath,
+            fileUri: fileUri.toString()
         });
         
         return `Documentation generated successfully! See the new tab for rendered output.`;
         
     } catch (error) {
-        log('Error saving documentation:', error);
+        debugLog('DOCS', `Error saving documentation: ${error.message}`);
         
         // Return the documentation as text if we can't save
         chatWebviewView?.webview.postMessage({ 
             type: 'appendResponse', 
-            text: `\n\n⚠️ Could not save file. Here's the documentation:\n\n---\n\n${documentation}`
+            text: `\n\n⚠️ Could not save file (${error.message}). Here's the documentation:\n\n---\n\n${documentation}`
         });
         
         return documentation;
@@ -20360,7 +20539,7 @@ let contextTreeProvider;
 
 function activate(context) {
     outputChannel = vscode.window.createOutputChannel('AstraCode');
-    log('AstraCode v4.9.76 activating...');
+    log('AstraCode v4.9.77 activating...');
     
     // Create status bar item for summary progress
     summaryStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
