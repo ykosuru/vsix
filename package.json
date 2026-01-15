@@ -2,9 +2,9 @@
   "name": "astra-standalone",
   "displayName": "AstraCode - AI Code Assistant",
   "description": "Standalone AI code assistant with explicit context control",
-  "version": "4.9.24",
+  "version": "4.9.73",
   "publisher": "astra",
-  "license": "MIT",
+  "license": "Wells Fargo",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -77,6 +77,10 @@
         "title": "AstraCode: Toggle API/Local Mode"
       },
       {
+        "command": "astra.toggleVerbose",
+        "title": "AstraCode: Toggle Verbose Search (Debug)"
+      },
+      {
         "command": "astra.addSelectionToContext",
         "title": "AstraCode: Add Selection to Context"
       },
@@ -84,6 +88,11 @@
         "command": "astra.rebuildIndex",
         "title": "Rebuild Index",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "astra.generateSummaries",
+        "title": "Generate Function Summaries",
+        "icon": "$(book)"
       },
       {
         "command": "astra.clearIndex",
@@ -136,19 +145,24 @@
           "group": "navigation@1"
         },
         {
-          "command": "astra.clearIndex",
+          "command": "astra.generateSummaries",
           "when": "view == astra.contextView",
           "group": "navigation@2"
         },
         {
-          "command": "astra.showIndexStats",
+          "command": "astra.clearIndex",
           "when": "view == astra.contextView",
           "group": "navigation@3"
         },
         {
-          "command": "astra.clearContext",
+          "command": "astra.showIndexStats",
           "when": "view == astra.contextView",
           "group": "navigation@4"
+        },
+        {
+          "command": "astra.clearContext",
+          "when": "view == astra.contextView",
+          "group": "navigation@5"
         }
       ],
       "editor/context": [
@@ -249,7 +263,64 @@
             "o1-preview - OpenAI reasoning model",
             "o1-mini - OpenAI reasoning (faster)"
           ],
-          "description": "Which model to use within GitHub Copilot"
+          "description": "Which model to use within GitHub Copilot for code generation"
+        },
+        "astra.llm.classificationModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "enum": [
+            "gpt-4o-mini",
+            "gpt-3.5-turbo",
+            "claude-3-haiku",
+            "claude-sonnet-4",
+            "gpt-4o"
+          ],
+          "enumDescriptions": [
+            "GPT-4o Mini - Fast & cheap, great for classification (recommended)",
+            "GPT-3.5 Turbo - Fastest, very cheap",
+            "Claude 3 Haiku - Fast Anthropic model",
+            "Claude Sonnet 4 - Use same as coding model",
+            "GPT-4o - Higher quality but slower/costlier"
+          ],
+          "description": "Lightweight model for query classification and planning (saves tokens/cost)"
+        },
+        "astra.llm.documentationModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "enum": [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "claude-sonnet-4",
+            "claude-3.5-sonnet",
+            "gpt-3.5-turbo"
+          ],
+          "enumDescriptions": [
+            "GPT-4o Mini - Fast & cost-effective for docs (recommended)",
+            "GPT-4o - Higher quality documentation",
+            "Claude Sonnet 4 - Best for technical writing",
+            "Claude 3.5 Sonnet - Great for documentation",
+            "GPT-3.5 Turbo - Fastest, basic quality"
+          ],
+          "description": "Model for documentation generation, summaries, and explanations"
+        },
+        "astra.llm.codegenModel": {
+          "type": "string",
+          "default": "claude-sonnet-4",
+          "enum": [
+            "claude-sonnet-4",
+            "claude-3.5-sonnet",
+            "gpt-4o",
+            "o1-mini",
+            "gpt-4o-mini"
+          ],
+          "enumDescriptions": [
+            "Claude Sonnet 4 - Best for code generation (recommended)",
+            "Claude 3.5 Sonnet - Great for coding",
+            "GPT-4o - Strong coding abilities",
+            "o1-mini - Good for complex logic",
+            "GPT-4o Mini - Faster, basic coding"
+          ],
+          "description": "Model for code generation, translation, and refactoring tasks"
         },
         "astra.llm.anthropicModel": {
           "type": "string",
@@ -304,6 +375,11 @@
           "type": "boolean",
           "default": true,
           "description": "Enable Java compilation after translation"
+        },
+        "astra.indexing.enableAutoSummary": {
+          "type": "boolean",
+          "default": true,
+          "description": "Generate LLM summaries during indexing (enables smart overview queries)"
         }
       }
     }
