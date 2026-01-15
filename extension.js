@@ -1,7 +1,7 @@
 /**
- * AstraCode v4.9.73 - Agentic Code Assistant
+ * AstraCode v4.9.76 - Agentic Code Assistant
  * 
- * CLEAN 3-LAYER SEARCH ARCHITECTURE (v4.9.73)
+ * CLEAN 3-LAYER SEARCH ARCHITECTURE (v4.9.76)
  * ============================================
  * 
  * ┌─────────────────────────────────────────────────────────┐
@@ -32,6 +32,7 @@
 
 const vscode = require('vscode');
 const path = require('path');
+const pathUtils = require('./pathUtils');
 
 // ============================================================
 // State Management
@@ -244,6 +245,36 @@ function log(...args) {
     const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
     outputChannel?.appendLine(`[${timestamp}] ${message}`);
     console.log(`[AstraCode] ${message}`);
+}
+
+/**
+ * Debug log that shows in chat panel when debug mode is enabled
+ * Use this for user-visible debug information
+ */
+function debugLog(category, message, data = null) {
+    const config = vscode.workspace.getConfiguration('astra');
+    const debugMode = config.get('debugMode', false);
+    
+    // Always log to output channel
+    log(`[${category}]`, message, data || '');
+    
+    // If debug mode is on, also show in chat
+    if (debugMode && chatWebviewView) {
+        let debugText = `\n🔧 **[${category}]** ${message}`;
+        if (data !== null) {
+            if (typeof data === 'object') {
+                debugText += `\n\`\`\`json\n${JSON.stringify(data, null, 2).substring(0, 500)}\n\`\`\``;
+            } else {
+                debugText += `: \`${data}\``;
+            }
+        }
+        debugText += '\n';
+        
+        chatWebviewView.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: debugText 
+        });
+    }
 }
 
 /**
@@ -1030,7 +1061,7 @@ async function summarizeFunctionBatch(functions) {
         const truncatedCode = funcCode.substring(0, SUMMARY_CONFIG.MAX_FUNCTION_SIZE);
         functionCodes.push({ func, code: truncatedCode });
         
-        batchContent += `\n### ${func.name} (${func.type} in ${func.file?.split('/').pop()}:${func.line})
+        batchContent += `\n### ${func.name} (${func.type} in ${pathUtils.getFileName(func.file)}:${func.line})
 \`\`\`
 ${truncatedCode}
 \`\`\`
@@ -1333,15 +1364,15 @@ async function generateFileSummaries() {
     
     log(`generateFileSummaries: Processing ${files.length} files`);
     
-    for (const [path, file] of files) {
+    for (const [filePath, file] of files) {
         if (taskController.isCancelled) break;
         
-        const fileName = path.split('/').pop();
+        const fileName = pathUtils.getFileName(filePath);
         
         // Get function summaries for this file
         const fileFuncSummaries = [];
         for (const [key, summary] of codeIndex.summaries) {
-            if (summary.file === path) {
+            if (summary.file === filePath) {
                 fileFuncSummaries.push(`- ${summary.name}: ${summary.summary}`);
             }
         }
@@ -1374,11 +1405,12 @@ async function generateOverallSummary() {
     
     // Group file summaries by module for better synthesis
     const moduleMap = new Map();
-    for (const [path, summary] of codeIndex.fileSummaries) {
-        const parts = path.split('/');
+    for (const [filePath, summary] of codeIndex.fileSummaries) {
+        const parts = pathUtils.splitPath(filePath);
         const module = parts.length > 2 ? parts.slice(-3, -1).join('/') : parts.slice(0, -1).join('/') || 'root';
+        const fileName = pathUtils.getFileName(filePath);
         if (!moduleMap.has(module)) moduleMap.set(module, []);
-        moduleMap.get(module).push({ file: parts.pop(), summary });
+        moduleMap.get(module).push({ file: fileName, summary });
     }
     
     // Build module-level summary text
@@ -1472,8 +1504,8 @@ function discoverDomain() {
     
     // Analyze top-level directories
     const dirCounts = new Map();
-    for (const [path] of contextFiles) {
-        const parts = path.split('/');
+    for (const [filePath] of contextFiles) {
+        const parts = pathUtils.splitPath(filePath);
         if (parts.length > 1) {
             const topDir = parts.slice(0, Math.min(3, parts.length - 1)).join('/');
             dirCounts.set(topDir, (dirCounts.get(topDir) || 0) + 1);
@@ -1491,7 +1523,7 @@ function discoverDomain() {
         .map(([lang]) => lang);
     
     const topTerms = Array.from(domain.keyTerms.keys()).slice(0, 10);
-    const topModules = domain.modules.slice(0, 5).map(m => m.name.split('/').pop());
+    const topModules = domain.modules.slice(0, 5).map(m => pathUtils.getFileName(m.name));
     
     domain.description = `${langList.join('/')} codebase with ${contextFiles.size} files. ` +
         `Key areas: ${topModules.join(', ')}. ` +
@@ -1555,17 +1587,18 @@ function getHighLevelContext() {
     // ================================================================
     const moduleTree = new Map(); // "backend/access" -> { submodules: Map<"brin" -> files[]> }
     
-    for (const [path, summary] of codeIndex.fileSummaries) {
-        const parts = path.split('/');
-        const fileName = parts.pop();
+    for (const [filePath, summary] of codeIndex.fileSummaries) {
+        const parts = pathUtils.splitPath(filePath);
+        const fileName = pathUtils.getFileName(filePath);
         
         // Get module path (2 levels up from file)
         let modulePath, submodule;
-        if (parts.length >= 2) {
-            modulePath = parts.slice(-3, -1).join('/') || parts.slice(-2).join('/');
-            submodule = parts[parts.length - 1];
+        const dirParts = parts.slice(0, -1); // Exclude file name
+        if (dirParts.length >= 2) {
+            modulePath = dirParts.slice(-3, -1).join('/') || dirParts.slice(-2).join('/');
+            submodule = dirParts[dirParts.length - 1];
         } else {
-            modulePath = parts.join('/') || 'root';
+            modulePath = dirParts.join('/') || 'root';
             submodule = 'main';
         }
         
@@ -1657,8 +1690,8 @@ function getHighLevelContext() {
                 entryPoints.push({
                     name,
                     calls,
-                    file: symbol.file?.split('/').pop(),
-                    module: symbol.file?.split('/').slice(-2, -1)[0] || '?',
+                    file: pathUtils.getFileName(symbol.file),
+                    module: pathUtils.getParentDirName(symbol.file) || '?',
                     summary: summary?.summary || ''
                 });
             }
@@ -1739,9 +1772,8 @@ async function generateQuickOverview(query) {
     
     for (const [filePath, file] of contextFiles) {
         // Get directory path (module)
-        const parts = filePath.split('/');
-        const fileName = parts.pop();
-        const dirPath = parts.join('/') || 'root';
+        const fileName = pathUtils.getFileName(filePath);
+        const dirPath = pathUtils.getParentDir(filePath) || 'root';
         
         // Get or create module entry
         if (!moduleTree.has(dirPath)) {
@@ -1840,8 +1872,8 @@ async function generateQuickOverview(query) {
             calls: calls.size, 
             callers, 
             total: calls.size + callers,
-            file: symbol?.file?.split('/').pop() || '?',
-            module: symbol?.file?.split('/').slice(-2, -1)[0] || '?'
+            file: pathUtils.getFileName(symbol?.file) || '?',
+            module: pathUtils.getParentDirName(symbol?.file) || '?'
         });
     }
     funcConnections.sort((a, b) => b.total - a.total);
@@ -1878,8 +1910,8 @@ async function generateQuickOverview(query) {
                 entryPoints.push({
                     name,
                     calls,
-                    file: symbol.file?.split('/').pop() || '?',
-                    module: symbol.file?.split('/').slice(-2, -1)[0] || '?'
+                    file: pathUtils.getFileName(symbol.file) || '?',
+                    module: pathUtils.getParentDirName(symbol.file) || '?'
                 });
             }
         }
@@ -1904,8 +1936,8 @@ async function generateQuickOverview(query) {
             dataStructures.push({
                 name: symbol.name,
                 type: symbol.type,
-                file: symbol.file?.split('/').pop() || '?',
-                module: symbol.file?.split('/').slice(-2, -1)[0] || '?'
+                file: pathUtils.getFileName(symbol.file) || '?',
+                module: pathUtils.getParentDirName(symbol.file) || '?'
             });
         }
     }
@@ -1994,7 +2026,10 @@ function isLlmErrorResponse(response) {
 }
 
 async function handleDetailedQuery(query) {
-    log('handleDetailedQuery: Processing specific query with search + chunking');
+    debugLog('SEARCH', `handleDetailedQuery started`, {
+        query: query.substring(0, 100),
+        totalFiles: contextFiles.size
+    });
     
     // VERBOSE: Show which code path we're in
     if (AGENT_CONFIG.verboseSearch) {
@@ -2012,24 +2047,37 @@ async function handleDetailedQuery(query) {
     // Step 1: Search for relevant code using all available methods
     const searchResults = await comprehensiveSearch(query);
     
+    debugLog('SEARCH', `comprehensiveSearch completed`, {
+        resultsFound: searchResults.length,
+        topResults: searchResults.slice(0, 5).map(r => ({
+            name: r.name,
+            file: pathUtils.getFileName(r.file),
+            score: r.score?.toFixed(2),
+            source: r.source
+        }))
+    });
+    
     if (searchResults.length === 0) {
+        debugLog('SEARCH', 'No results found');
         return `No relevant code found for: "${query}". Try rephrasing or check if the functionality exists in the attached files.`;
     }
-    
-    log(`handleDetailedQuery: Found ${searchResults.length} relevant results`);
     
     // Extract high-priority files (filename matches get score >= 1.4)
     const highPriorityFiles = [...new Set(
         searchResults
             .filter(r => r.score >= 1.4 && r.source?.includes('filename'))
-            .map(r => r.file?.split('/').pop())
+            .map(r => pathUtils.getFileName(r.file))
             .filter(Boolean)
     )];
     
     // Extract all analyzed files (deduped)
-    const allFilesAnalyzed = [...new Set(searchResults.map(r => r.file?.split('/').pop()).filter(Boolean))];
+    const allFilesAnalyzed = [...new Set(searchResults.map(r => pathUtils.getFileName(r.file)).filter(Boolean))];
     
-    log('handleDetailedQuery: High priority files (filename matches):', highPriorityFiles);
+    debugLog('SEARCH', `File analysis`, {
+        highPriorityFiles,
+        allFilesCount: allFilesAnalyzed.length,
+        allFiles: allFilesAnalyzed.slice(0, 10)
+    });
     
     chatWebviewView?.webview.postMessage({ 
         type: 'appendResponse', 
@@ -2039,14 +2087,17 @@ async function handleDetailedQuery(query) {
     // Step 2: Chunk the results to fit context window
     const chunks = chunkSearchResults(searchResults, SUMMARY_CONFIG.CHUNK_SIZE_FOR_QUERY);
     
-    log(`handleDetailedQuery: Split into ${chunks.length} chunks`);
+    debugLog('SEARCH', `Chunking results`, {
+        totalChunks: chunks.length,
+        chunkSizes: chunks.map(c => c.length)
+    });
     
     // Limit chunks to prevent overwhelming the system
     const MAX_CHUNKS = 8;  // Process at most 8 chunks (reduced to prevent API limits)
     const chunksToProcess = chunks.slice(0, MAX_CHUNKS);
     
     if (chunks.length > MAX_CHUNKS) {
-        log(`handleDetailedQuery: Limiting from ${chunks.length} to ${MAX_CHUNKS} chunks`);
+        debugLog('SEARCH', `Limiting chunks: ${chunks.length} → ${MAX_CHUNKS}`);
         chatWebviewView?.webview.postMessage({ 
             type: 'appendResponse', 
             text: `*Note: Processing top ${MAX_CHUNKS} of ${chunks.length} relevant chunks for efficiency*\n`
@@ -2072,6 +2123,11 @@ async function handleDetailedQuery(query) {
         }
     }
     
+    debugLog('SEARCH', `Chunk analysis complete`, {
+        chunksAnalyzed: chunkAnalyses.length,
+        chunksProcessed: chunksToProcess.length
+    });
+    
     // Step 4: Synthesize final answer
     if (chunkAnalyses.length === 0) {
         return `Found code but couldn't analyze it. The code may be too complex or the LLM is unavailable.`;
@@ -2095,18 +2151,25 @@ async function comprehensiveSearch(query) {
     
     // Extract keywords for search
     const keywords = extractSearchKeywords(query);
-    log('comprehensiveSearch: Keywords:', keywords);
+    
+    debugLog('SEARCH', 'comprehensiveSearch starting', {
+        query: query.substring(0, 80),
+        keywords,
+        totalFiles: contextFiles.size,
+        indexedSymbols: codeIndex.symbols.size
+    });
     
     // ================================================================
     // 0. FILE NAME MATCHING (HIGHEST PRIORITY)
     // For "show me X that implements Y", find files with Y in the name
     // ================================================================
+    let filenameMatches = 0;
     for (const keyword of keywords) {
         if (keyword.length < 3) continue;
         const keywordLower = keyword.toLowerCase();
         
         for (const [filePath, file] of contextFiles) {
-            const fileName = filePath.split('/').pop().toLowerCase();
+            const fileName = pathUtils.getFileName(filePath).toLowerCase();
             const fileNameNoExt = fileName.replace(/\.[^.]+$/, '');
             
             // Check if filename matches keyword (multiple strategies)
@@ -2152,14 +2215,21 @@ async function comprehensiveSearch(query) {
                     }
                 }
                 
+                filenameMatches++;
                 log(`comprehensiveSearch: File name match: ${fileName} for keyword "${keyword}" (keywordInFile=${keywordInFile}, fileInKeyword=${fileInKeyword}, commonPrefix=${commonPrefix})`);
             }
         }
     }
     
+    debugLog('SEARCH', `Phase 0: Filename matching complete`, {
+        filenameMatches,
+        resultsAfterPhase0: results.size
+    });
+    
     // ================================================================
     // 1. SYMBOL NAME SEARCH (exact matches get higher score)
     // ================================================================
+    const symbolMatchesBefore = results.size;
     for (const keyword of keywords) {
         const keywordLower = keyword.toLowerCase();
         
@@ -2214,7 +2284,13 @@ async function comprehensiveSearch(query) {
         }
     }
     
+    debugLog('SEARCH', `Phase 1: Symbol search complete`, {
+        newMatches: results.size - symbolMatchesBefore,
+        resultsAfterPhase1: results.size
+    });
+    
     // 2. TRIGRAM SEARCH (fast partial/exact text matching)
+    const trigramMatchesBefore = results.size;
     if (trigramIndex.index.size > 0) {
         for (const keyword of keywords.slice(0, 3)) {
             if (keyword.length < 3) continue;
@@ -2240,7 +2316,14 @@ async function comprehensiveSearch(query) {
         }
     }
     
+    debugLog('SEARCH', `Phase 2: Trigram search complete`, {
+        trigramIndexSize: trigramIndex.index.size,
+        newMatches: results.size - trigramMatchesBefore,
+        resultsAfterPhase2: results.size
+    });
+    
     // 3. Grep search (for things symbol parser might miss)
+    const grepMatchesBefore = results.size;
     for (const keyword of keywords.slice(0, 3)) { // Limit grep keywords
         try {
             const grepResults = await AGENT_TOOLS.grep_context.execute({ 
@@ -2272,7 +2355,13 @@ async function comprehensiveSearch(query) {
         }
     }
     
+    debugLog('SEARCH', `Phase 3: Grep search complete`, {
+        newMatches: results.size - grepMatchesBefore,
+        resultsAfterPhase3: results.size
+    });
+    
     // 3. Vector search (if available)
+    const vectorMatchesBefore = results.size;
     if (vectorIndex.chunks.length > 0) {
         try {
             const vectorResults = await hybridSearch(query, { maxResults: 20 });
@@ -2294,6 +2383,12 @@ async function comprehensiveSearch(query) {
             log('comprehensiveSearch: Vector search error:', e.message);
         }
     }
+    
+    debugLog('SEARCH', `Phase 4: Vector search complete`, {
+        vectorIndexSize: vectorIndex.chunks.length,
+        newMatches: results.size - vectorMatchesBefore,
+        resultsAfterPhase4: results.size
+    });
     
     // 4. Call graph traversal for tracing queries
     if (/trace|flow|call|calls|calling|invokes?/i.test(query)) {
@@ -2382,7 +2477,7 @@ async function comprehensiveSearch(query) {
         
         verboseOutput += `\n**Top 10 Results:**\n`;
         for (const r of resultsArray.slice(0, 10)) {
-            const fileName = r.file?.split('/').pop() || 'unknown';
+            const fileName = pathUtils.getFileName(r.file) || 'unknown';
             verboseOutput += `- \`${r.name}\` (${r.type}) in ${fileName}:${r.line} [score=${r.score.toFixed(2)}, src=${r.source}]\n`;
         }
         verboseOutput += '\n---\n\n';
@@ -2392,6 +2487,22 @@ async function comprehensiveSearch(query) {
             text: verboseOutput
         });
     }
+    
+    // Final summary by source
+    const bySourceSummary = {};
+    for (const r of resultsArray) {
+        bySourceSummary[r.source] = (bySourceSummary[r.source] || 0) + 1;
+    }
+    
+    debugLog('SEARCH', 'comprehensiveSearch complete', {
+        totalResults: resultsArray.length,
+        bySource: bySourceSummary,
+        topScores: resultsArray.slice(0, 5).map(r => ({
+            name: r.name,
+            score: r.score?.toFixed(2),
+            source: r.source
+        }))
+    });
     
     return resultsArray.slice(0, 50); // Limit results
 }
@@ -2492,9 +2603,9 @@ function extractFileNamesFromQuery(query) {
  * Find file path by name
  */
 function findFileByName(fileName) {
-    for (const [path, file] of contextFiles) {
-        if (path.endsWith(fileName) || path.split('/').pop() === fileName) {
-            return { path, file };
+    for (const [filePath, file] of contextFiles) {
+        if (filePath.endsWith(fileName) || pathUtils.getFileName(filePath) === fileName) {
+            return { path: filePath, file };
         }
     }
     return null;
@@ -2827,7 +2938,7 @@ async function searchForRelevantCode(question, subQuestions = []) {
         for (const { fileName, baseName } of mentionedFiles) {
             // Find this file in context
             for (const [filePath, file] of contextFiles) {
-                const pathFileName = filePath.split('/').pop();
+                const pathFileName = pathUtils.getFileName(filePath);
                 if (pathFileName === fileName || pathFileName.toLowerCase() === fileName.toLowerCase()) {
                     log(`searchForRelevantCode: Found mentioned file: ${filePath}`);
                     
@@ -2882,7 +2993,7 @@ async function searchForRelevantCode(question, subQuestions = []) {
         const keywordLower = keyword.toLowerCase();
         
         for (const [filePath, file] of contextFiles) {
-            const fileName = filePath.split('/').pop().toLowerCase();
+            const fileName = pathUtils.getFileName(filePath).toLowerCase();
             const fileNameNoExt = fileName.replace(/\.[^.]+$/, '');
             
             // Check BOTH directions:
@@ -3155,7 +3266,7 @@ function buildFocusedChunks(searchResults, maxChunkSize) {
     // Group results by file for better context
     const byFile = new Map();
     for (const result of searchResults) {
-        const fileName = result.file?.split('/').pop() || 'unknown';
+        const fileName = pathUtils.getFileName(result.file) || 'unknown';
         if (!byFile.has(fileName)) {
             byFile.set(fileName, []);
         }
@@ -3206,9 +3317,9 @@ function grepContext(pattern, contextLines = 5) {
     const results = [];
     const patternLower = pattern.toLowerCase();
     
-    for (const [path, file] of contextFiles) {
+    for (const [filePath, file] of contextFiles) {
         const lines = file.content.split('\n');
-        const fileName = path.split('/').pop();
+        const fileName = pathUtils.getFileName(filePath);
         
         for (let i = 0; i < lines.length; i++) {
             if (lines[i].toLowerCase().includes(patternLower)) {
@@ -3220,7 +3331,7 @@ function grepContext(pattern, contextLines = 5) {
                 
                 results.push({
                     fileName,
-                    filePath: path,
+                    filePath: filePath,
                     startLine: i + 1,
                     matchLine: i + 1,
                     content
@@ -5769,7 +5880,7 @@ function grepCodeForSymbol(symbolName, options = {}) {
     for (const [filePath, file] of contextFiles) {
         const content = file.content;
         const lines = content.split('\n');
-        const fileName = filePath.split('/').pop();
+        const fileName = pathUtils.getFileName(filePath);
         
         // Find definition (function declaration with body)
         for (let i = 0; i < lines.length; i++) {
@@ -6185,7 +6296,7 @@ function generateHierarchicalSummary() {
     for (const [key, symbol] of codeIndex.symbols) {
         if (['function', 'procedure', 'method', 'subproc', 'paragraph', 'section'].includes(symbol.type)) {
             const file = symbol.file || 'unknown';
-            const fileName = file.split('/').pop();
+            const fileName = pathUtils.getFileName(file);
             if (!funcsByFile.has(fileName)) {
                 funcsByFile.set(fileName, []);
             }
@@ -6291,6 +6402,11 @@ function generateHierarchicalSummary() {
  * Returns: 'overview' | 'domain' | 'specific' | 'general'
  */
 async function classifyQueryWithLLM(query, fileCount) {
+    debugLog('CLASSIFY', `Classifying query with LLM`, {
+        query: query.substring(0, 100),
+        fileCount
+    });
+    
     const classificationPrompt = `You are a query classifier for a code assistant. The user has ${fileCount} files attached.
 
 Classify this query into ONE of these categories:
@@ -6312,13 +6428,11 @@ USER QUERY: "${query}"
 Respond with ONLY the category name (overview, domain, specific, or general), nothing else.`;
 
     try {
-        log('classifyQueryWithLLM: Classifying query...');
-        
         // Use a quick, low-cost LLM call
         const response = await callLanguageModelQuick(classificationPrompt);
         
         if (!response) {
-            log('classifyQueryWithLLM: No response from LLM, using fallback');
+            debugLog('CLASSIFY', 'LLM returned no response, using regex fallback');
             return classifyQueryFallback(query);
         }
         
@@ -6327,23 +6441,29 @@ Respond with ONLY the category name (overview, domain, specific, or general), no
         // Validate response
         const validTypes = ['overview', 'domain', 'specific', 'general'];
         if (validTypes.includes(classification)) {
-            log('classifyQueryWithLLM: Result:', classification);
+            debugLog('CLASSIFY', `LLM classification result: ${classification}`, {
+                rawResponse: response.substring(0, 50)
+            });
             return classification;
         }
         
         // Try to extract from longer response
         for (const type of validTypes) {
             if (response.toLowerCase().includes(type)) {
-                log('classifyQueryWithLLM: Extracted:', type);
+                debugLog('CLASSIFY', `Extracted type from response: ${type}`, {
+                    rawResponse: response.substring(0, 100)
+                });
                 return type;
             }
         }
         
-        log('classifyQueryWithLLM: Could not parse response:', response);
+        debugLog('CLASSIFY', `Could not parse LLM response, using fallback`, {
+            rawResponse: response.substring(0, 100)
+        });
         return classifyQueryFallback(query);
         
     } catch (error) {
-        log('classifyQueryWithLLM: Error:', error.message);
+        debugLog('CLASSIFY', `LLM error: ${error.message}, using fallback`);
         // Fall back to regex-based classification
         return classifyQueryFallback(query);
     }
@@ -6460,9 +6580,62 @@ async function callLanguageModelQuick(prompt) {
  * Fallback regex-based classification when LLM is unavailable
  */
 function classifyQueryFallback(text) {
-    if (isOverviewQuery(text)) return 'overview';
-    if (isDomainQuery(text)) return 'domain';
-    return 'specific';
+    debugLog('CLASSIFY', `Using regex fallback classification`, {
+        query: text.substring(0, 80)
+    });
+    
+    const isOverview = isOverviewQuery(text);
+    const isDomain = isDomainQuery(text);
+    
+    let result;
+    let matchedPattern = null;
+    
+    if (isOverview) {
+        result = 'overview';
+        // Find which pattern matched
+        const normalizedText = text.trim().replace(/^(?:can\s+you\s+|could\s+you\s+|please\s+|would\s+you\s+)/i, '').trim();
+        const overviewPatterns = [
+            { name: 'explain/describe codebase', regex: /^(?:explain|describe|summarize|overview|analyze)\s+(?:the\s+)?(?:high[\s-]?level\s+)?(?:code|codebase|project|files?|attached|this)/i },
+            { name: 'functionality/structure', regex: /^(?:explain|describe|summarize)\s+(?:the\s+)?(?:high[\s-]?level\s+)?(?:functionality|structure|architecture|purpose)/i },
+            { name: 'what does/is', regex: /^(?:what\s+(?:does|is)\s+(?:this|the)\s+(?:code|codebase|project)|give\s+(?:me\s+)?(?:an?\s+)?overview)/i },
+            { name: 'how does work', regex: /^(?:how\s+does\s+(?:this|the)\s+(?:code|codebase|project)\s+work)/i },
+            { name: 'tell me about', regex: /^(?:tell\s+me\s+about\s+(?:this|the)\s+(?:code|codebase|project))/i },
+            { name: 'overall/general', regex: /(?:overall|general|main|high[\s-]?level)\s+(?:purpose|functionality|structure|design)/i }
+        ];
+        for (const p of overviewPatterns) {
+            if (p.regex.test(normalizedText)) {
+                matchedPattern = p.name;
+                break;
+            }
+        }
+    } else if (isDomain) {
+        result = 'domain';
+        // Find which pattern matched
+        const domainPatterns = [
+            { name: 'describe/explain functionality', regex: /(?:describe|explain|how\s+(?:is|does|do|are))\s+(?:the\s+)?(\w+)\s+(?:functionality|feature|work|handled|implemented|processed)/i },
+            { name: 'how is X implemented', regex: /how\s+(?:is|are)\s+(\w+)\s+implemented/i },
+            { name: 'where/how handling', regex: /(?:where|how)\s+(?:is|does|are)\s+(\w+)\s+(?:validation|processing|handling|logic|implemented)/i },
+            { name: 'show/find flow', regex: /(?:show|find|trace)\s+(?:me\s+)?(?:the\s+)?(\w+)\s+(?:flow|logic|code|implementation)/i },
+            { name: 'ACRONYM validation/processing', regex: /\b([A-Z]{2,5})\s+(?:validation|processing|handling|workflow|flow|logic)\b/i }
+        ];
+        for (const p of domainPatterns) {
+            if (p.regex.test(text.trim())) {
+                matchedPattern = p.name;
+                break;
+            }
+        }
+    } else {
+        result = 'specific';
+        matchedPattern = 'no overview/domain patterns matched';
+    }
+    
+    debugLog('CLASSIFY', `Fallback result: ${result}`, {
+        isOverview,
+        isDomain,
+        matchedPattern
+    });
+    
+    return result;
 }
 
 /**
@@ -6734,11 +6907,11 @@ function findRelevantContext(text, maxFiles = 30, maxChars = 100000) {
     let totalChars = 0;
     const includedFiles = [];
     
-    for (const [path, info] of sortedFiles) {
-        const file = contextFiles.get(path);
+    for (const [filePath, info] of sortedFiles) {
+        const file = contextFiles.get(filePath);
         if (!file) continue;
         
-        const fileName = path.split('/').pop();
+        const fileName = pathUtils.getFileName(filePath);
         const fileContent = file.content;
         
         // Check if adding this file would exceed limit
@@ -16292,14 +16465,19 @@ async function handleChatMessage(text) {
         
         // Documentation generation should bypass planning
         const isDocumentGeneration = /^(?:document|generate\s+(?:full\s+)?(?:doc|documentation)|documentation|deepwiki|full\s*doc)/i.test(text.trim());
-        log('Documentation check:', text.trim().substring(0, 50), '| isDocumentGeneration:', isDocumentGeneration, '| contextFiles:', contextFiles.size);
+        
+        debugLog('ROUTE', `Files: ${contextFiles.size} | isDocGen: ${isDocumentGeneration}`, {
+            query: text.substring(0, 80),
+            fileCount: contextFiles.size,
+            isDocGeneration: isDocumentGeneration
+        });
         
         const shouldSkipPlanning = skipPlanningPatterns.some(p => p.test(text.trim()));
         
         // For large codebases, use LLM to classify the query type
         const LARGE_CODEBASE_THRESHOLD = 50;
         if (contextFiles.size > LARGE_CODEBASE_THRESHOLD && !isDocumentGeneration && !shouldSkipPlanning) {
-            log('CLASSIFY: Large codebase detected, using LLM to classify query');
+            debugLog('ROUTE', 'Large codebase → LLM classification', contextFiles.size);
             
             // Show classification status
             chatWebviewView?.webview.postMessage({ 
@@ -16308,9 +16486,10 @@ async function handleChatMessage(text) {
             });
             
             const queryType = await classifyQueryWithLLM(text, contextFiles.size);
-            log('CLASSIFY: Query type:', queryType);
+            debugLog('CLASSIFY', `Query type: ${queryType}`, queryType);
             
             if (queryType === 'overview' || queryType === 'domain' || queryType === 'specific') {
+                debugLog('ROUTE', `Using handleLocalMode (${queryType})`, queryType);
                 // Handle overview, domain, AND specific queries with specialized handlers
                 // These all benefit from search + chunking, not the planner
                 const response = await handleLocalMode(text, { queryType });
@@ -16405,7 +16584,11 @@ async function handleChatMessage(text) {
         // ============================================================
         const SMALL_CODEBASE_THRESHOLD = 50;
         if (contextFiles.size > 0 && contextFiles.size <= SMALL_CODEBASE_THRESHOLD) {
-            log('SMALL CODEBASE: Bypassing planner for', contextFiles.size, 'files');
+            debugLog('ROUTE', `Small codebase (${contextFiles.size} files) → Direct analysis`, {
+                fileCount: contextFiles.size,
+                threshold: SMALL_CODEBASE_THRESHOLD,
+                files: Array.from(contextFiles.keys()).map(f => pathUtils.getFileName(f)).slice(0, 10)
+            });
             
             chatWebviewView?.webview.postMessage({ 
                 type: 'appendResponse', 
@@ -16413,8 +16596,10 @@ async function handleChatMessage(text) {
             });
             
             // For small codebases, just pass all content to LLM
+            debugLog('ROUTE', 'Calling handleLocalMode with queryType=specific');
             const response = await handleLocalMode(text, { queryType: 'specific' });
             const modelName = getModelDisplayName();
+            debugLog('MODEL', `Response from: ${modelName}`, response?.length || 0);
             const attribution = `\n\n---\n*AstraCode (${modelName})*`;
             
             if (response && response.length > 0) {
@@ -16525,7 +16710,11 @@ function determineMode(text) {
 }
 
 async function handleLocalMode(text, config = {}) {
-    log('LOCAL MODE: Using context files');
+    debugLog('LOCAL', `handleLocalMode called`, {
+        query: text.substring(0, 60),
+        configQueryType: config.queryType,
+        fileCount: contextFiles.size
+    });
     
     if (contextFiles.size === 0) {
         return `No files in context. Please add files using:
@@ -16538,13 +16727,17 @@ async function handleLocalMode(text, config = {}) {
     const isLargeCodebase = contextFiles.size > LARGE_CODEBASE_THRESHOLD;
     const queryType = config.queryType || (isLargeCodebase ? classifyQueryFallback(text) : 'specific');
     
-    log('LOCAL MODE: Query type:', queryType, '| Files:', contextFiles.size);
+    debugLog('LOCAL', `Query classification`, {
+        isLargeCodebase,
+        queryType,
+        threshold: LARGE_CODEBASE_THRESHOLD
+    });
     
     // ============================================================
     // HIGH-LEVEL QUERIES: Use pre-computed summaries + structure
     // ============================================================
     if (isLargeCodebase && queryType === 'overview') {
-        log('LOCAL MODE: Using smart high-level handler for', contextFiles.size, 'files');
+        debugLog('LOCAL', 'Using HIGH-LEVEL handler (summaries + structure)');
         
         chatWebviewView?.webview.postMessage({ 
             type: 'appendResponse', 
@@ -16554,7 +16747,7 @@ async function handleLocalMode(text, config = {}) {
         try {
             return await handleHighLevelQuery(text);
         } catch (error) {
-            log('LOCAL MODE: High-level handler error:', error.message);
+            debugLog('LOCAL', `High-level handler error: ${error.message}`);
             // Fall back to legacy hierarchical summary
             const hierarchicalSummary = generateHierarchicalSummary();
             const prompt = `Based on this codebase structure, answer: ${text}\n\n${hierarchicalSummary}`;
@@ -16576,7 +16769,7 @@ Please check your GitHub Copilot or API configuration.`;
     // DOMAIN/DETAILED QUERIES: Search + chunk + analyze
     // ============================================================
     if (isLargeCodebase && (queryType === 'domain' || queryType === 'specific')) {
-        log('LOCAL MODE: Using smart detailed handler with search + chunking');
+        debugLog('LOCAL', 'Using DETAILED handler (search + chunking)');
         
         chatWebviewView?.webview.postMessage({ 
             type: 'appendResponse', 
@@ -16607,14 +16800,22 @@ Please check your GitHub Copilot or API configuration.`;
     // ============================================================
     // SMALL CODEBASES: Direct context (original behavior)
     // ============================================================
+    debugLog('LOCAL', 'Small codebase path - reading files directly');
+    
     let contextContent = 'FILES IN CONTEXT:\n\n';
     const fileList = [];
-    for (const [path, file] of contextFiles) {
-        const fileName = path.split('/').pop();
+    for (const [filePath, file] of contextFiles) {
+        const fileName = pathUtils.getFileName(filePath);
         contextContent += `=== ${fileName} (${file.language}) ===\n`;
         contextContent += file.content + '\n\n';
-        fileList.push({ name: fileName, path, language: file.language, size: file.content.length });
+        fileList.push({ name: fileName, path: filePath, language: file.language, size: file.content.length });
     }
+    
+    debugLog('LOCAL', `Built context`, {
+        files: fileList.length,
+        totalChars: contextContent.length,
+        fileNames: fileList.map(f => f.name)
+    });
     
     // Add code index summary for code analysis queries
     const indexSummary = getIndexSummary();
@@ -16645,9 +16846,16 @@ Please check your GitHub Copilot or API configuration.`;
     const isEnhance = /^(?:enhance|improve|add\s+(?:a\s+)?feature|implement|extend|modify|refactor|optimize)/i.test(text);
     const isFindFunction = /^(?:find\s+(?:the\s+)?function|where\s+is\s+(?:the\s+)?(?:function|method)|locate|show\s+me\s+(?:the\s+)?(?:function|method))/i.test(text);
     
+    debugLog('LOCAL', 'Task type detection', {
+        isTranslate, isFlowchart, isDocument, isSummarize, isExplain,
+        isDirectQuestion, isTrace, isFindBug, isEnhance, isFindFunction,
+        hasPdf, hasOnlyDocs
+    });
+    
     // For PDFs and documents, always summarize instead of generating code documentation
     if (hasPdf || hasOnlyDocs) {
         if (isDocument || isSummarize) {
+            debugLog('LOCAL', 'Using document summary prompt');
             const prompt = buildDocumentSummaryPrompt(contextContent, text);
             return await callLanguageModel(prompt);
         }
@@ -16655,6 +16863,7 @@ Please check your GitHub Copilot or API configuration.`;
     
     // Special handling for code documentation - generate .md file
     if (isDocument && !hasPdf) {
+        debugLog('LOCAL', 'Generating documentation file');
         return await generateDocumentationFile(fileList, text);
     }
     
@@ -16662,6 +16871,7 @@ Please check your GitHub Copilot or API configuration.`;
     
     // Direct questions get answered directly
     if (isDirectQuestion) {
+        debugLog('LOCAL', 'Using direct question prompt');
         prompt = buildDirectQuestionPrompt(contextContent, indexSummary, text);
     } else if (isTrace) {
         // Extract symbol name OR concept keywords from query
@@ -16714,18 +16924,26 @@ Please check your GitHub Copilot or API configuration.`;
         }
         
         log('Trace - symbol:', symbolName, 'concepts:', conceptKeywords);
+        debugLog('EXECUTE', 'Building TRACE prompt', {
+            symbolName,
+            conceptKeywords,
+            symbolExists: symbolName ? codeIndex.symbols.has(symbolName) : false
+        });
         prompt = buildTracePrompt(contextContent, indexSummary, text, symbolName, conceptKeywords);
-        log('Trace prompt built, length:', prompt.length, 'chars');
-        log('Trace prompt preview:', prompt.substring(0, 500));
     } else if (isFindBug) {
+        debugLog('EXECUTE', 'Building DEBUG prompt');
         prompt = buildDebugPrompt(contextContent, indexSummary, text);
     } else if (isEnhance) {
+        debugLog('EXECUTE', 'Building ENHANCE prompt');
         prompt = buildEnhancePrompt(contextContent, indexSummary, text);
     } else if (isFindFunction) {
+        debugLog('EXECUTE', 'Building FIND_FUNCTION prompt');
         prompt = buildFindFunctionPrompt(contextContent, indexSummary, text);
     } else if (isFlowchart) {
+        debugLog('EXECUTE', 'Building FLOWCHART prompt');
         prompt = buildFlowchartPrompt(contextContent, text);
     } else if (isTranslate) {
+        debugLog('EXECUTE', 'Building TRANSLATE prompt');
         // Detect target language from query or use config
         let targetLang = config.get('targetLanguage') || 'java';
         const targetMatch = text.match(/(?:to|into)\s+(java|python|c#|csharp|javascript|typescript|go|rust|c\+\+|cpp)/i);
@@ -16739,7 +16957,7 @@ Please check your GitHub Copilot or API configuration.`;
         const fileMatch = text.match(/(?:translate|convert|port)\s+(?:the\s+)?(?:file\s+)?[`'"]*([a-zA-Z0-9_\-\.]+\.[a-zA-Z]+)/i);
         let targetFile = fileMatch ? fileMatch[1] : null;
         
-        log('Translate request - target file:', targetFile, 'target language:', targetLang);
+        debugLog('EXECUTE', 'Translate details', { targetFile, targetLang });
         
         // STEP 2: EXECUTE - Find the specific file and translate ONLY it
         let translateContent = '';
@@ -16783,12 +17001,21 @@ Please check your GitHub Copilot or API configuration.`;
         
         prompt = buildTranslatePrompt(translateContent, text, targetLang, foundFile?.fileName);
     } else if (isExplain) {
+        debugLog('EXECUTE', 'Building EXPLAIN prompt');
         prompt = buildExplainPrompt(contextContent + indexSummary, text);
     } else if (isSummarize) {
+        debugLog('EXECUTE', 'Building SUMMARIZE prompt');
         prompt = buildDocumentSummaryPrompt(contextContent, text);
     } else {
+        debugLog('EXECUTE', 'Building GENERAL prompt (no specific type matched)');
         prompt = buildGeneralPrompt(contextContent + indexSummary, text);
     }
+    
+    // Log final prompt details before calling LLM
+    debugLog('EXECUTE', 'Final prompt ready', {
+        promptLength: prompt.length,
+        promptPreview: prompt.substring(0, 200) + '...'
+    });
     
     // Call LLM via VS Code Language Model API
     return await callLanguageModel(prompt);
@@ -17491,9 +17718,9 @@ ${fileList.map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-')
             await vscode.workspace.fs.createDirectory(astraDir);
             fileUri = vscode.Uri.joinPath(astraDir, fileName);
         } else {
-            // Save to temp location
+            // Save to temp location (use pathUtils for cross-platform compatibility)
             const tmpDir = require('os').tmpdir();
-            fileUri = vscode.Uri.file(`${tmpDir}/${fileName}`);
+            fileUri = vscode.Uri.file(pathUtils.joinPath(tmpDir, fileName));
         }
         
         await vscode.workspace.fs.writeFile(fileUri, Buffer.from(documentation, 'utf-8'));
@@ -17532,7 +17759,7 @@ function getProjectName(fileList) {
     
     // Try to find common directory name
     const paths = fileList.map(f => f.path);
-    const parts = paths[0].split('/');
+    const parts = pathUtils.splitPath(paths[0]);
     
     // Look for a meaningful directory name
     for (let i = parts.length - 2; i >= 0; i--) {
@@ -18776,11 +19003,16 @@ async function callLanguageModel(prompt, taskType = null) {
             // 'auto' and other tasks use the general copilot model
             preferredModel = config.get('llm.copilotModel') || 'claude-sonnet-4';
     }
-    log('LLM call - task type:', taskType, '| preferred model:', preferredModel);
+    
+    debugLog('LLM', `Model selection`, {
+        taskType,
+        preferredModel,
+        promptSize: prompt.length
+    });
     
     // Get provider order based on task type
     const providerOrder = getProviderOrderForTask(taskType);
-    log('LLM call - provider order:', providerOrder.join(' -> '));
+    debugLog('LLM', `Provider order: ${providerOrder.join(' → ')}`);
     log('Prompt size:', prompt.length, 'chars');
     
     let lastError = null;
@@ -19008,7 +19240,10 @@ async function tryCopilot(prompt, preferredModel = null) {
                 id: model.id
             };
             
-            log('Using model:', lastUsedModel.name, '| family:', lastUsedModel.family);
+            debugLog('COPILOT', `Selected model: ${lastUsedModel.name}`, {
+                family: lastUsedModel.family,
+                promptLength: prompt.length
+            });
             
             // Show model in chat
             chatWebviewView?.webview.postMessage({ 
@@ -20125,7 +20360,7 @@ let contextTreeProvider;
 
 function activate(context) {
     outputChannel = vscode.window.createOutputChannel('AstraCode');
-    log('AstraCode v4.9.73 activating...');
+    log('AstraCode v4.9.76 activating...');
     
     // Create status bar item for summary progress
     summaryStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
