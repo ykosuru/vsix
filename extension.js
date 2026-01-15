@@ -1,14 +1,31 @@
 /**
- * AstraCode v4.9.24 - Agentic Code Assistant
+ * AstraCode v4.9.73 - Agentic Code Assistant
  * 
- * TAL PARSER ENHANCEMENT (v4.9.24)
- * ================================
- * - Comprehensive TAL parser ported from Python
- * - Full DEFINE/LITERAL/STRUCT/PROC parsing
- * - Call graph extraction (CALL, PCAL, function-style)
- * - Cyclomatic complexity calculation
- * - Symbol table with scope management
- * - TAL-specific call detection in findFunctionCalls()
+ * CLEAN 3-LAYER SEARCH ARCHITECTURE (v4.9.73)
+ * ============================================
+ * 
+ * ┌─────────────────────────────────────────────────────────┐
+ * │                     SEARCH QUERY                         │
+ * └─────────────────────────────────────────────────────────┘
+ *                            │
+ *        ┌───────────────────┼───────────────────┐
+ *        ▼                   ▼                   ▼
+ * ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+ * │   SYMBOL    │     │   TRIGRAM   │     │   VECTOR    │
+ * │   INDEX     │     │   INDEX     │     │   INDEX     │
+ * ├─────────────┤     ├─────────────┤     ├─────────────┤
+ * │ Functions   │     │ Exact text  │     │ Semantic    │
+ * │ Classes     │     │ Substrings  │     │ TF-IDF      │
+ * │ Variables   │     │ Identifiers │     │ Concepts    │
+ * │ Call graph  │     │ (Zoekt)     │     │             │
+ * │ Fuzzy match │     │ O(1) lookup │     │ Similarity  │
+ * └─────────────┘     └─────────────┘     └─────────────┘
+ * 
+ * Key Tools:
+ * - search_code: Combines Layer 1 + Layer 2 (PREFERRED)
+ * - search_trigram: Layer 2 only (exact text)
+ * - search_semantic: Layer 3 only (concepts)
+ * - hybridSearch(): All 3 layers with result fusion
  * 
  * Toggle Judge: AGENT_CONFIG.enableJudge = true/false
  */
@@ -34,6 +51,9 @@ let chatWebviewView;
 
 /** @type {vscode.OutputChannel} */
 let outputChannel;
+
+/** @type {vscode.StatusBarItem | undefined} */
+let summaryStatusBarItem;
 
 /** @type {{name: string, vendor: string, family: string} | null} */
 let lastUsedModel = null;
@@ -98,11 +118,14 @@ const taskController = {
 /**
  * Code Index - stores parsed information about the codebase
  * @type {{
- *   files: Map<string, {path: string, language: string, symbols: Array}>,
- *   symbols: Map<string, {name: string, type: string, file: string, line: number, signature?: string}>,
+ *   files: Map<string, {path: string, language: string, symbols: Array, summary?: string}>,
+ *   symbols: Map<string, {name: string, type: string, file: string, line: number, signature?: string, summary?: string}>,
  *   callGraph: Map<string, Set<string>>,
  *   reverseCallGraph: Map<string, Set<string>>,
  *   dependencies: Map<string, Set<string>>,
+ *   summaries: Map<string, {name: string, type: string, file: string, summary: string, line: number}>,
+ *   fileSummaries: Map<string, string>,
+ *   overallSummary: string | null,
  *   lastUpdated: Date | null
  * }}
  */
@@ -113,8 +136,37 @@ const codeIndex = {
     callGraph: new Map(),       // function -> functions it calls
     reverseCallGraph: new Map(), // function -> functions that call it
     dependencies: new Map(),    // file -> files it depends on
+    summaries: new Map(),       // function/proc name@file -> LLM-generated summary
+    fileSummaries: new Map(),   // file path -> LLM-generated file summary
+    overallSummary: null,       // High-level summary of entire codebase
+    discoveredDomain: null,     // Domain info discovered from attached code
     lastUpdated: null
 };
+
+/**
+ * Summary Index Configuration
+ * Note: Auto-summary is controlled via astra.indexing.enableAutoSummary setting
+ */
+const SUMMARY_CONFIG = {
+    ENABLE_AUTO_SUMMARY: true,       // Default, overridden by settings
+    SUMMARY_BATCH_SIZE: 10,          // Functions per LLM batch call
+    MAX_FUNCTION_SIZE: 5000,         // Max chars to send for summarization
+    MIN_FUNCTION_SIZE: 50,           // Skip tiny functions
+    CONTEXT_WINDOW_LIMIT: 18000,     // Max chars for context (fits in Copilot 25K limit with room for prompt)
+    CHUNK_SIZE_FOR_QUERY: 10000,     // Chunk size for detailed queries (reduced to prevent prompt overflow)
+    CHUNK_OVERLAP: 500               // Overlap between chunks
+};
+
+/**
+ * Get current summary config with settings overrides
+ */
+function getSummaryConfig() {
+    const config = vscode.workspace.getConfiguration('astra');
+    return {
+        ...SUMMARY_CONFIG,
+        ENABLE_AUTO_SUMMARY: config.get('indexing.enableAutoSummary', true)
+    };
+}
 
 /**
  * Vector Index - stores embeddings for semantic search
@@ -131,7 +183,7 @@ const vectorIndex = {
     chunks: [],                  // text chunks with metadata
     embeddings: null,            // flat Float32Array of all embeddings (chunks.length * dimensions)
     dimensions: 384,             // embedding dimensions (all-MiniLM-L6-v2 = 384)
-    model: 'simple-hash',        // 'simple-hash' (fast, no deps) or 'copilot' or 'api'
+    model: 'tfidf',              // 'tfidf' (better quality) or 'simple-hash' (faster)
     lastUpdated: null,
     isBuilding: false
 };
@@ -144,7 +196,43 @@ const VECTOR_CONFIG = {
     MAX_CHUNKS_PER_FILE: 100,    // Limit chunks per file
     TOP_K_RESULTS: 10,           // Default number of results
     EMBEDDING_BATCH_SIZE: 20,    // Chunks to embed per batch
-    SIMILARITY_THRESHOLD: 0.1    // Lowered for hash-based embeddings
+    SIMILARITY_THRESHOLD: 0.3    // Minimum similarity for results
+};
+
+/**
+ * Trigram Index - Zoekt-style index for fast exact/partial text search
+ * Uses 3-character sequences for substring matching
+ * @type {{
+ *   index: Map<string, Array<{file: string, positions: number[]}>>,
+ *   fileContent: Map<string, string>,
+ *   stats: {trigrams: number, files: number, totalPositions: number},
+ *   lastUpdated: Date | null
+ * }}
+ */
+const trigramIndex = {
+    index: new Map(),            // trigram → [{file, positions}]
+    fileContent: new Map(),      // file → content (for verification)
+    stats: { trigrams: 0, files: 0, totalPositions: 0 },
+    lastUpdated: null
+};
+
+// Trigram configuration
+const TRIGRAM_CONFIG = {
+    MIN_QUERY_LENGTH: 3,         // Minimum query length for trigram search
+    MAX_RESULTS: 100,            // Maximum results to return
+    MAX_FILE_SIZE: 500000,       // Skip files larger than this
+    CASE_SENSITIVE: false,       // Case-insensitive by default
+    MAX_POSITIONS_PER_FILE: 1000 // Limit positions stored per file per trigram
+};
+
+/**
+ * TF-IDF Vocabulary for vector embeddings
+ */
+const tfidfVocabulary = {
+    terms: new Map(),            // term → {index, df}
+    idf: null,                   // Float32Array of IDF values
+    numDocs: 0,
+    built: false
 };
 
 // ============================================================
@@ -158,6 +246,122 @@ function log(...args) {
     console.log(`[AstraCode] ${message}`);
 }
 
+/**
+ * Show progress message in chat UI (user-visible)
+ * Used to show what the agent is doing during search/planning
+ */
+function showProgress(message, type = 'info') {
+    const icons = {
+        'search': '🔍',
+        'index': '📊',
+        'grep': '📝',
+        'found': '✅',
+        'step': '▶️',
+        'info': 'ℹ️',
+        'warn': '⚠️'
+    };
+    const icon = icons[type] || icons.info;
+    const formatted = `\n${icon} *${message}*\n`;
+    
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: formatted 
+    });
+    log(`PROGRESS: ${message}`);
+}
+
+/**
+ * Update summary progress in both webview and status bar
+ * @param {number} progress - 0-100, or -1 to hide
+ * @param {string} message - Status message
+ * @param {number} [count] - Final count (on completion)
+ */
+function updateSummaryStatus(progress, message, count) {
+    // Update webview progress indicator
+    chatWebviewView?.webview.postMessage({ 
+        type: 'summaryProgress',
+        progress: progress,
+        message: message,
+        count: count
+    });
+    
+    // Update VS Code status bar item
+    if (summaryStatusBarItem) {
+        if (progress >= 0 && progress < 100) {
+            summaryStatusBarItem.text = `$(sync~spin) ${message}`;
+            summaryStatusBarItem.tooltip = `AstraCode: Generating function summaries (${progress}%)`;
+            summaryStatusBarItem.show();
+        } else if (progress >= 100) {
+            summaryStatusBarItem.text = `$(check) ${count || 0} summaries`;
+            summaryStatusBarItem.tooltip = `AstraCode: ${count || 0} function summaries generated`;
+            // Hide after 5 seconds
+            setTimeout(() => {
+                if (summaryStatusBarItem) {
+                    summaryStatusBarItem.hide();
+                }
+            }, 5000);
+        } else {
+            summaryStatusBarItem.hide();
+        }
+    }
+    
+    log(`SUMMARY: ${message} (${progress}%)`);
+}
+
+/**
+ * Show index statistics to user
+ */
+function showIndexStats() {
+    if (codeIndex.symbols.size === 0 && trigramIndex.index.size === 0 && vectorIndex.chunks.length === 0) {
+        showProgress('No indexes available - files not yet indexed', 'warn');
+        return;
+    }
+    
+    // Count by type
+    const typeCounts = {};
+    for (const [_, sym] of codeIndex.symbols) {
+        typeCounts[sym.type] = (typeCounts[sym.type] || 0) + 1;
+    }
+    
+    const stats = [];
+    
+    // Symbol index stats
+    if (codeIndex.files.size > 0) {
+        stats.push(`${codeIndex.files.size} files`);
+        stats.push(`${codeIndex.symbols.size} symbols`);
+    }
+    
+    // Trigram index stats
+    if (trigramIndex.index.size > 0) {
+        stats.push(`${trigramIndex.stats.trigrams} trigrams`);
+    }
+    
+    // Vector index stats
+    if (vectorIndex.chunks.length > 0) {
+        stats.push(`${vectorIndex.chunks.length} chunks`);
+        if (tfidfVocabulary.built) {
+            stats.push(`${tfidfVocabulary.terms.size} TF-IDF terms`);
+        }
+    }
+    
+    // Summary stats
+    if (codeIndex.summaries.size > 0) {
+        stats.push(`${codeIndex.summaries.size} summaries`);
+    }
+    
+    // Add type breakdown
+    const typeStr = Object.entries(typeCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+        .map(([type, count]) => `${count} ${type}s`)
+        .join(', ');
+    
+    showProgress(`Index: ${stats.join(' | ')}`, 'index');
+    if (typeStr) {
+        showProgress(`Types: ${typeStr}`, 'info');
+    }
+}
+
 // ============================================================
 // Code Indexing
 // ============================================================
@@ -169,9 +373,10 @@ function log(...args) {
 const INDEX_CONFIG = {
     BATCH_SIZE: 50,           // Files per batch
     BATCH_DELAY: 10,          // ms delay between batches (yield to UI)
-    MAX_FILES_FOR_FULL_INDEX: 500,  // Above this, use lightweight indexing
-    MAX_SYMBOLS_PER_FILE: 500,      // Limit symbols per file
-    SEARCH_RESULT_LIMIT: 100        // Max search results
+    MAX_FILES_FOR_FULL_INDEX: 1000,  // Above this, use lightweight indexing
+    MAX_SYMBOLS_PER_FILE: 500,       // Limit symbols per file in lightweight mode
+    MAX_VARS_PER_FILE: 100,          // Limit variables per file in lightweight mode
+    SEARCH_RESULT_LIMIT: 100         // Max search results
 };
 
 /**
@@ -250,6 +455,9 @@ async function buildCodeIndex(options = {}) {
                     : fileInfo.symbols;
                 
                 // Add symbols to global symbol table
+                let varsInFile = 0;
+                let varTypesFound = {};
+                
                 for (const symbol of symbols) {
                     const key = `${symbol.name}@${path}`;
                     codeIndex.symbols.set(key, { ...symbol, file: path });
@@ -258,8 +466,19 @@ async function buildCodeIndex(options = {}) {
                         codeIndex.symbols.set(symbol.name, { ...symbol, file: path });
                     }
                     
-                    // Track variables (skip in lightweight mode)
-                    if (!useLightweight && (variableTypes.has(symbol.type) || symbol.dataType)) {
+                    // Track variables (with limit in lightweight mode)
+                    // Check: is this a variable-type symbol OR does it have a dataType?
+                    const hasVarType = variableTypes.has(symbol.type);
+                    const hasDataType = symbol.dataType && symbol.dataType.length > 0;
+                    const isVariable = hasVarType || hasDataType;
+                    const underVarLimit = !useLightweight || varsInFile < INDEX_CONFIG.MAX_VARS_PER_FILE;
+                    
+                    // Track what types we're finding
+                    if (isVariable) {
+                        varTypesFound[symbol.type] = (varTypesFound[symbol.type] || 0) + 1;
+                    }
+                    
+                    if (isVariable && underVarLimit) {
                         const varKey = `${symbol.name}@${path}`;
                         codeIndex.variables.set(varKey, {
                             name: symbol.name,
@@ -270,8 +489,27 @@ async function buildCodeIndex(options = {}) {
                             scope: symbol.scope || 'global',
                             accesses: []
                         });
+                        varsInFile++;
                     }
                     totalSymbols++;
+                }
+                
+                // Log variable types found in this file (for first few files)
+                if (processedFiles < 3 && varsInFile > 0) {
+                    log('File:', path, '- vars found:', varsInFile, 'types:', varTypesFound);
+                }
+                
+                // Log first file's symbol types for debugging
+                if (processedFiles === 0) {
+                    const sampleSymbols = symbols.slice(0, 10).map(s => ({
+                        name: s.name, 
+                        type: s.type, 
+                        dataType: s.dataType,
+                        hasVarType: variableTypes.has(s.type),
+                        hasDataType: !!(s.dataType && s.dataType.length > 0)
+                    }));
+                    log('First file symbols (first 10):', sampleSymbols);
+                    log('variableTypes Set contains:', Array.from(variableTypes));
                 }
                 
                 // Build call graph (skip in lightweight mode for large files)
@@ -333,6 +571,21 @@ async function buildCodeIndex(options = {}) {
     
     codeIndex.lastUpdated = new Date();
     
+    // Count symbol types for debugging
+    const typeCounts = {};
+    const varTypeSymbols = [];
+    for (const [key, symbol] of codeIndex.symbols) {
+        const t = symbol.type || 'unknown';
+        typeCounts[t] = (typeCounts[t] || 0) + 1;
+        
+        // Track which symbols should be variables
+        if (variableTypes.has(symbol.type) || (symbol.dataType && symbol.dataType.length > 0)) {
+            if (varTypeSymbols.length < 5) {
+                varTypeSymbols.push({ name: symbol.name, type: symbol.type, dataType: symbol.dataType });
+            }
+        }
+    }
+    
     const stats = {
         files: codeIndex.files.size,
         symbols: codeIndex.symbols.size,
@@ -343,13 +596,53 @@ async function buildCodeIndex(options = {}) {
     };
     
     log('Code index built:', stats);
+    log('Symbol types breakdown:', typeCounts);
+    log('Sample variable-type symbols:', varTypeSymbols);
+    log('codeIndex.variables.size:', codeIndex.variables.size);
+    
+    // Build trigram index for fast text search (lightweight version for initial load)
+    if (showProgress && chatWebviewView) {
+        chatWebviewView.webview.postMessage({
+            type: 'indexProgress',
+            progress: 90,
+            message: `Building trigram index...`
+        });
+    }
+    
+    try {
+        // Build trigram index - limit to smaller files for speed during initial indexing
+        const trigramOptions = {
+            showProgressUI: false,
+            maxFilesToIndex: useLightweight ? 200 : 500,  // Limit for initial indexing
+            maxFileSize: 50000  // Skip very large files
+        };
+        await buildTrigramIndexLightweight(trigramOptions);
+        stats.trigrams = trigramIndex.index.size;
+        log('Trigram index built:', trigramIndex.index.size, 'trigrams');
+    } catch (err) {
+        log('Trigram indexing error (non-fatal):', err.message);
+    }
     
     // Final progress update
+    const trigramMsg = stats.trigrams > 0 ? `, ${stats.trigrams} trigrams` : '';
     if (showProgress && chatWebviewView) {
         chatWebviewView.webview.postMessage({
             type: 'indexProgress',
             progress: 100,
-            message: `Index complete: ${stats.files} files, ${stats.symbols} symbols`
+            message: `Index complete: ${stats.files} files, ${stats.symbols} symbols${trigramMsg}`
+        });
+    }
+    
+    // Discover domain from indexed code (always, regardless of summary setting)
+    discoverDomain();
+    
+    // Generate summaries if enabled (async, don't block)
+    // Summaries are essential for answering high-level queries efficiently
+    const summaryConfig = getSummaryConfig();
+    if (summaryConfig.ENABLE_AUTO_SUMMARY) {
+        // Start summary generation in background - generate ALL functions
+        generateCodeSummaries().catch(err => {
+            log('Background summary generation failed:', err.message);
         });
     }
     
@@ -404,7 +697,7 @@ function buildCodeIndexLegacy() {
                 codeIndex.symbols.set(symbol.name, { ...symbol, file: path });
             }
             
-            if (variableTypes.has(symbol.type) || symbol.dataType) {
+            if (variableTypes.has(symbol.type) || (symbol.dataType && symbol.dataType.length > 0)) {
                 const varKey = `${symbol.name}@${path}`;
                 codeIndex.variables.set(varKey, {
                     name: symbol.name,
@@ -452,8 +745,2496 @@ function buildCodeIndexLegacy() {
 }
 
 /**
- * Parse a file and extract symbols
+ * Generate a one-liner summary for a function/procedure
+ * Extracts from: leading comment, docstring, or first meaningful line
  */
+function generateFunctionSummary(content, lineNumber, language) {
+    const lines = content.split('\n');
+    const startLine = Math.max(0, lineNumber - 1);
+    
+    // Look for leading comment (up to 5 lines before function)
+    for (let i = startLine - 1; i >= Math.max(0, startLine - 5); i--) {
+        const line = lines[i].trim();
+        
+        // Skip empty lines
+        if (!line) continue;
+        
+        // Check for various comment formats
+        // C-style: /** ... */ or /* ... */ or // ...
+        if (line.startsWith('//')) {
+            const comment = line.replace(/^\/\/\s*/, '').trim();
+            if (comment && comment.length > 5 && comment.length < 200) {
+                return comment;
+            }
+        }
+        if (line.startsWith('*') && !line.startsWith('*/')) {
+            const comment = line.replace(/^\*\s*/, '').trim();
+            if (comment && comment.length > 5 && comment.length < 200 && !comment.startsWith('@')) {
+                return comment;
+            }
+        }
+        // Python docstring
+        if (line.startsWith('"""') || line.startsWith("'''")) {
+            const comment = line.replace(/^['"]{3}\s*/, '').replace(/['"]{3}$/, '').trim();
+            if (comment && comment.length > 5) {
+                return comment;
+            }
+        }
+        // TAL/COBOL comment
+        if (line.startsWith('!') || line.startsWith('*>')) {
+            const comment = line.replace(/^[!*>]+\s*/, '').trim();
+            if (comment && comment.length > 5 && comment.length < 200) {
+                return comment;
+            }
+        }
+        
+        // If we hit a non-comment line, stop looking
+        if (!line.startsWith('*') && !line.startsWith('/') && !line.startsWith('#') && 
+            !line.startsWith('!') && !line.startsWith('"') && !line.startsWith("'")) {
+            break;
+        }
+    }
+    
+    // Look for inline comment on function line or first line of body
+    for (let i = startLine; i < Math.min(lines.length, startLine + 3); i++) {
+        const line = lines[i];
+        
+        // Check for inline comment
+        const inlineComment = line.match(/\/\/\s*(.+)$/) || 
+                              line.match(/!\s*(.+)$/) ||
+                              line.match(/#\s*(.+)$/);
+        if (inlineComment && inlineComment[1].length > 5 && inlineComment[1].length < 200) {
+            return inlineComment[1].trim();
+        }
+    }
+    
+    // Fallback: Generate from function name
+    return null;
+}
+
+// ============================================================
+// LLM-Based Summary Generation (for intelligent query handling)
+// ============================================================
+
+/**
+ * Generate summaries for all functions in the codebase
+ * Called after indexing to enable high-level query answering
+ * @param {number|null} maxFunctions - Optional limit on functions to summarize (prioritizes most important)
+ */
+async function generateCodeSummaries(maxFunctions = null) {
+    // Get config from settings
+    const summaryConfig = getSummaryConfig();
+    
+    if (!summaryConfig.ENABLE_AUTO_SUMMARY) {
+        log('generateCodeSummaries: Auto-summary disabled in settings');
+        return;
+    }
+    
+    log('generateCodeSummaries: Starting summary generation...');
+    
+    // Clear existing summaries
+    codeIndex.summaries.clear();
+    codeIndex.fileSummaries.clear();
+    codeIndex.overallSummary = null;
+    
+    // Get all callable symbols (functions, procedures, methods, etc.)
+    // Only include functions that are in the callGraph (consistent with "funcs" count in status bar)
+    const callableTypes = new Set([
+        'function', 'procedure', 'method', 'subproc',
+        'section', 'paragraph', 'program',
+        'define', 'macro'
+    ]);
+    
+    const functionsToSummarize = [];
+    const typeBreakdown = {};
+    let skippedNotInCallGraph = 0;
+    
+    for (const [key, symbol] of codeIndex.symbols) {
+        // Skip duplicate entries (we have both "name" and "name@path" entries)
+        if (!key.includes('@')) continue;
+        
+        if (callableTypes.has(symbol.type)) {
+            typeBreakdown[symbol.type] = (typeBreakdown[symbol.type] || 0) + 1;
+            
+            // Only summarize functions that appear in the call graph
+            // This matches the "7814 funcs" count shown in the status bar
+            const isInCallGraph = codeIndex.callGraph.has(symbol.name) || 
+                                  codeIndex.reverseCallGraph?.has(symbol.name);
+            
+            if (!isInCallGraph) {
+                skippedNotInCallGraph++;
+                continue;
+            }
+            
+            functionsToSummarize.push({
+                key,
+                name: symbol.name,
+                type: symbol.type,
+                file: symbol.file,
+                line: symbol.line,
+                signature: symbol.signature,
+                // Priority score: entry points (called often) + functions that call others
+                priority: (codeIndex.reverseCallGraph?.get(symbol.name)?.size || 0) * 2 + 
+                         (codeIndex.callGraph.get(symbol.name)?.size || 0)
+            });
+        }
+    }
+    
+    // Log type breakdown to understand counts
+    log(`generateCodeSummaries: Type breakdown (all): ${JSON.stringify(typeBreakdown)}`);
+    log(`generateCodeSummaries: Skipped ${skippedNotInCallGraph} not in call graph`);
+    
+    log(`generateCodeSummaries: Found ${functionsToSummarize.length} functions to summarize`);
+    log(`generateCodeSummaries: contextFiles has ${contextFiles.size} files`);
+    
+    // Debug: check how many functions have their files in context
+    let filesInContext = 0;
+    let filesNotInContext = 0;
+    const samplePaths = { context: [], func: [] };
+    
+    for (const func of functionsToSummarize) {
+        if (contextFiles.has(func.file)) {
+            filesInContext++;
+        } else {
+            filesNotInContext++;
+            if (samplePaths.func.length < 3) {
+                samplePaths.func.push(func.file);
+            }
+        }
+    }
+    
+    // Get sample context file paths
+    for (const [path] of contextFiles) {
+        if (samplePaths.context.length < 3) {
+            samplePaths.context.push(path);
+        }
+    }
+    
+    log(`generateCodeSummaries: ${filesInContext} funcs have files in context, ${filesNotInContext} do not`);
+    if (filesNotInContext > 0) {
+        log(`generateCodeSummaries: Sample context paths: ${samplePaths.context.join(', ')}`);
+        log(`generateCodeSummaries: Sample func paths: ${samplePaths.func.join(', ')}`);
+    }
+    
+    // Sort by priority (most important first) and apply limit
+    functionsToSummarize.sort((a, b) => b.priority - a.priority);
+    
+    const toProcess = maxFunctions 
+        ? functionsToSummarize.slice(0, maxFunctions)
+        : functionsToSummarize;
+    
+    if (toProcess.length === 0) {
+        log('generateCodeSummaries: No functions to summarize');
+        return;
+    }
+    
+    const limitMsg = maxFunctions ? ` (top ${maxFunctions} by importance)` : '';
+    log(`generateCodeSummaries: Processing ${toProcess.length} functions${limitMsg}`);
+    
+    // Show progress in status bar AND VS Code status bar
+    updateSummaryStatus(0, `📚 Summarizing ${toProcess.length} functions${limitMsg}...`);
+    
+    // Process in batches
+    const batchSize = SUMMARY_CONFIG.SUMMARY_BATCH_SIZE;
+    let summarized = 0;
+    let actualSummaries = 0;
+    let skippedFunctions = 0;
+    
+    for (let i = 0; i < toProcess.length; i += batchSize) {
+        if (taskController.isCancelled) {
+            log('Summary generation cancelled');
+            updateSummaryStatus(-1, 'Cancelled');
+            break;
+        }
+        
+        const batch = toProcess.slice(i, i + batchSize);
+        const beforeCount = codeIndex.summaries.size;
+        
+        try {
+            await summarizeFunctionBatch(batch);
+            summarized += batch.length;
+            const addedThisBatch = codeIndex.summaries.size - beforeCount;
+            actualSummaries += addedThisBatch;
+            
+            if (addedThisBatch < batch.length) {
+                skippedFunctions += (batch.length - addedThisBatch);
+            }
+            
+            // Progress update every few batches
+            const updateFrequency = toProcess.length > 500 ? 50 : 20;
+            if (summarized % updateFrequency === 0 || summarized === toProcess.length) {
+                const percent = Math.round((summarized / toProcess.length) * 100);
+                updateSummaryStatus(percent, `📝 ${codeIndex.summaries.size}/${toProcess.length} (${percent}%)`);
+            }
+        } catch (error) {
+            log('generateCodeSummaries: Batch error:', error.message);
+            skippedFunctions += batch.length;
+        }
+        
+        // Small delay between batches to avoid rate limits
+        await new Promise(r => setTimeout(r, 100));
+    }
+    
+    // Update status for file summaries phase
+    updateSummaryStatus(90, '📁 Building file summaries...');
+    
+    // Generate file-level summaries
+    await generateFileSummaries();
+    
+    // Update status for overall summary phase
+    updateSummaryStatus(95, '🔍 Creating codebase overview...');
+    
+    // Generate overall codebase summary
+    await generateOverallSummary();
+    
+    log(`generateCodeSummaries: Complete. ${codeIndex.summaries.size} function summaries, ${codeIndex.fileSummaries.size} file summaries (${skippedFunctions} skipped)`);
+    
+    // Show completion in both status bar and webview
+    updateSummaryStatus(100, '✓ Summaries complete', codeIndex.summaries.size);
+    
+    // Log if many were skipped
+    if (skippedFunctions > toProcess.length * 0.2) {
+        log(`WARNING: ${skippedFunctions}/${toProcess.length} functions could not be summarized (code extraction or LLM parsing issues)`);
+    }
+    
+    // Update main status line to show summary count
+    if (typeof updateChatStatusUI === 'function') {
+        updateChatStatusUI();
+    }
+}
+
+/**
+ * Summarize a batch of functions using LLM
+ */
+async function summarizeFunctionBatch(functions) {
+    // Build batch prompt with function code
+    let batchContent = '';
+    const functionCodes = [];
+    let skippedNoFile = 0;
+    let skippedTooSmall = 0;
+    
+    for (const func of functions) {
+        const file = contextFiles.get(func.file);
+        if (!file) {
+            skippedNoFile++;
+            continue;
+        }
+        
+        // Extract function code
+        const funcCode = extractFunctionCode(file.content, func.line, file.language);
+        if (!funcCode || funcCode.length < SUMMARY_CONFIG.MIN_FUNCTION_SIZE) {
+            skippedTooSmall++;
+            continue;
+        }
+        
+        const truncatedCode = funcCode.substring(0, SUMMARY_CONFIG.MAX_FUNCTION_SIZE);
+        functionCodes.push({ func, code: truncatedCode });
+        
+        batchContent += `\n### ${func.name} (${func.type} in ${func.file?.split('/').pop()}:${func.line})
+\`\`\`
+${truncatedCode}
+\`\`\`
+`;
+    }
+    
+    if (skippedNoFile > 0 || skippedTooSmall > 0) {
+        log(`summarizeFunctionBatch: Skipped ${skippedNoFile} (no file) + ${skippedTooSmall} (too small) of ${functions.length}`);
+    }
+    
+    // Save fallback summaries for functions we couldn't extract code for
+    const skippedFuncs = functions.filter(f => !functionCodes.find(fc => fc.func.key === f.key));
+    if (skippedFuncs.length > 0) {
+        log(`summarizeFunctionBatch: Saving ${skippedFuncs.length} fallback summaries for skipped functions`);
+    }
+    for (const func of skippedFuncs) {
+        const summary = generateSummaryFromName(func.name);
+        codeIndex.summaries.set(func.key, {
+            name: func.name,
+            type: func.type,
+            file: func.file,
+            line: func.line,
+            summary: summary
+        });
+    }
+    
+    // If no code could be extracted, we're done (fallbacks already saved above)
+    if (functionCodes.length === 0) return;
+    
+    const prompt = `Summarize each function in 1-2 sentences. Focus on: what it does, key inputs/outputs, and business purpose.
+
+${batchContent}
+
+Respond in this exact format for each function:
+FUNCTION: <name>
+SUMMARY: <1-2 sentence summary>
+---`;
+
+    try {
+        // Use summary-specific LLM call (allows longer responses than classification)
+        const response = await callLanguageModelForSummary(prompt, 3000);
+        
+        // ALWAYS save summaries - LLM or fallback
+        let matched = 0;
+        
+        if (!response || response.trim().length < 20) {
+            log(`summarizeFunctionBatch: No/empty LLM response, using name-based summaries`);
+            // Fallback: generate from names
+            for (const funcItem of functionCodes) {
+                const summary = generateSummaryFromName(funcItem.func.name);
+                codeIndex.summaries.set(funcItem.func.key, {
+                    name: funcItem.func.name,
+                    type: funcItem.func.type,
+                    file: funcItem.func.file,
+                    line: funcItem.func.line,
+                    summary: summary
+                });
+                matched++;
+            }
+            log(`summarizeFunctionBatch: Generated ${matched} name-based summaries`);
+            return;
+        }
+        
+        // Debug: log first response to see format
+        if (codeIndex.summaries.size === 0) {
+            log(`summarizeFunctionBatch: First LLM response sample (${response.length} chars):`);
+            log(response.substring(0, 800));
+        }
+        
+        // ULTRA-ROBUST PARSING: Try multiple strategies
+        
+        // Strategy 1: Look for each function name in the response and extract nearby summary
+        for (const funcItem of functionCodes) {
+            if (funcItem.used) continue;
+            
+            const funcName = funcItem.func.name;
+            const escapedName = funcName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            
+            // Try multiple patterns to find this function's summary
+            const patterns = [
+                // Pattern: FUNCTION: name\nSUMMARY: ...
+                new RegExp(`FUNCTION:\\s*${escapedName}[^\\n]*\\n+SUMMARY:\\s*([^\\n]+(?:\\n(?!FUNCTION:|---|###)[^\\n]+)*)`, 'i'),
+                // Pattern: ### name\n... (markdown style)
+                new RegExp(`###\\s*${escapedName}[^\\n]*\\n+([^#]+?)(?=###|$)`, 'i'),
+                // Pattern: **name**: summary or name: summary
+                new RegExp(`(?:\\*\\*)?${escapedName}(?:\\*\\*)?[:\\s]+([^\\n]+)`, 'i'),
+                // Pattern: name - summary
+                new RegExp(`${escapedName}\\s*[-–:]\\s*([^\\n]+)`, 'i'),
+                // Pattern: 1. name: summary (numbered list)
+                new RegExp(`\\d+\\.\\s*${escapedName}[:\\s]+([^\\n]+)`, 'i'),
+            ];
+            
+            for (const pattern of patterns) {
+                const match = response.match(pattern);
+                if (match && match[1]) {
+                    const summary = match[1].trim()
+                        .replace(/^[-–:]\s*/, '')  // Remove leading dash/colon
+                        .replace(/\n+/g, ' ')      // Collapse newlines
+                        .substring(0, 500);
+                    
+                    if (summary.length > 10) {  // Sanity check
+                        codeIndex.summaries.set(funcItem.func.key, {
+                            name: funcItem.func.name,
+                            type: funcItem.func.type,
+                            file: funcItem.func.file,
+                            line: funcItem.func.line,
+                            summary: summary
+                        });
+                        funcItem.used = true;
+                        matched++;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Strategy 2: If Strategy 1 got low matches, try order-based assignment
+        // Split response by various delimiters and assign in order
+        if (matched < functionCodes.length * 0.5) {
+            log(`summarizeFunctionBatch: Low match rate (${matched}/${functionCodes.length}), trying order-based`);
+            
+            // Split by ---, ###, numbered items, or FUNCTION:
+            const blocks = response.split(/(?:---|###|\d+\.\s+|FUNCTION:)/i).filter(b => b.trim().length > 20);
+            
+            let orderIdx = 0;
+            for (const funcItem of functionCodes) {
+                if (funcItem.used || orderIdx >= blocks.length) continue;
+                
+                const block = blocks[orderIdx];
+                // Extract any sentence-like content as summary
+                const summaryMatch = block.match(/(?:SUMMARY:\s*)?([A-Z][^.!?]*[.!?])/i) ||
+                                    block.match(/([^:\n]{20,})/);
+                
+                if (summaryMatch) {
+                    const summary = summaryMatch[1].trim().substring(0, 500);
+                    if (summary.length > 15) {
+                        codeIndex.summaries.set(funcItem.func.key, {
+                            name: funcItem.func.name,
+                            type: funcItem.func.type,
+                            file: funcItem.func.file,
+                            line: funcItem.func.line,
+                            summary: summary
+                        });
+                        funcItem.used = true;
+                        matched++;
+                    }
+                }
+                orderIdx++;
+            }
+        }
+        
+        // Strategy 3: GUARANTEED fallback - generate from function name for ALL unmatched
+        for (const funcItem of functionCodes) {
+            if (funcItem.used) continue;
+            
+            // Generate a basic summary from the function name
+            const summary = generateSummaryFromName(funcItem.func.name);
+            codeIndex.summaries.set(funcItem.func.key, {
+                name: funcItem.func.name,
+                type: funcItem.func.type,
+                file: funcItem.func.file,
+                line: funcItem.func.line,
+                summary: summary
+            });
+            matched++;
+        }
+        
+        log(`summarizeFunctionBatch: Final matched ${matched}/${functionCodes.length}`);
+        log(`summarizeFunctionBatch: Total summaries now: ${codeIndex.summaries.size}`);
+        
+    } catch (error) {
+        log('summarizeFunctionBatch: Error:', error.message);
+        // On error, still generate basic summaries from names
+        for (const funcItem of functionCodes) {
+            if (!funcItem.used) {
+                const summary = generateSummaryFromName(funcItem.func.name);
+                codeIndex.summaries.set(funcItem.func.key, {
+                    name: funcItem.func.name,
+                    type: funcItem.func.type,
+                    file: funcItem.func.file,
+                    line: funcItem.func.line,
+                    summary: summary
+                });
+            }
+        }
+    }
+}
+
+/**
+ * Generate a reasonable summary from function name using naming conventions
+ */
+function generateSummaryFromName(name) {
+    // Split camelCase, snake_case, PascalCase
+    const words = name
+        .replace(/([a-z])([A-Z])/g, '$1 $2')  // camelCase
+        .replace(/_/g, ' ')                     // snake_case
+        .replace(/-/g, ' ')                     // kebab-case
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(w => w.length > 0);
+    
+    if (words.length === 0) return `Function ${name}`;
+    
+    // Common verb patterns
+    const verbMap = {
+        'get': 'Gets', 'set': 'Sets', 'is': 'Checks if', 'has': 'Checks if has',
+        'can': 'Checks if can', 'init': 'Initializes', 'create': 'Creates',
+        'make': 'Creates', 'build': 'Builds', 'parse': 'Parses',
+        'read': 'Reads', 'write': 'Writes', 'load': 'Loads', 'save': 'Saves',
+        'find': 'Finds', 'search': 'Searches for', 'check': 'Checks',
+        'validate': 'Validates', 'process': 'Processes', 'handle': 'Handles',
+        'update': 'Updates', 'delete': 'Deletes', 'remove': 'Removes',
+        'add': 'Adds', 'insert': 'Inserts', 'append': 'Appends',
+        'convert': 'Converts', 'transform': 'Transforms', 'format': 'Formats',
+        'calculate': 'Calculates', 'compute': 'Computes', 'count': 'Counts',
+        'send': 'Sends', 'receive': 'Receives', 'fetch': 'Fetches',
+        'open': 'Opens', 'close': 'Closes', 'start': 'Starts', 'stop': 'Stops',
+        'enable': 'Enables', 'disable': 'Disables', 'reset': 'Resets',
+        'clear': 'Clears', 'print': 'Prints', 'log': 'Logs', 'display': 'Displays',
+        'on': 'Handles', 'do': 'Performs', 'run': 'Runs', 'exec': 'Executes',
+        'perform': 'Performs', 'apply': 'Applies', 'render': 'Renders'
+    };
+    
+    const firstWord = words[0];
+    const restWords = words.slice(1).join(' ');
+    
+    if (verbMap[firstWord]) {
+        return `${verbMap[firstWord]} ${restWords}`.trim() + '.';
+    }
+    
+    // If no verb, describe as a noun
+    return `Handles ${words.join(' ')}.`;
+}
+
+/**
+ * Extract function code starting from a line number
+ */
+function extractFunctionCode(content, startLine, language) {
+    const lines = content.split('\n');
+    if (startLine < 1 || startLine > lines.length) return null;
+    
+    const startIdx = startLine - 1;
+    let endIdx = startIdx;
+    let braceCount = 0;
+    let foundOpen = false;
+    
+    // Language-specific extraction
+    const langLower = (language || '').toLowerCase();
+    
+    if (langLower === 'python') {
+        // Python: use indentation
+        const baseIndent = lines[startIdx].match(/^(\s*)/)[1].length;
+        for (let i = startIdx + 1; i < lines.length && i < startIdx + 200; i++) {
+            const line = lines[i];
+            if (line.trim() === '') continue;
+            const indent = line.match(/^(\s*)/)[1].length;
+            if (indent <= baseIndent && line.trim() !== '') {
+                endIdx = i - 1;
+                break;
+            }
+            endIdx = i;
+        }
+    } else if (langLower === 'cobol') {
+        // COBOL: find next paragraph/section
+        for (let i = startIdx + 1; i < lines.length && i < startIdx + 300; i++) {
+            const line = lines[i];
+            if (/^\s{0,6}[A-Z0-9-]+\s+(SECTION|PARAGRAPH)\.?/i.test(line) ||
+                /^\s{0,6}[A-Z0-9-]+\.\s*$/i.test(line)) {
+                endIdx = i - 1;
+                break;
+            }
+            endIdx = i;
+        }
+    } else {
+        // C-style: use brace matching
+        for (let i = startIdx; i < lines.length && i < startIdx + 300; i++) {
+            const line = lines[i];
+            braceCount += (line.match(/\{/g) || []).length;
+            braceCount -= (line.match(/\}/g) || []).length;
+            
+            if (braceCount > 0) foundOpen = true;
+            
+            if (foundOpen && braceCount === 0) {
+                endIdx = i;
+                break;
+            }
+            endIdx = i;
+        }
+    }
+    
+    return lines.slice(startIdx, endIdx + 1).join('\n');
+}
+
+/**
+ * Generate file-level summaries
+ */
+async function generateFileSummaries() {
+    // Process all files (file summaries are built from function summaries, no LLM calls)
+    const files = Array.from(contextFiles.entries());
+    
+    log(`generateFileSummaries: Processing ${files.length} files`);
+    
+    for (const [path, file] of files) {
+        if (taskController.isCancelled) break;
+        
+        const fileName = path.split('/').pop();
+        
+        // Get function summaries for this file
+        const fileFuncSummaries = [];
+        for (const [key, summary] of codeIndex.summaries) {
+            if (summary.file === path) {
+                fileFuncSummaries.push(`- ${summary.name}: ${summary.summary}`);
+            }
+        }
+        
+        // Build file summary from function summaries + structure
+        let fileSummary = '';
+        if (fileFuncSummaries.length > 0) {
+            fileSummary = `File ${fileName} contains ${fileFuncSummaries.length} functions:\n${fileFuncSummaries.slice(0, 30).join('\n')}`;
+            if (fileFuncSummaries.length > 30) {
+                fileSummary += `\n... and ${fileFuncSummaries.length - 30} more functions`;
+            }
+        } else {
+            // Quick structural summary
+            const lines = file.content.split('\n').length;
+            fileSummary = `File ${fileName}: ${lines} lines of ${file.language} code`;
+        }
+        
+        codeIndex.fileSummaries.set(path, fileSummary);
+    }
+}
+
+/**
+ * Generate overall codebase summary from file summaries
+ */
+async function generateOverallSummary() {
+    if (codeIndex.fileSummaries.size === 0) {
+        codeIndex.overallSummary = `Codebase with ${contextFiles.size} files, ${codeIndex.symbols.size} symbols`;
+        return;
+    }
+    
+    // Group file summaries by module for better synthesis
+    const moduleMap = new Map();
+    for (const [path, summary] of codeIndex.fileSummaries) {
+        const parts = path.split('/');
+        const module = parts.length > 2 ? parts.slice(-3, -1).join('/') : parts.slice(0, -1).join('/') || 'root';
+        if (!moduleMap.has(module)) moduleMap.set(module, []);
+        moduleMap.get(module).push({ file: parts.pop(), summary });
+    }
+    
+    // Build module-level summary text
+    let summaryText = `## Codebase Structure (${contextFiles.size} files, ${codeIndex.fileSummaries.size} summarized)\n\n`;
+    
+    for (const [module, files] of Array.from(moduleMap.entries()).slice(0, 30)) {
+        summaryText += `### ${module}/ (${files.length} files)\n`;
+        for (const f of files.slice(0, 5)) {
+            summaryText += `- ${f.file}: ${f.summary.substring(0, 150)}\n`;
+        }
+        if (files.length > 5) summaryText += `- ... +${files.length - 5} more\n`;
+        summaryText += '\n';
+    }
+    
+    const prompt = `Based on these module and file summaries, write a DEVELOPER-FOCUSED overview (3-5 sentences) of what this codebase does:
+
+${summaryText}
+
+Focus on:
+1. Main purpose/functionality
+2. Key modules and their responsibilities  
+3. Architectural patterns (if evident)
+4. Important dependencies or integration points
+
+Write for developers who need to understand this codebase quickly.`;
+
+    try {
+        // Use summary-specific LLM call (allows longer responses)
+        const response = await callLanguageModelForSummary(prompt, 2000);
+        codeIndex.overallSummary = response?.substring(0, 2500) || 
+            `Codebase with ${contextFiles.size} files containing ${codeIndex.symbols.size} symbols across ${moduleMap.size} modules`;
+    } catch (error) {
+        log('generateOverallSummary: Error:', error.message);
+        codeIndex.overallSummary = `Codebase with ${contextFiles.size} files containing ${codeIndex.symbols.size} symbols`;
+    }
+}
+
+/**
+ * Discover domain from indexed code
+ * Analyzes file paths, symbol names, and code patterns to infer the domain
+ * This info is cleared when the index is cleared
+ */
+function discoverDomain() {
+    log('discoverDomain: Analyzing indexed code...');
+    
+    const domain = {
+        languages: new Map(),      // language -> count
+        frameworks: [],            // detected frameworks
+        patterns: [],              // detected patterns (e.g., MVC, microservices)
+        keyTerms: new Map(),       // frequent terms in symbol names
+        modules: [],               // top-level modules/directories
+        fileTypes: new Map(),      // file extensions -> count
+        description: ''            // One-line description
+    };
+    
+    // Analyze languages
+    for (const [path, file] of contextFiles) {
+        const lang = file.language || 'unknown';
+        domain.languages.set(lang, (domain.languages.get(lang) || 0) + 1);
+        
+        const ext = path.split('.').pop();
+        domain.fileTypes.set(ext, (domain.fileTypes.get(ext) || 0) + 1);
+    }
+    
+    // Analyze symbol names to find key terms
+    const termCounts = new Map();
+    for (const [key, symbol] of codeIndex.symbols) {
+        if (key.includes('@')) continue;
+        
+        // Extract words from symbol name
+        const words = symbol.name
+            .replace(/([a-z])([A-Z])/g, '$1 $2')  // camelCase
+            .replace(/_/g, ' ')                     // snake_case
+            .toLowerCase()
+            .split(/\s+/)
+            .filter(w => w.length > 3);
+        
+        for (const word of words) {
+            termCounts.set(word, (termCounts.get(word) || 0) + 1);
+        }
+    }
+    
+    // Get top terms (excluding very common ones)
+    const commonWords = new Set(['init', 'get', 'set', 'create', 'delete', 'update', 'handle', 'process', 'make', 'check', 'validate', 'parse', 'read', 'write', 'open', 'close', 'start', 'stop', 'data', 'info', 'list', 'item', 'node', 'value', 'result', 'error', 'state', 'type', 'name', 'index', 'count', 'size', 'length']);
+    const sortedTerms = Array.from(termCounts.entries())
+        .filter(([term, count]) => count > 2 && !commonWords.has(term))
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 30);
+    
+    domain.keyTerms = new Map(sortedTerms);
+    
+    // Analyze top-level directories
+    const dirCounts = new Map();
+    for (const [path] of contextFiles) {
+        const parts = path.split('/');
+        if (parts.length > 1) {
+            const topDir = parts.slice(0, Math.min(3, parts.length - 1)).join('/');
+            dirCounts.set(topDir, (dirCounts.get(topDir) || 0) + 1);
+        }
+    }
+    domain.modules = Array.from(dirCounts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 15)
+        .map(([dir, count]) => ({ name: dir, files: count }));
+    
+    // Build description from what we found
+    const langList = Array.from(domain.languages.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([lang]) => lang);
+    
+    const topTerms = Array.from(domain.keyTerms.keys()).slice(0, 10);
+    const topModules = domain.modules.slice(0, 5).map(m => m.name.split('/').pop());
+    
+    domain.description = `${langList.join('/')} codebase with ${contextFiles.size} files. ` +
+        `Key areas: ${topModules.join(', ')}. ` +
+        `Frequent terms: ${topTerms.join(', ')}.`;
+    
+    codeIndex.discoveredDomain = domain;
+    log('discoverDomain: Complete -', domain.description);
+    
+    return domain;
+}
+
+/**
+ * Get discovered domain info for planner
+ */
+function getDomainContext() {
+    if (!codeIndex.discoveredDomain) {
+        discoverDomain();
+    }
+    
+    const d = codeIndex.discoveredDomain;
+    if (!d) return '';
+    
+    let context = `## Discovered Domain (from attached code)\n`;
+    context += `${d.description}\n\n`;
+    
+    if (d.keyTerms.size > 0) {
+        context += `**Key terms in code:** ${Array.from(d.keyTerms.keys()).slice(0, 15).join(', ')}\n`;
+    }
+    
+    if (d.modules.length > 0) {
+        context += `**Main modules:** ${d.modules.slice(0, 8).map(m => m.name).join(', ')}\n`;
+    }
+    
+    context += '\n';
+    return context;
+}
+
+/**
+ * Get summary context for high-level queries
+ * Returns aggregated summaries suitable for answering overview questions
+ */
+function getHighLevelContext() {
+    let context = '';
+    
+    // Overall summary
+    if (codeIndex.overallSummary) {
+        context += `## Codebase Overview\n${codeIndex.overallSummary}\n\n`;
+    }
+    
+    // File statistics
+    context += `## Statistics\n`;
+    context += `- Files: ${contextFiles.size}\n`;
+    context += `- Symbols: ${codeIndex.symbols.size}\n`;
+    context += `- Function Summaries: ${codeIndex.summaries.size}\n`;
+    context += `- File Summaries: ${codeIndex.fileSummaries.size}\n`;
+    context += `- Call Graph Edges: ${Array.from(codeIndex.callGraph.values()).reduce((s, c) => s + c.size, 0)}\n\n`;
+    
+    // ================================================================
+    // Group file summaries by MODULE (2-level hierarchy)
+    // e.g., src/backend/access/* -> "backend/access"
+    // ================================================================
+    const moduleTree = new Map(); // "backend/access" -> { submodules: Map<"brin" -> files[]> }
+    
+    for (const [path, summary] of codeIndex.fileSummaries) {
+        const parts = path.split('/');
+        const fileName = parts.pop();
+        
+        // Get module path (2 levels up from file)
+        let modulePath, submodule;
+        if (parts.length >= 2) {
+            modulePath = parts.slice(-3, -1).join('/') || parts.slice(-2).join('/');
+            submodule = parts[parts.length - 1];
+        } else {
+            modulePath = parts.join('/') || 'root';
+            submodule = 'main';
+        }
+        
+        if (!moduleTree.has(modulePath)) {
+            moduleTree.set(modulePath, new Map());
+        }
+        if (!moduleTree.get(modulePath).has(submodule)) {
+            moduleTree.get(modulePath).set(submodule, []);
+        }
+        moduleTree.get(modulePath).get(submodule).push({ name: fileName, summary });
+    }
+    
+    // Sort modules by total file count
+    const sortedModules = Array.from(moduleTree.entries())
+        .map(([mod, subs]) => ({
+            module: mod,
+            submodules: subs,
+            totalFiles: Array.from(subs.values()).reduce((sum, files) => sum + files.length, 0)
+        }))
+        .sort((a, b) => b.totalFiles - a.totalFiles);
+    
+    context += `## Modules/Components (${sortedModules.length} top-level modules)\n`;
+    
+    for (const { module, submodules, totalFiles } of sortedModules) {
+        context += `\n### ${module}/ (${totalFiles} files)\n`;
+        
+        // Sort submodules by file count
+        const sortedSubs = Array.from(submodules.entries())
+            .sort((a, b) => b[1].length - a[1].length);
+        
+        for (const [subName, files] of sortedSubs.slice(0, 10)) {
+            context += `\n**${subName}/** (${files.length} files):\n`;
+            
+            // Show top files with summaries
+            for (const f of files.slice(0, 5)) {
+                const shortSummary = f.summary.substring(0, 120).replace(/\n/g, ' ');
+                context += `- ${f.name}: ${shortSummary}\n`;
+            }
+            if (files.length > 5) {
+                context += `- ... +${files.length - 5} more files\n`;
+            }
+        }
+        
+        if (sortedSubs.length > 10) {
+            context += `\n... +${sortedSubs.length - 10} more subdirectories\n`;
+        }
+    }
+    
+    // ================================================================
+    // Function summaries grouped by module
+    // ================================================================
+    if (codeIndex.summaries.size > 0) {
+        context += `\n## Key Functions (${codeIndex.summaries.size} summarized)\n`;
+        
+        const funcsByModule = new Map();
+        for (const [key, summary] of codeIndex.summaries) {
+            const parts = summary.file?.split('/') || [];
+            const module = parts.slice(-2, -1)[0] || 'root';
+            
+            if (!funcsByModule.has(module)) {
+                funcsByModule.set(module, []);
+            }
+            funcsByModule.get(module).push(summary);
+        }
+        
+        // Show top functions per module
+        const sortedFuncModules = Array.from(funcsByModule.entries())
+            .sort((a, b) => b[1].length - a[1].length);
+        
+        for (const [module, funcs] of sortedFuncModules.slice(0, 15)) {
+            context += `\n**${module}/** (${funcs.length} functions):\n`;
+            for (const f of funcs.slice(0, 5)) {
+                const shortSummary = f.summary?.substring(0, 80) || '';
+                context += `- ${f.name}: ${shortSummary}\n`;
+            }
+        }
+    }
+    
+    // ================================================================
+    // Key entry points (functions with no callers but that call others)
+    // ================================================================
+    const entryPoints = [];
+    for (const [name, symbol] of codeIndex.symbols) {
+        if (name.includes('@')) continue;
+        if (!codeIndex.reverseCallGraph.has(name) && codeIndex.callGraph.has(name)) {
+            const calls = codeIndex.callGraph.get(name)?.size || 0;
+            if (calls > 2) { // Only significant entry points
+                const summary = codeIndex.summaries.get(`${name}@${symbol.file}`);
+                entryPoints.push({
+                    name,
+                    calls,
+                    file: symbol.file?.split('/').pop(),
+                    module: symbol.file?.split('/').slice(-2, -1)[0] || '?',
+                    summary: summary?.summary || ''
+                });
+            }
+        }
+    }
+    entryPoints.sort((a, b) => b.calls - a.calls);
+    
+    if (entryPoints.length > 0) {
+        context += `\n## Entry Points (likely public APIs)\n`;
+        for (const ep of entryPoints.slice(0, 25)) {
+            context += `- **${ep.name}** (${ep.module}/${ep.file}, calls ${ep.calls}): ${ep.summary.substring(0, 60)}\n`;
+        }
+    }
+    
+    // Ensure context fits within limits
+    if (context.length > SUMMARY_CONFIG.CONTEXT_WINDOW_LIMIT) {
+        log('getHighLevelContext: Truncating from', context.length, 'to', SUMMARY_CONFIG.CONTEXT_WINDOW_LIMIT);
+        context = context.substring(0, SUMMARY_CONFIG.CONTEXT_WINDOW_LIMIT) + '\n\n... [summary truncated for context limit]';
+    }
+    
+    return context;
+}
+
+/**
+ * Handle high-level/overview queries using pre-computed summaries
+ */
+async function handleHighLevelQuery(query) {
+    log('handleHighLevelQuery: Processing overview query');
+    
+    // Check if we have summaries
+    if (codeIndex.summaries.size === 0 && codeIndex.fileSummaries.size === 0) {
+        // Generate summaries on-demand if not available
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n📊 *Analyzing codebase structure...*\n`
+        });
+        
+        // Quick structural analysis without full LLM summarization
+        return await generateQuickOverview(query);
+    }
+    
+    // Use pre-computed summaries
+    const context = getHighLevelContext();
+    
+    const prompt = `Based on this codebase summary, answer the user's question:
+
+${context}
+
+USER QUESTION: ${query}
+
+Provide a clear, organized answer focusing on the high-level architecture and functionality. Use the summary information provided.`;
+
+    try {
+        const response = await callLanguageModel(prompt);
+        return response;
+    } catch (error) {
+        log('handleHighLevelQuery: Error:', error.message);
+        return `Error generating overview: ${error.message}`;
+    }
+}
+
+/**
+ * Generate quick overview without pre-computed summaries
+ * Builds COMPREHENSIVE hierarchical view of ALL modules
+ */
+async function generateQuickOverview(query) {
+    log('generateQuickOverview: Building comprehensive structural overview');
+    
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `\n📂 *Building comprehensive codebase overview (${contextFiles.size} files)...*\n`
+    });
+    
+    // ================================================================
+    // STEP 1: Group files by directory hierarchy (modules)
+    // ================================================================
+    const moduleTree = new Map(); // path -> { files: [], symbols: [], submodules: Map }
+    
+    for (const [filePath, file] of contextFiles) {
+        // Get directory path (module)
+        const parts = filePath.split('/');
+        const fileName = parts.pop();
+        const dirPath = parts.join('/') || 'root';
+        
+        // Get or create module entry
+        if (!moduleTree.has(dirPath)) {
+            moduleTree.set(dirPath, {
+                files: [],
+                symbols: [],
+                functions: 0,
+                types: 0,
+                lines: 0
+            });
+        }
+        
+        const module = moduleTree.get(dirPath);
+        module.files.push(fileName);
+        module.lines += file.content.split('\n').length;
+        
+        // Count symbols in this file
+        for (const [key, symbol] of codeIndex.symbols) {
+            if (symbol.file === filePath) {
+                if (['function', 'procedure', 'method'].includes(symbol.type)) {
+                    module.functions++;
+                } else if (['struct', 'class', 'type', 'typedef', 'enum'].includes(symbol.type)) {
+                    module.types++;
+                }
+                module.symbols.push(symbol.name);
+            }
+        }
+    }
+    
+    // ================================================================
+    // STEP 2: Build hierarchical module summary
+    // ================================================================
+    let context = `# Codebase Overview: ${contextFiles.size} files, ${codeIndex.symbols.size} symbols\n\n`;
+    
+    // Group modules by top-level directory
+    const topLevelModules = new Map();
+    for (const [dirPath, moduleData] of moduleTree) {
+        const topLevel = dirPath.split('/').slice(0, 3).join('/') || dirPath;
+        if (!topLevelModules.has(topLevel)) {
+            topLevelModules.set(topLevel, {
+                submodules: [],
+                totalFiles: 0,
+                totalFunctions: 0,
+                totalTypes: 0,
+                totalLines: 0
+            });
+        }
+        const top = topLevelModules.get(topLevel);
+        top.submodules.push({ path: dirPath, ...moduleData });
+        top.totalFiles += moduleData.files.length;
+        top.totalFunctions += moduleData.functions;
+        top.totalTypes += moduleData.types;
+        top.totalLines += moduleData.lines;
+    }
+    
+    // Sort by file count (largest modules first)
+    const sortedModules = Array.from(topLevelModules.entries())
+        .sort((a, b) => b[1].totalFiles - a[1].totalFiles);
+    
+    context += `## Module Structure\n\n`;
+    
+    for (const [modulePath, moduleData] of sortedModules) {
+        const moduleName = modulePath.split('/').pop() || modulePath;
+        context += `### ${moduleName}/ (${moduleData.totalFiles} files, ${moduleData.totalFunctions} functions)\n`;
+        
+        // List submodules with their key functions
+        const submodulesSorted = moduleData.submodules.sort((a, b) => b.files.length - a.files.length);
+        
+        for (const sub of submodulesSorted.slice(0, 15)) { // Top 15 submodules per module
+            const subName = sub.path.split('/').pop() || sub.path;
+            const keyFuncs = sub.symbols.slice(0, 5).join(', ');
+            context += `- **${subName}/**: ${sub.files.length} files, ${sub.functions} funcs`;
+            if (keyFuncs) {
+                context += ` (${keyFuncs}${sub.symbols.length > 5 ? '...' : ''})`;
+            }
+            context += `\n`;
+        }
+        
+        if (submodulesSorted.length > 15) {
+            context += `- ... and ${submodulesSorted.length - 15} more subdirectories\n`;
+        }
+        context += `\n`;
+    }
+    
+    // ================================================================
+    // STEP 3: Key entry points and most-connected functions
+    // ================================================================
+    context += `## Key Functions (by connectivity)\n\n`;
+    
+    const funcConnections = [];
+    for (const [name, calls] of codeIndex.callGraph) {
+        const callers = codeIndex.reverseCallGraph.get(name)?.size || 0;
+        const symbol = codeIndex.symbols.get(name);
+        funcConnections.push({ 
+            name, 
+            calls: calls.size, 
+            callers, 
+            total: calls.size + callers,
+            file: symbol?.file?.split('/').pop() || '?',
+            module: symbol?.file?.split('/').slice(-2, -1)[0] || '?'
+        });
+    }
+    funcConnections.sort((a, b) => b.total - a.total);
+    
+    // Group top functions by module
+    const topFuncsByModule = new Map();
+    for (const f of funcConnections.slice(0, 100)) {
+        if (!topFuncsByModule.has(f.module)) {
+            topFuncsByModule.set(f.module, []);
+        }
+        if (topFuncsByModule.get(f.module).length < 5) {
+            topFuncsByModule.get(f.module).push(f);
+        }
+    }
+    
+    for (const [module, funcs] of topFuncsByModule) {
+        context += `**${module}/**:\n`;
+        for (const f of funcs) {
+            context += `- ${f.name} (${f.file}): calls ${f.calls}, called by ${f.callers}\n`;
+        }
+        context += `\n`;
+    }
+    
+    // ================================================================
+    // STEP 4: Entry points (functions not called by others)
+    // ================================================================
+    const entryPoints = [];
+    for (const [name, symbol] of codeIndex.symbols) {
+        if (name.includes('@')) continue;
+        if (symbol.type !== 'function') continue;
+        if (!codeIndex.reverseCallGraph.has(name) && codeIndex.callGraph.has(name)) {
+            const calls = codeIndex.callGraph.get(name)?.size || 0;
+            if (calls > 0) { // Only include functions that call others
+                entryPoints.push({
+                    name,
+                    calls,
+                    file: symbol.file?.split('/').pop() || '?',
+                    module: symbol.file?.split('/').slice(-2, -1)[0] || '?'
+                });
+            }
+        }
+    }
+    entryPoints.sort((a, b) => b.calls - a.calls);
+    
+    if (entryPoints.length > 0) {
+        context += `## Likely Entry Points (functions not called by others)\n\n`;
+        for (const ep of entryPoints.slice(0, 30)) {
+            context += `- **${ep.name}** (${ep.module}/${ep.file}): calls ${ep.calls} functions\n`;
+        }
+        context += `\n`;
+    }
+    
+    // ================================================================
+    // STEP 5: Data structures (structs, types, enums)
+    // ================================================================
+    const dataStructures = [];
+    for (const [key, symbol] of codeIndex.symbols) {
+        if (key.includes('@')) continue;
+        if (['struct', 'class', 'type', 'typedef', 'enum'].includes(symbol.type)) {
+            dataStructures.push({
+                name: symbol.name,
+                type: symbol.type,
+                file: symbol.file?.split('/').pop() || '?',
+                module: symbol.file?.split('/').slice(-2, -1)[0] || '?'
+            });
+        }
+    }
+    
+    if (dataStructures.length > 0) {
+        context += `## Key Data Structures (${dataStructures.length} total)\n\n`;
+        
+        // Group by module
+        const structsByModule = new Map();
+        for (const ds of dataStructures) {
+            if (!structsByModule.has(ds.module)) {
+                structsByModule.set(ds.module, []);
+            }
+            structsByModule.get(ds.module).push(ds);
+        }
+        
+        for (const [module, structs] of Array.from(structsByModule.entries()).slice(0, 20)) {
+            context += `**${module}/**: ${structs.slice(0, 8).map(s => s.name).join(', ')}`;
+            if (structs.length > 8) context += ` (+${structs.length - 8} more)`;
+            context += `\n`;
+        }
+        context += `\n`;
+    }
+    
+    // ================================================================
+    // STEP 6: Language breakdown
+    // ================================================================
+    const byLanguage = new Map();
+    for (const [path, file] of contextFiles) {
+        const lang = file.language || 'unknown';
+        if (!byLanguage.has(lang)) byLanguage.set(lang, 0);
+        byLanguage.set(lang, byLanguage.get(lang) + 1);
+    }
+    
+    context += `## Language Breakdown\n\n`;
+    for (const [lang, count] of Array.from(byLanguage.entries()).sort((a, b) => b[1] - a[1])) {
+        context += `- **${lang}**: ${count} files\n`;
+    }
+    
+    // Limit context size but keep it comprehensive
+    if (context.length > SUMMARY_CONFIG.CONTEXT_WINDOW_LIMIT) {
+        context = context.substring(0, SUMMARY_CONFIG.CONTEXT_WINDOW_LIMIT) + '\n\n... [truncated for context limit]';
+    }
+    
+    log('generateQuickOverview: Built context of', context.length, 'chars');
+    
+    // ================================================================
+    // STEP 7: Send to LLM for final synthesis
+    // ================================================================
+    const prompt = `You are analyzing a large codebase. Based on this comprehensive structural analysis, provide a HIGH-LEVEL OVERVIEW.
+
+${context}
+
+USER QUESTION: ${query}
+
+Provide a well-organized answer that:
+1. Describes the OVERALL PURPOSE of this codebase
+2. Lists the MAJOR MODULES/COMPONENTS and their responsibilities
+3. Identifies KEY ARCHITECTURAL PATTERNS
+4. Notes important ENTRY POINTS and how components interact
+5. Highlights any interesting DESIGN DECISIONS evident from the structure
+
+Be comprehensive - this is a summary of the ENTIRE codebase, not just one part.`;
+
+    return await callLanguageModel(prompt);
+}
+
+/**
+ * Handle detailed queries using search + chunking
+ */
+/**
+ * Check if an LLM response is actually an error message
+ * Returns true if the response looks like an error template
+ */
+function isLlmErrorResponse(response) {
+    if (!response) return false;
+    const trimmed = response.trim();
+    return (
+        trimmed.includes('Fix Option 1:') ||
+        trimmed.includes('Fix Option 2:') ||
+        trimmed.startsWith('**Language Model not available') ||
+        trimmed.startsWith('**Cannot generate') ||
+        trimmed.startsWith('❌ GitHub Copilot') ||
+        trimmed.includes('LLM unavailable')
+    );
+}
+
+async function handleDetailedQuery(query) {
+    log('handleDetailedQuery: Processing specific query with search + chunking');
+    
+    // VERBOSE: Show which code path we're in
+    if (AGENT_CONFIG.verboseSearch) {
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n**🔧 Debug: Using handleDetailedQuery (large codebase path)**\n**Query:** ${query.substring(0, 100)}...\n\n`
+        });
+    }
+    
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `\n🔍 *Searching codebase...*\n`
+    });
+    
+    // Step 1: Search for relevant code using all available methods
+    const searchResults = await comprehensiveSearch(query);
+    
+    if (searchResults.length === 0) {
+        return `No relevant code found for: "${query}". Try rephrasing or check if the functionality exists in the attached files.`;
+    }
+    
+    log(`handleDetailedQuery: Found ${searchResults.length} relevant results`);
+    
+    // Extract high-priority files (filename matches get score >= 1.4)
+    const highPriorityFiles = [...new Set(
+        searchResults
+            .filter(r => r.score >= 1.4 && r.source?.includes('filename'))
+            .map(r => r.file?.split('/').pop())
+            .filter(Boolean)
+    )];
+    
+    // Extract all analyzed files (deduped)
+    const allFilesAnalyzed = [...new Set(searchResults.map(r => r.file?.split('/').pop()).filter(Boolean))];
+    
+    log('handleDetailedQuery: High priority files (filename matches):', highPriorityFiles);
+    
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `Found ${searchResults.length} relevant code sections...\n`
+    });
+    
+    // Step 2: Chunk the results to fit context window
+    const chunks = chunkSearchResults(searchResults, SUMMARY_CONFIG.CHUNK_SIZE_FOR_QUERY);
+    
+    log(`handleDetailedQuery: Split into ${chunks.length} chunks`);
+    
+    // Limit chunks to prevent overwhelming the system
+    const MAX_CHUNKS = 8;  // Process at most 8 chunks (reduced to prevent API limits)
+    const chunksToProcess = chunks.slice(0, MAX_CHUNKS);
+    
+    if (chunks.length > MAX_CHUNKS) {
+        log(`handleDetailedQuery: Limiting from ${chunks.length} to ${MAX_CHUNKS} chunks`);
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `*Note: Processing top ${MAX_CHUNKS} of ${chunks.length} relevant chunks for efficiency*\n`
+        });
+    }
+    
+    // Step 3: Analyze each chunk
+    const chunkAnalyses = [];
+    
+    for (let i = 0; i < chunksToProcess.length; i++) {
+        if (taskController.isCancelled) {
+            throw new Error('Query cancelled by user');
+        }
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n📖 *Analyzing chunk ${i + 1}/${chunksToProcess.length}...*\n`
+        });
+        
+        const analysis = await analyzeChunk(query, chunksToProcess[i], i + 1, chunksToProcess.length);
+        if (analysis) {
+            chunkAnalyses.push(analysis);
+        }
+    }
+    
+    // Step 4: Synthesize final answer
+    if (chunkAnalyses.length === 0) {
+        return `Found code but couldn't analyze it. The code may be too complex or the LLM is unavailable.`;
+    }
+    
+    // Always synthesize to get structured format, even for single chunk
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `\n🧩 *Synthesizing results...*\n`
+    });
+    
+    return await synthesizeChunkAnalyses(query, chunkAnalyses, highPriorityFiles, allFilesAnalyzed);
+}
+
+/**
+ * Comprehensive search using all available methods
+ * Priority: 1) File name matches, 2) Symbol name matches, 3) Grep, 4) Vector
+ */
+async function comprehensiveSearch(query) {
+    const results = new Map(); // Use map to dedupe by file:line
+    
+    // Extract keywords for search
+    const keywords = extractSearchKeywords(query);
+    log('comprehensiveSearch: Keywords:', keywords);
+    
+    // ================================================================
+    // 0. FILE NAME MATCHING (HIGHEST PRIORITY)
+    // For "show me X that implements Y", find files with Y in the name
+    // ================================================================
+    for (const keyword of keywords) {
+        if (keyword.length < 3) continue;
+        const keywordLower = keyword.toLowerCase();
+        
+        for (const [filePath, file] of contextFiles) {
+            const fileName = filePath.split('/').pop().toLowerCase();
+            const fileNameNoExt = fileName.replace(/\.[^.]+$/, '');
+            
+            // Check if filename matches keyword (multiple strategies)
+            const keywordInFile = fileNameNoExt.includes(keywordLower) || fileName.includes(keywordLower);
+            const fileInKeyword = keywordLower.length >= 4 && keywordLower.includes(fileNameNoExt.substring(0, Math.min(4, fileNameNoExt.length)));
+            const commonPrefix = fileNameNoExt.length >= 4 && keywordLower.length >= 4 && 
+                                fileNameNoExt.substring(0, 4) === keywordLower.substring(0, 4); // e.g., "part" == "part"
+            
+            if (keywordInFile || fileInKeyword || commonPrefix) {
+                // This file's name matches - add all its top-level symbols
+                let addedFromFile = 0;
+                for (const [symKey, symbol] of codeIndex.symbols) {
+                    if (symbol.file === filePath && !symKey.includes('@')) {
+                        const key = `${symbol.file}:${symbol.line}`;
+                        if (!results.has(key)) {
+                            results.set(key, {
+                                file: symbol.file,
+                                line: symbol.line,
+                                name: symbol.name,
+                                type: symbol.type,
+                                score: 1.5, // HIGHEST score for file name matches
+                                source: 'filename-match',
+                                content: null
+                            });
+                            addedFromFile++;
+                        }
+                    }
+                }
+                
+                // If no symbols found, add the file header
+                if (addedFromFile === 0) {
+                    const key = `${filePath}:1`;
+                    if (!results.has(key)) {
+                        results.set(key, {
+                            file: filePath,
+                            line: 1,
+                            name: fileName,
+                            type: 'file',
+                            score: 1.4,
+                            source: 'filename-match',
+                            content: extractCodeContext(file.content, 1, 50)
+                        });
+                    }
+                }
+                
+                log(`comprehensiveSearch: File name match: ${fileName} for keyword "${keyword}" (keywordInFile=${keywordInFile}, fileInKeyword=${fileInKeyword}, commonPrefix=${commonPrefix})`);
+            }
+        }
+    }
+    
+    // ================================================================
+    // 1. SYMBOL NAME SEARCH (exact matches get higher score)
+    // ================================================================
+    for (const keyword of keywords) {
+        const keywordLower = keyword.toLowerCase();
+        
+        // First: exact symbol name matches
+        for (const [symKey, symbol] of codeIndex.symbols) {
+            if (symKey.includes('@')) continue;
+            
+            const symNameLower = symbol.name.toLowerCase();
+            const key = `${symbol.file}:${symbol.line}`;
+            
+            if (results.has(key)) continue; // Already have from file match
+            
+            // Exact match or contains
+            if (symNameLower === keywordLower) {
+                results.set(key, {
+                    file: symbol.file,
+                    line: symbol.line,
+                    name: symbol.name,
+                    type: symbol.type,
+                    score: 1.3, // High score for exact name match
+                    source: 'symbol-exact',
+                    content: null
+                });
+            } else if (symNameLower.includes(keywordLower)) {
+                results.set(key, {
+                    file: symbol.file,
+                    line: symbol.line,
+                    name: symbol.name,
+                    type: symbol.type,
+                    score: 1.0, // Good score for partial name match
+                    source: 'symbol-partial',
+                    content: null
+                });
+            }
+        }
+        
+        // Then fuzzy search for remaining
+        const symbolResults = fuzzySearchSymbols(keyword, null, 20);
+        for (const symbol of symbolResults) {
+            const key = `${symbol.file}:${symbol.line}`;
+            if (!results.has(key)) {
+                results.set(key, {
+                    file: symbol.file,
+                    line: symbol.line,
+                    name: symbol.name,
+                    type: symbol.type,
+                    score: symbol.matchScore || 0.5,
+                    source: 'symbol-fuzzy',
+                    content: null
+                });
+            }
+        }
+    }
+    
+    // 2. TRIGRAM SEARCH (fast partial/exact text matching)
+    if (trigramIndex.index.size > 0) {
+        for (const keyword of keywords.slice(0, 3)) {
+            if (keyword.length < 3) continue;
+            try {
+                const trigramResults = searchTrigramIndex(keyword, { maxResults: 15 });
+                for (const tr of trigramResults) {
+                    const key = `${tr.file}:${tr.line}`;
+                    if (!results.has(key)) {
+                        results.set(key, {
+                            file: tr.file,
+                            line: tr.line,
+                            name: tr.context?.split('\n')[0]?.substring(0, 50) || keyword,
+                            type: 'trigram',
+                            score: 0.8,  // Between symbol (1.0) and grep (0.6)
+                            source: 'trigram',
+                            content: tr.context
+                        });
+                    }
+                }
+            } catch (e) {
+                log('comprehensiveSearch: Trigram error:', e.message);
+            }
+        }
+    }
+    
+    // 3. Grep search (for things symbol parser might miss)
+    for (const keyword of keywords.slice(0, 3)) { // Limit grep keywords
+        try {
+            const grepResults = await AGENT_TOOLS.grep_context.execute({ 
+                pattern: keyword, 
+                contextLines: 10 
+            });
+            
+            if (grepResults.success && grepResults.data?.results) {
+                for (const match of grepResults.data.results) {
+                    const file = findFileByName(match.fileName);
+                    if (file) {
+                        const key = `${file.path}:${match.startLine}`;
+                        if (!results.has(key)) {
+                            results.set(key, {
+                                file: file.path,
+                                line: match.startLine,
+                                name: match.fileName,
+                                type: 'grep',
+                                score: 0.6,
+                                source: 'grep',
+                                content: match.content
+                            });
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            log('comprehensiveSearch: Grep error:', e.message);
+        }
+    }
+    
+    // 3. Vector search (if available)
+    if (vectorIndex.chunks.length > 0) {
+        try {
+            const vectorResults = await hybridSearch(query, { maxResults: 20 });
+            for (const vr of vectorResults) {
+                const key = `${vr.file}:${vr.line}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: vr.file,
+                        line: vr.line,
+                        name: vr.symbol || vr.fileName,
+                        type: 'vector',
+                        score: vr.score || 0.5,
+                        source: 'vector',
+                        content: vr.preview
+                    });
+                }
+            }
+        } catch (e) {
+            log('comprehensiveSearch: Vector search error:', e.message);
+        }
+    }
+    
+    // 4. Call graph traversal for tracing queries
+    if (/trace|flow|call|calls|calling|invokes?/i.test(query)) {
+        for (const keyword of keywords) {
+            const symbol = codeIndex.symbols.get(keyword);
+            if (symbol && codeIndex.callGraph.has(keyword)) {
+                // Add called functions
+                const calls = codeIndex.callGraph.get(keyword);
+                for (const called of calls) {
+                    const calledSymbol = codeIndex.symbols.get(called);
+                    if (calledSymbol) {
+                        const key = `${calledSymbol.file}:${calledSymbol.line}`;
+                        if (!results.has(key)) {
+                            results.set(key, {
+                                file: calledSymbol.file,
+                                line: calledSymbol.line,
+                                name: called,
+                                type: 'callgraph',
+                                score: 0.7,
+                                source: 'callgraph',
+                                content: null
+                            });
+                        }
+                    }
+                }
+                
+                // Add callers
+                const callers = codeIndex.reverseCallGraph.get(keyword);
+                if (callers) {
+                    for (const caller of callers) {
+                        const callerSymbol = codeIndex.symbols.get(caller);
+                        if (callerSymbol) {
+                            const key = `${callerSymbol.file}:${callerSymbol.line}`;
+                            if (!results.has(key)) {
+                                results.set(key, {
+                                    file: callerSymbol.file,
+                                    line: callerSymbol.line,
+                                    name: caller,
+                                    type: 'callgraph',
+                                    score: 0.7,
+                                    source: 'callgraph',
+                                    content: null
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Convert to array and fill in content
+    const resultsArray = Array.from(results.values());
+    
+    for (const result of resultsArray) {
+        if (!result.content && result.file) {
+            const file = contextFiles.get(result.file);
+            if (file) {
+                result.content = extractCodeContext(file.content, result.line, 30);
+            }
+        }
+    }
+    
+    // Sort by score
+    resultsArray.sort((a, b) => b.score - a.score);
+    
+    // VERBOSE: Show comprehensive search results
+    if (AGENT_CONFIG.verboseSearch && resultsArray.length > 0) {
+        let verboseOutput = '\n**🔎 comprehensiveSearch Results:**\n\n';
+        verboseOutput += `**Keywords:** \`${keywords.slice(0, 10).join('`, `')}\`\n\n`;
+        
+        // Group by source
+        const bySource = {};
+        for (const r of resultsArray) {
+            const src = r.source || 'unknown';
+            if (!bySource[src]) bySource[src] = [];
+            bySource[src].push(r);
+        }
+        
+        verboseOutput += `| Source | Count | Top Matches |\n`;
+        verboseOutput += `|:-------|:------|:------------|\n`;
+        for (const [src, items] of Object.entries(bySource)) {
+            const topNames = items.slice(0, 5).map(i => i.name).join(', ');
+            verboseOutput += `| ${src} | ${items.length} | ${topNames.substring(0, 60)}... |\n`;
+        }
+        
+        verboseOutput += `\n**Top 10 Results:**\n`;
+        for (const r of resultsArray.slice(0, 10)) {
+            const fileName = r.file?.split('/').pop() || 'unknown';
+            verboseOutput += `- \`${r.name}\` (${r.type}) in ${fileName}:${r.line} [score=${r.score.toFixed(2)}, src=${r.source}]\n`;
+        }
+        verboseOutput += '\n---\n\n';
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: verboseOutput
+        });
+    }
+    
+    return resultsArray.slice(0, 50); // Limit results
+}
+
+/**
+ * Extract search keywords from query
+ * Also extracts specific file names mentioned
+ */
+function extractSearchKeywords(query) {
+    // Remove common words AND task words (words that describe what to do, not what to search for)
+    const stopWords = new Set([
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
+        'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
+        'from', 'as', 'into', 'through', 'during', 'before', 'after',
+        'above', 'below', 'between', 'under', 'again', 'further', 'then',
+        'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all',
+        'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor',
+        'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just',
+        'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those',
+        'am', 'and', 'but', 'if', 'or', 'because', 'until', 'while',
+        // Task words - describe actions, not search targets
+        'explain', 'explained', 'explaining', 'explaing', // common typo
+        'describe', 'described', 'show', 'shown', 'showing',
+        'tell', 'me', 'about', 'find', 'found', 'finding',
+        'code', 'function', 'method', 'class', 'file', 'does', 'work', 'works', 'working',
+        'how', 'implement', 'implemented', 'implementation', 'implements',
+        'identify', 'bug', 'bugs', 'issue', 'issues', 'problem', 'problems',
+        'review', 'analyze', 'analyse', 'check', 'fix', 'look', 'see',
+        'list', 'give', 'provide', 'help', 'want', 'need', 'please',
+        'using', 'used', 'use', 'get', 'gets', 'getting'
+    ]);
+    
+    // Helper: check if word is similar to any stop word (1 char difference)
+    const isSimilarToStopWord = (word) => {
+        const wLower = word.toLowerCase();
+        if (stopWords.has(wLower)) return true;
+        // Check for 1-char typos in common task words
+        const taskRoots = ['explain', 'describe', 'implement', 'function', 'method'];
+        for (const root of taskRoots) {
+            if (wLower.startsWith(root) || root.startsWith(wLower.substring(0, 4))) return true;
+        }
+        return false;
+    };
+    
+    // Extract words and technical terms
+    const words = query
+        .replace(/[^\w\s_.-]/g, ' ')  // Keep dots for file extensions
+        .split(/\s+/)
+        .filter(w => w.length > 2)
+        .filter(w => !isSimilarToStopWord(w));
+    
+    // Also extract camelCase/snake_case parts
+    const extraTerms = [];
+    for (const word of words) {
+        // Split camelCase
+        const camelParts = word.split(/(?=[A-Z])/).filter(p => p.length > 2);
+        extraTerms.push(...camelParts);
+        
+        // Split snake_case
+        const snakeParts = word.split('_').filter(p => p.length > 2);
+        extraTerms.push(...snakeParts);
+    }
+    
+    // Combine and dedupe
+    const allTerms = [...new Set([...words, ...extraTerms])];
+    
+    return allTerms.slice(0, 10); // Limit keywords
+}
+
+/**
+ * Extract specific file names from query
+ * Returns array of { fileName, baseName } for files mentioned
+ */
+function extractFileNamesFromQuery(query) {
+    const files = [];
+    
+    // Match file patterns: word.ext or word_word.ext
+    const filePatterns = [
+        /\b([\w-]+\.(?:c|h|cpp|hpp|java|py|js|ts|go|rs|rb|sql|tal|cob|cbl))\b/gi,
+        /\b([\w-]+\.(?:json|xml|yaml|yml|md|txt))\b/gi
+    ];
+    
+    for (const pattern of filePatterns) {
+        const matches = query.matchAll(pattern);
+        for (const match of matches) {
+            const fileName = match[1];
+            const baseName = fileName.replace(/\.[^.]+$/, '');
+            files.push({ fileName, baseName });
+        }
+    }
+    
+    return files;
+}
+
+/**
+ * Find file path by name
+ */
+function findFileByName(fileName) {
+    for (const [path, file] of contextFiles) {
+        if (path.endsWith(fileName) || path.split('/').pop() === fileName) {
+            return { path, file };
+        }
+    }
+    return null;
+}
+
+/**
+ * Extract code context around a line
+ */
+function extractCodeContext(content, lineNum, contextLines = 20) {
+    const lines = content.split('\n');
+    const start = Math.max(0, lineNum - contextLines - 1);
+    const end = Math.min(lines.length, lineNum + contextLines);
+    
+    return lines.slice(start, end)
+        .map((line, i) => `${(start + i + 1).toString().padStart(5)}: ${line}`)
+        .join('\n');
+}
+
+/**
+ * Chunk search results to fit context window
+ */
+function chunkSearchResults(results, maxChunkSize) {
+    const chunks = [];
+    let currentChunk = [];
+    let currentSize = 0;
+    
+    for (const result of results) {
+        const resultSize = (result.content?.length || 0) + 200; // 200 for metadata
+        
+        if (currentSize + resultSize > maxChunkSize && currentChunk.length > 0) {
+            chunks.push(currentChunk);
+            currentChunk = [];
+            currentSize = 0;
+        }
+        
+        currentChunk.push(result);
+        currentSize += resultSize;
+    }
+    
+    if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+    }
+    
+    return chunks;
+}
+
+/**
+ * Analyze a chunk of search results
+ */
+async function analyzeChunk(query, chunk, chunkNum, totalChunks) {
+    // Build context from chunk
+    let context = '';
+    for (const result of chunk) {
+        context += `\n### ${result.name} (${result.type} in ${result.file?.split('/').pop()}:${result.line})\n`;
+        context += `Source: ${result.source}, Score: ${(result.score * 100).toFixed(0)}%\n`;
+        if (result.content) {
+            context += `\`\`\`\n${result.content}\n\`\`\`\n`;
+        }
+    }
+    
+    // IMPORTANT: Limit context size to prevent "prompt too large" errors
+    // API limit is 25000 chars, leave room for instructions (~500 chars)
+    const MAX_CONTEXT_SIZE = 8000;  // Conservative limit
+    if (context.length > MAX_CONTEXT_SIZE) {
+        log(`analyzeChunk: Truncating context from ${context.length} to ${MAX_CONTEXT_SIZE} chars`);
+        context = context.substring(0, MAX_CONTEXT_SIZE) + '\n\n[... context truncated for size ...]';
+    }
+    
+    const prompt = `Analyze this code to answer the user's question.
+
+## Code Context (Chunk ${chunkNum}/${totalChunks})
+${context}
+
+## User Question
+${query}
+
+## Instructions
+1. Focus on answering the specific question
+2. Reference specific functions, line numbers, and code patterns
+3. If this chunk doesn't fully answer the question, note what's found and what might be missing
+4. Keep your analysis under 1500 words - focus on key insights
+5. Be concise but thorough
+
+Your analysis:`;
+
+    try {
+        let analysis = await callLanguageModel(prompt);
+        
+        // Check if the response is actually an error message
+        if (isLlmErrorResponse(analysis)) {
+            log('analyzeChunk: Got error template instead of analysis');
+            return null;
+        }
+        
+        // Truncate overly long analyses to prevent prompt explosion
+        const MAX_ANALYSIS_LENGTH = 8000;  // ~2000 words
+        if (analysis && analysis.length > MAX_ANALYSIS_LENGTH) {
+            log(`analyzeChunk: Truncating analysis from ${analysis.length} to ${MAX_ANALYSIS_LENGTH} chars`);
+            analysis = analysis.substring(0, MAX_ANALYSIS_LENGTH) + '\n\n[... truncated for brevity ...]';
+        }
+        
+        return analysis;
+    } catch (error) {
+        log('analyzeChunk: Error:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Synthesize multiple chunk analyses into final answer
+ */
+async function synthesizeChunkAnalyses(query, analyses, priorityFiles = [], allFilesAnalyzed = []) {
+    // ================================================================
+    // HIERARCHICAL MAP/REDUCE SYNTHESIS
+    // If we have many analyses, merge them in batches to avoid token limits
+    // Like merge sort: combine small groups → combine those → final result
+    // ================================================================
+    
+    const MAX_BATCH_SIZE = 3;  // Process 3 analyses at a time (reduced for API limits)
+    const MAX_COMBINED_SIZE = 15000;  // Trigger hierarchical merge early (API limit ~25K)
+    
+    log(`synthesizeChunkAnalyses: Processing ${analyses.length} analyses`);
+    
+    // Check if we need hierarchical merging
+    let combinedAnalyses = analyses.map((a, i) => `### Part ${i + 1}\n${a}`).join('\n\n');
+    
+    if (combinedAnalyses.length > MAX_COMBINED_SIZE && analyses.length > MAX_BATCH_SIZE) {
+        log(`synthesizeChunkAnalyses: Content too large (${Math.round(combinedAnalyses.length/1024)}KB), using hierarchical merge`);
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n🔄 *Large result set - using hierarchical merge (${analyses.length} chunks → batches of ${MAX_BATCH_SIZE})...*\n`
+        });
+        
+        // Merge analyses in batches until we have a manageable size
+        let currentAnalyses = [...analyses];
+        let mergeRound = 1;
+        
+        while (currentAnalyses.length > MAX_BATCH_SIZE) {
+            const mergedBatches = [];
+            
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n*Merge round ${mergeRound}: ${currentAnalyses.length} → ~${Math.ceil(currentAnalyses.length / MAX_BATCH_SIZE)} summaries...*\n`
+            });
+            
+            // Process in batches
+            for (let i = 0; i < currentAnalyses.length; i += MAX_BATCH_SIZE) {
+                const batch = currentAnalyses.slice(i, i + MAX_BATCH_SIZE);
+                const batchNum = Math.floor(i / MAX_BATCH_SIZE) + 1;
+                const totalBatches = Math.ceil(currentAnalyses.length / MAX_BATCH_SIZE);
+                
+                // Merge this batch into an intermediate summary
+                let batchContent = batch.map((a, j) => `### Section ${j + 1}\n${a}`).join('\n\n');
+                
+                // Limit batch content size to prevent prompt overflow
+                const MAX_BATCH_CONTENT = 10000;  // Conservative to stay under 25K API limit
+                if (batchContent.length > MAX_BATCH_CONTENT) {
+                    log(`synthesizeChunkAnalyses: Truncating batch ${batchNum} from ${batchContent.length} to ${MAX_BATCH_CONTENT}`);
+                    batchContent = batchContent.substring(0, MAX_BATCH_CONTENT) + '\n\n[... truncated ...]';
+                }
+                
+                const mergePrompt = `Merge these ${batch.length} analysis sections into a comprehensive technical summary.
+
+## Original Query
+${query}
+
+## Sections to Merge
+${batchContent}
+
+## Instructions
+1. PRESERVE all specific code references (function names, file names, line numbers)
+2. PRESERVE technical patterns and implementation details
+3. PRESERVE the "how it works" explanations with concrete examples
+4. Remove only true duplicates where the exact same point is made twice
+5. Organize by topic (e.g., "Parent/Child Relationships", "Catalog Storage", "Key Functions")
+6. Keep technical depth - this is for developers, not executives
+7. Target 2500-3000 words - detail is more important than brevity
+
+Merged technical summary:`;
+
+                try {
+                    let merged = await callLanguageModel(mergePrompt);
+                    
+                    // Ensure merge didn't over-compress
+                    if (merged && merged.length < 1000 && batchContent.length > 3000) {
+                        log(`synthesizeChunkAnalyses: Merge too short (${merged.length}), keeping original`);
+                        merged = batch.join('\n\n---\n\n');
+                    }
+                    
+                    if (merged && merged.length > 50) {
+                        mergedBatches.push(merged);
+                        log(`synthesizeChunkAnalyses: Merged batch ${batchNum}/${totalBatches} (${batch.length} → 1)`);
+                    } else {
+                        // Keep original if merge failed
+                        mergedBatches.push(batch.join('\n\n---\n\n'));
+                    }
+                } catch (err) {
+                    log(`synthesizeChunkAnalyses: Batch ${batchNum} merge failed:`, err.message);
+                    mergedBatches.push(batch.join('\n\n---\n\n'));
+                }
+            }
+            
+            currentAnalyses = mergedBatches;
+            mergeRound++;
+            
+            // Safety check to prevent infinite loops
+            if (mergeRound > 5) {
+                log('synthesizeChunkAnalyses: Max merge rounds reached, proceeding with current results');
+                break;
+            }
+        }
+        
+        // Update combinedAnalyses with merged results
+        combinedAnalyses = currentAnalyses.map((a, i) => `### Summary ${i + 1}\n${a}`).join('\n\n');
+        log(`synthesizeChunkAnalyses: After ${mergeRound - 1} merge rounds: ${Math.round(combinedAnalyses.length/1024)}KB`);
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `*Merge complete: ${analyses.length} chunks → ${currentAnalyses.length} summaries (${Math.round(combinedAnalyses.length/1024)}KB)*\n`
+        });
+    }
+    
+    // Add priority file information at the TOP of the context
+    if (priorityFiles.length > 0) {
+        // Limit to top 10 unique files
+        const topPriorityFiles = priorityFiles.slice(0, 10);
+        const prioritySection = `## ⭐ HIGH-PRIORITY FILES (filename matches query topic)
+These files are MOST LIKELY to contain core implementation - prioritize them in key_files:
+${topPriorityFiles.map(f => `- ${f}`).join('\n')}
+
+---
+
+`;
+        combinedAnalyses = prioritySection + combinedAnalyses;
+    }
+    
+    // VERBOSE: Show which code path we're in
+    if (AGENT_CONFIG.verboseSearch) {
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n**🔧 Debug: Using synthesizeChunkAnalyses (${analyses.length} chunks, ${Math.round(combinedAnalyses.length/1024)}KB)**\n`
+        });
+        if (priorityFiles.length > 0) {
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `**Priority files (filename matches):** ${priorityFiles.join(', ')}\n\n`
+            });
+        }
+    }
+    
+    // Use the two-stage synthesis approach for consistent formatting
+    const subQuestions = decomposeQuestion(query);
+    
+    // Route through the two-stage synthesis function
+    const result = await synthesizeFindingsWithReferences(
+        query,
+        combinedAnalyses,
+        null, // domain
+        null, // domain_notes
+        subQuestions,
+        allFilesAnalyzed, // filesAnalyzed
+        [], // relatedFiles  
+        []  // functionsFound
+    );
+    
+    if (result.success && result.data?.answer) {
+        return result.data.answer;
+    }
+    
+    // Fallback if two-stage fails
+    log('synthesizeChunkAnalyses: Two-stage failed, falling back to direct synthesis');
+    const prompt = `Synthesize these partial analyses into a complete answer.
+
+## Original Question
+${query}
+
+## Analyses from Different Code Sections
+${combinedAnalyses}
+
+## Instructions
+1. Combine the insights from all analyses
+2. Resolve any contradictions
+3. Provide a coherent, complete answer
+4. Include specific code references (function names, line numbers)
+5. Structure the answer logically (overview first, then details)
+
+Final synthesized answer:`;
+
+    const fallbackResult = await callLanguageModel(prompt);
+    
+    // Check if the fallback also failed
+    if (isLlmErrorResponse(fallbackResult)) {
+        return `**Unable to synthesize analysis**
+
+The LLM is currently unavailable. Please check your GitHub Copilot or API configuration.
+
+**What was found:**
+${analyses.length > 0 ? `- Analyzed ${analyses.length} code chunks` : '- No code chunks analyzed'}
+${priorityFiles.length > 0 ? `- Priority files: ${priorityFiles.slice(0, 5).join(', ')}` : ''}
+
+Try again later or check the Output panel (View → Output → AstraCode) for details.`;
+    }
+    
+    return fallbackResult;
+}
+
+/**
+ * Search for relevant code using all available methods
+ * Used by answer_question tool for search-first approach
+ */
+async function searchForRelevantCode(question, subQuestions = []) {
+    log('searchForRelevantCode: Starting multi-method search');
+    
+    const results = new Map(); // Dedupe by file:line
+    
+    // Combine question and sub-questions for keyword extraction
+    const fullQuery = [question, ...subQuestions].join(' ');
+    const keywords = extractSearchKeywords(fullQuery);
+    log('searchForRelevantCode: Keywords:', keywords.slice(0, 10));
+    
+    // ================================================================
+    // -1. SPECIFIC FILE MENTIONED IN QUERY (HIGHEST PRIORITY)
+    // For "identify bugs in partdesc.c" → focus on partdesc.c
+    // ================================================================
+    const mentionedFiles = extractFileNamesFromQuery(fullQuery);
+    if (mentionedFiles.length > 0) {
+        log('searchForRelevantCode: Specific files mentioned:', mentionedFiles.map(f => f.fileName));
+        
+        for (const { fileName, baseName } of mentionedFiles) {
+            // Find this file in context
+            for (const [filePath, file] of contextFiles) {
+                const pathFileName = filePath.split('/').pop();
+                if (pathFileName === fileName || pathFileName.toLowerCase() === fileName.toLowerCase()) {
+                    log(`searchForRelevantCode: Found mentioned file: ${filePath}`);
+                    
+                    // Add ALL symbols from this file with HIGHEST priority
+                    for (const [symKey, symbol] of codeIndex.symbols) {
+                        if (symbol.file === filePath && !symKey.includes('@')) {
+                            const key = `${symbol.file}:${symbol.line}`;
+                            if (!results.has(key)) {
+                                results.set(key, {
+                                    file: symbol.file,
+                                    line: symbol.line,
+                                    name: symbol.name,
+                                    type: symbol.type,
+                                    score: 2.0, // HIGHEST score - specific file mentioned
+                                    source: 'mentioned-file',
+                                    content: null
+                                });
+                            }
+                        }
+                    }
+                    
+                    // Also add the file header if no symbols
+                    if (results.size === 0) {
+                        results.set(`${filePath}:1`, {
+                            file: filePath,
+                            line: 1,
+                            name: pathFileName,
+                            type: 'file',
+                            score: 2.0,
+                            source: 'mentioned-file',
+                            content: extractCodeContext(file.content, 1, 100)
+                        });
+                    }
+                }
+            }
+        }
+        
+        // If we found the specific file, we may want to focus on it
+        if (results.size > 0) {
+            log(`searchForRelevantCode: Found ${results.size} results from mentioned files`);
+        }
+    }
+    
+    // ================================================================
+    // 0. FILE NAME MATCHING (HIGH PRIORITY)
+    // For queries like "show me partition code", find files with "partition" in name
+    // Also handles: keyword in filename OR filename stem in keyword
+    // ================================================================
+    log('searchForRelevantCode: Checking file name matches...');
+    for (const keyword of keywords) {
+        if (keyword.length < 3) continue;
+        const keywordLower = keyword.toLowerCase();
+        
+        for (const [filePath, file] of contextFiles) {
+            const fileName = filePath.split('/').pop().toLowerCase();
+            const fileNameNoExt = fileName.replace(/\.[^.]+$/, '');
+            
+            // Check BOTH directions:
+            // 1. keyword in filename: "part" matches "partdesc.c"
+            // 2. filename stem in keyword: "partdesc" matches "partitioning" (via common prefix)
+            const keywordInFile = fileNameNoExt.includes(keywordLower) || fileName.includes(keywordLower);
+            const fileInKeyword = keywordLower.includes(fileNameNoExt.substring(0, 4)); // First 4 chars
+            const commonPrefix = fileNameNoExt.substring(0, 4) === keywordLower.substring(0, 4); // e.g., "part" == "part"
+            
+            if (keywordInFile || (fileNameNoExt.length >= 4 && (fileInKeyword || commonPrefix))) {
+                // Add all top-level symbols from this file with HIGH priority
+                let addedFromFile = 0;
+                for (const [symKey, symbol] of codeIndex.symbols) {
+                    if (symbol.file === filePath && !symKey.includes('@')) {
+                        const key = `${symbol.file}:${symbol.line}`;
+                        if (!results.has(key)) {
+                            results.set(key, {
+                                file: symbol.file,
+                                line: symbol.line,
+                                name: symbol.name,
+                                type: symbol.type,
+                                score: 1.5, // HIGH score for file name matches
+                                source: 'filename-match',
+                                content: null
+                            });
+                            addedFromFile++;
+                        }
+                    }
+                }
+                
+                // If no symbols found, add the file header
+                if (addedFromFile === 0) {
+                    const key = `${filePath}:1`;
+                    if (!results.has(key)) {
+                        results.set(key, {
+                            file: filePath,
+                            line: 1,
+                            name: fileName,
+                            type: 'file',
+                            score: 1.4,
+                            source: 'filename-match',
+                            content: extractCodeContext(file.content, 1, 50)
+                        });
+                    }
+                }
+                
+                log(`searchForRelevantCode: File name match: ${fileName} for keyword "${keyword}"`);
+            }
+        }
+    }
+    log('searchForRelevantCode: After file name matching:', results.size, 'results');
+    
+    // ================================================================
+    // 1. SYMBOL NAME SEARCH (exact matches get higher score)
+    // ================================================================
+    log('searchForRelevantCode: Searching symbol index...');
+    for (const keyword of keywords.slice(0, 8)) {
+        const keywordLower = keyword.toLowerCase();
+        
+        // First: exact/partial symbol name matches
+        for (const [symKey, symbol] of codeIndex.symbols) {
+            if (symKey.includes('@')) continue;
+            
+            const symNameLower = symbol.name.toLowerCase();
+            const key = `${symbol.file}:${symbol.line}`;
+            
+            if (results.has(key)) continue; // Already have from file match
+            
+            if (symNameLower === keywordLower) {
+                results.set(key, {
+                    file: symbol.file,
+                    line: symbol.line,
+                    name: symbol.name,
+                    type: symbol.type,
+                    score: 1.3, // High score for exact name match
+                    source: 'symbol-exact',
+                    content: null
+                });
+            } else if (symNameLower.includes(keywordLower)) {
+                results.set(key, {
+                    file: symbol.file,
+                    line: symbol.line,
+                    name: symbol.name,
+                    type: symbol.type,
+                    score: 1.0, // Good score for partial name match
+                    source: 'symbol-partial',
+                    content: null
+                });
+            }
+        }
+        
+        // Then fuzzy search for remaining
+        const symbolResults = fuzzySearchSymbols(keyword, null, 30);
+        for (const symbol of symbolResults) {
+            const key = `${symbol.file}:${symbol.line}`;
+            if (!results.has(key)) {
+                results.set(key, {
+                    file: symbol.file,
+                    line: symbol.line,
+                    name: symbol.name,
+                    type: symbol.type,
+                    score: (symbol.matchScore || 0.5) + 0.1,
+                    source: 'symbol-fuzzy',
+                    content: null
+                });
+            }
+        }
+    }
+    log('searchForRelevantCode: After symbol search:', results.size, 'results');
+    
+    // 2. VECTOR/EMBEDDING SEARCH (semantic similarity)
+    if (vectorIndex.chunks.length > 0) {
+        log('searchForRelevantCode: Searching vector index...');
+        try {
+            const vectorResults = await hybridSearch(question, { maxResults: 30 });
+            for (const vr of vectorResults) {
+                const key = `${vr.file}:${vr.line || 0}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: vr.file,
+                        line: vr.line || 1,
+                        name: vr.symbol || vr.file?.split('/').pop(),
+                        type: 'vector',
+                        score: (vr.score || 0.5) + 0.2, // Boost semantic matches
+                        source: 'vector',
+                        content: vr.preview
+                    });
+                } else {
+                    // Boost score if found by multiple methods
+                    const existing = results.get(key);
+                    existing.score += 0.15;
+                }
+            }
+            log('searchForRelevantCode: Vector search total now', results.size);
+        } catch (e) {
+            log('searchForRelevantCode: Vector search error:', e.message);
+        }
+    }
+    
+    // 3. GREP SEARCH (text patterns - catches things symbol parser might miss)
+    log('searchForRelevantCode: Running grep search...');
+    for (const keyword of keywords.slice(0, 5)) {
+        if (keyword.length < 3) continue;
+        
+        try {
+            const grepResults = grepContext(keyword, 8);
+            for (const match of grepResults) {
+                // Find the file path
+                let filePath = null;
+                for (const [path, file] of contextFiles) {
+                    if (path.endsWith(match.fileName) || path.includes(match.fileName)) {
+                        filePath = path;
+                        break;
+                    }
+                }
+                
+                if (filePath) {
+                    const key = `${filePath}:${match.startLine}`;
+                    if (!results.has(key)) {
+                        results.set(key, {
+                            file: filePath,
+                            line: match.startLine,
+                            name: match.fileName,
+                            type: 'grep',
+                            score: 0.6,
+                            source: 'grep',
+                            content: match.content
+                        });
+                    } else {
+                        // Boost if found by multiple methods
+                        const existing = results.get(key);
+                        existing.score += 0.1;
+                    }
+                }
+            }
+        } catch (e) {
+            log('searchForRelevantCode: Grep error for', keyword, ':', e.message);
+        }
+    }
+    log('searchForRelevantCode: After grep, total', results.size);
+    
+    // 4. CALL GRAPH TRAVERSAL (for tracing/flow questions)
+    if (/trace|flow|call|calls|calling|invoke|path|chain/i.test(question)) {
+        log('searchForRelevantCode: Adding call graph results for flow query...');
+        for (const keyword of keywords.slice(0, 5)) {
+            // Find functions matching keyword
+            for (const [name, symbol] of codeIndex.symbols) {
+                if (name.includes('@')) continue;
+                if (!name.toLowerCase().includes(keyword.toLowerCase())) continue;
+                
+                // Add what this function calls
+                const calls = codeIndex.callGraph.get(name);
+                if (calls) {
+                    for (const called of calls) {
+                        const calledSymbol = codeIndex.symbols.get(called);
+                        if (calledSymbol) {
+                            const key = `${calledSymbol.file}:${calledSymbol.line}`;
+                            if (!results.has(key)) {
+                                results.set(key, {
+                                    file: calledSymbol.file,
+                                    line: calledSymbol.line,
+                                    name: called,
+                                    type: 'callgraph',
+                                    score: 0.7,
+                                    source: 'callgraph-callee',
+                                    content: null
+                                });
+                            }
+                        }
+                    }
+                }
+                
+                // Add what calls this function
+                const callers = codeIndex.reverseCallGraph.get(name);
+                if (callers) {
+                    for (const caller of callers) {
+                        const callerSymbol = codeIndex.symbols.get(caller);
+                        if (callerSymbol) {
+                            const key = `${callerSymbol.file}:${callerSymbol.line}`;
+                            if (!results.has(key)) {
+                                results.set(key, {
+                                    file: callerSymbol.file,
+                                    line: callerSymbol.line,
+                                    name: caller,
+                                    type: 'callgraph',
+                                    score: 0.7,
+                                    source: 'callgraph-caller',
+                                    content: null
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        log('searchForRelevantCode: After call graph, total', results.size);
+    }
+    
+    // Convert to array and fill in missing content
+    const resultsArray = Array.from(results.values());
+    
+    for (const result of resultsArray) {
+        if (!result.content && result.file) {
+            const file = contextFiles.get(result.file);
+            if (file) {
+                // Extract more context for better analysis
+                result.content = extractCodeContext(file.content, result.line, 40);
+            }
+        }
+    }
+    
+    // Sort by score (highest first)
+    resultsArray.sort((a, b) => b.score - a.score);
+    
+    // Return top results (limit to avoid overwhelming LLM)
+    const maxResults = 80;
+    log('searchForRelevantCode: Returning top', Math.min(resultsArray.length, maxResults), 'of', resultsArray.length, 'results');
+    
+    return resultsArray.slice(0, maxResults);
+}
+
+/**
+ * Build focused chunks from search results
+ * Groups related results and ensures chunks fit within size limit
+ */
+function buildFocusedChunks(searchResults, maxChunkSize) {
+    const chunks = [];
+    let currentChunk = { content: '', files: new Set(), resultCount: 0 };
+    
+    // Group results by file for better context
+    const byFile = new Map();
+    for (const result of searchResults) {
+        const fileName = result.file?.split('/').pop() || 'unknown';
+        if (!byFile.has(fileName)) {
+            byFile.set(fileName, []);
+        }
+        byFile.get(fileName).push(result);
+    }
+    
+    // Build chunks, keeping file results together when possible
+    for (const [fileName, fileResults] of byFile) {
+        // Sort results within file by line number
+        fileResults.sort((a, b) => (a.line || 0) - (b.line || 0));
+        
+        for (const result of fileResults) {
+            const resultText = `### ${result.name} (${result.type} in ${fileName}:${result.line})
+Source: ${result.source}, Score: ${(result.score * 100).toFixed(0)}%
+\`\`\`
+${result.content || 'No content available'}
+\`\`\`
+
+`;
+            
+            // Check if adding this result would exceed chunk size
+            if (currentChunk.content.length + resultText.length > maxChunkSize && currentChunk.resultCount > 0) {
+                // Save current chunk and start new one
+                chunks.push(currentChunk);
+                currentChunk = { content: '', files: new Set(), resultCount: 0 };
+            }
+            
+            currentChunk.content += resultText;
+            currentChunk.files.add(fileName);
+            currentChunk.resultCount++;
+        }
+    }
+    
+    // Don't forget the last chunk
+    if (currentChunk.resultCount > 0) {
+        chunks.push(currentChunk);
+    }
+    
+    log('buildFocusedChunks: Created', chunks.length, 'chunks from', searchResults.length, 'results');
+    
+    return chunks;
+}
+
+/**
+ * Simple synchronous grep for context search
+ */
+function grepContext(pattern, contextLines = 5) {
+    const results = [];
+    const patternLower = pattern.toLowerCase();
+    
+    for (const [path, file] of contextFiles) {
+        const lines = file.content.split('\n');
+        const fileName = path.split('/').pop();
+        
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].toLowerCase().includes(patternLower)) {
+                const start = Math.max(0, i - contextLines);
+                const end = Math.min(lines.length, i + contextLines + 1);
+                const content = lines.slice(start, end)
+                    .map((line, idx) => `${(start + idx + 1).toString().padStart(5)}: ${line}`)
+                    .join('\n');
+                
+                results.push({
+                    fileName,
+                    filePath: path,
+                    startLine: i + 1,
+                    matchLine: i + 1,
+                    content
+                });
+                
+                // Skip ahead to avoid duplicate overlapping matches
+                i += contextLines;
+            }
+        }
+    }
+    
+    return results;
+}
+
 function parseFile(path, content, language) {
     const symbols = [];
     const lines = content.split('\n');
@@ -507,6 +3288,25 @@ function parseFile(path, content, language) {
     }
     const actualParser = parser || parsers['default'];
     const fileSymbols = actualParser(content, lines);
+    
+    // Add summaries to callable symbols (functions, procedures, methods)
+    const callableTypes = new Set([
+        'function', 'procedure', 'method', 'subproc', 'constructor',
+        'section', 'paragraph', 'program', 'macro'
+    ]);
+    
+    for (const symbol of fileSymbols) {
+        if (callableTypes.has(symbol.type) && symbol.line) {
+            const summary = generateFunctionSummary(content, symbol.line, language);
+            if (summary) {
+                symbol.summary = summary;
+            } else {
+                // Generate from name: convertCamelCase → "Convert camel case"
+                symbol.summary = generateSummaryFromName(symbol.name);
+            }
+        }
+    }
+    
     log('parseFile:', path, '- found', fileSymbols.length, 'symbols');
     return {
         path,
@@ -2176,61 +4976,6 @@ function splitTalDeclarations(text) {
     return parts;
 }
 
-/**
- * Get the last TAL parse result (for call graph access)
- */
-function getLastTalParseResult() {
-    return lastTalParseResult;
-}
-
-/**
- * Get TAL call graph from last parse
- */
-function getTalCallGraph() {
-    if (!lastTalParseResult) return {};
-    
-    const graph = {};
-    for (const call of lastTalParseResult.calls) {
-        if (!graph[call.caller]) {
-            graph[call.caller] = [];
-        }
-        if (!graph[call.caller].includes(call.callee)) {
-            graph[call.caller].push(call.callee);
-        }
-    }
-    return graph;
-}
-
-/**
- * Get TAL reverse call graph from last parse
- */
-function getTalReverseCallGraph() {
-    if (!lastTalParseResult) return {};
-    
-    const graph = {};
-    for (const call of lastTalParseResult.calls) {
-        if (!graph[call.callee]) {
-            graph[call.callee] = [];
-        }
-        if (!graph[call.callee].includes(call.caller)) {
-            graph[call.callee].push(call.caller);
-        }
-    }
-    return graph;
-}
-
-/**
- * Get TAL entry points (procedures not called by others)
- */
-function getTalEntryPoints() {
-    if (!lastTalParseResult) return [];
-    
-    const called = new Set(lastTalParseResult.calls.map(c => c.callee));
-    return lastTalParseResult.procedures
-        .filter(p => !called.has(p.name))
-        .map(p => p.name);
-}
-
 function parseGo(content, lines) {
     const symbols = [];
     
@@ -2480,16 +5225,48 @@ function parseSQL(content, lines) {
 
 function parseGeneric(content, lines) {
     const symbols = [];
+    let match;
     
     // Generic function-like patterns
     const funcRegex = /(?:function|def|fn|func|proc|sub|method)\s+(\w+)/gi;
-    let match;
-    
     while ((match = funcRegex.exec(content)) !== null) {
         const lineNum = content.substring(0, match.index).split('\n').length;
         symbols.push({
             name: match[1],
             type: 'function',
+            line: lineNum
+        });
+    }
+    
+    // Generic class-like patterns
+    const classRegex = /(?:class|struct|interface|type|enum)\s+(\w+)/gi;
+    while ((match = classRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'class',
+            line: lineNum
+        });
+    }
+    
+    // Generic constant patterns (ALL_CAPS = value)
+    const constRegex = /^([A-Z][A-Z0-9_]{2,})\s*[:=]/gm;
+    while ((match = constRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'constant',
+            line: lineNum
+        });
+    }
+    
+    // Generic variable patterns (type name or var/let/const name)
+    const varRegex = /(?:var|let|const|dim|local|global|int|string|bool|float|double)\s+(\w+)/gi;
+    while ((match = varRegex.exec(content)) !== null) {
+        const lineNum = content.substring(0, match.index).split('\n').length;
+        symbols.push({
+            name: match[1],
+            type: 'variable',
             line: lineNum
         });
     }
@@ -3359,6 +6136,712 @@ function getIndexSummary() {
 }
 
 /**
+ * Generate hierarchical codebase summary for overview queries
+ * Instead of including all file contents, summarizes by:
+ * 1. File/module organization
+ * 2. Function summaries grouped by file
+ * 3. Key data structures
+ * 4. Entry points and main flows
+ */
+function generateHierarchicalSummary() {
+    const fileCount = contextFiles.size;
+    const totalLines = Array.from(contextFiles.values()).reduce((sum, f) => sum + (f.content?.split('\n').length || 0), 0);
+    
+    let summary = `# CODEBASE OVERVIEW\n\n`;
+    summary += `**${fileCount} files** | **${totalLines.toLocaleString()} lines** | **${codeIndex.symbols.size} symbols**\n\n`;
+    
+    // Group files by directory/module
+    const filesByDir = new Map();
+    for (const [path, file] of contextFiles) {
+        const parts = path.split('/');
+        const dir = parts.length > 1 ? parts.slice(0, -1).join('/') : '/';
+        if (!filesByDir.has(dir)) {
+            filesByDir.set(dir, []);
+        }
+        filesByDir.get(dir).push({ path, file, name: parts[parts.length - 1] });
+    }
+    
+    // Sort directories by file count
+    const sortedDirs = [...filesByDir.entries()].sort((a, b) => b[1].length - a[1].length);
+    
+    summary += `## File Organization\n\n`;
+    for (const [dir, files] of sortedDirs.slice(0, 15)) {
+        const dirName = dir || '(root)';
+        summary += `**${dirName}/** (${files.length} files)\n`;
+        // List first few files
+        for (const f of files.slice(0, 5)) {
+            summary += `  - ${f.name}\n`;
+        }
+        if (files.length > 5) {
+            summary += `  - ... and ${files.length - 5} more\n`;
+        }
+        summary += '\n';
+    }
+    
+    // Group functions by file with summaries
+    summary += `## Functions by Module\n\n`;
+    const funcsByFile = new Map();
+    
+    for (const [key, symbol] of codeIndex.symbols) {
+        if (['function', 'procedure', 'method', 'subproc', 'paragraph', 'section'].includes(symbol.type)) {
+            const file = symbol.file || 'unknown';
+            const fileName = file.split('/').pop();
+            if (!funcsByFile.has(fileName)) {
+                funcsByFile.set(fileName, []);
+            }
+            funcsByFile.get(fileName).push(symbol);
+        }
+    }
+    
+    // Sort by function count and show top modules
+    const sortedFiles = [...funcsByFile.entries()].sort((a, b) => b[1].length - a[1].length);
+    
+    for (const [fileName, funcs] of sortedFiles.slice(0, 20)) {
+        summary += `### ${fileName} (${funcs.length} functions)\n\n`;
+        
+        // Show each function with its summary
+        for (const func of funcs.slice(0, 15)) {
+            const funcSummary = func.summary || generateSummaryFromName(func.name);
+            const callers = codeIndex.reverseCallGraph.get(func.name)?.size || 0;
+            const callees = codeIndex.callGraph.get(func.name)?.size || 0;
+            
+            summary += `- **${func.name}**: ${funcSummary}`;
+            if (callers > 0 || callees > 0) {
+                summary += ` [↓${callers} ↑${callees}]`;
+            }
+            summary += '\n';
+        }
+        
+        if (funcs.length > 15) {
+            summary += `- ... and ${funcs.length - 15} more functions\n`;
+        }
+        summary += '\n';
+    }
+    
+    // Entry points (functions not called by others)
+    const entryPoints = [];
+    for (const [funcName, callees] of codeIndex.callGraph) {
+        const callers = codeIndex.reverseCallGraph.get(funcName);
+        if (!callers || callers.size === 0) {
+            const symbol = codeIndex.symbols.get(funcName);
+            if (symbol) {
+                entryPoints.push(symbol);
+            }
+        }
+    }
+    
+    if (entryPoints.length > 0) {
+        summary += `## Entry Points (${entryPoints.length} functions not called by others)\n\n`;
+        for (const ep of entryPoints.slice(0, 20)) {
+            const epSummary = ep.summary || generateSummaryFromName(ep.name);
+            const file = ep.file?.split('/').pop() || '';
+            summary += `- **${ep.name}** (${file}): ${epSummary}\n`;
+        }
+        if (entryPoints.length > 20) {
+            summary += `- ... and ${entryPoints.length - 20} more entry points\n`;
+        }
+        summary += '\n';
+    }
+    
+    // Key data structures (structs, classes, records)
+    const dataStructures = [];
+    for (const [key, symbol] of codeIndex.symbols) {
+        if (['class', 'struct', 'record', 'type', 'interface'].includes(symbol.type)) {
+            dataStructures.push(symbol);
+        }
+    }
+    
+    if (dataStructures.length > 0) {
+        summary += `## Data Structures (${dataStructures.length})\n\n`;
+        for (const ds of dataStructures.slice(0, 30)) {
+            const file = ds.file?.split('/').pop() || '';
+            summary += `- **${ds.name}** (${ds.type}, ${file})\n`;
+        }
+        if (dataStructures.length > 30) {
+            summary += `- ... and ${dataStructures.length - 30} more\n`;
+        }
+        summary += '\n';
+    }
+    
+    // Key constants/literals
+    const constants = [];
+    for (const [key, symbol] of codeIndex.symbols) {
+        if (['constant', 'literal', 'define'].includes(symbol.type)) {
+            constants.push(symbol);
+        }
+    }
+    
+    if (constants.length > 0 && constants.length < 100) {
+        summary += `## Constants & Defines (${constants.length})\n\n`;
+        for (const c of constants.slice(0, 20)) {
+            const value = c.value ? ` = ${String(c.value).substring(0, 50)}` : '';
+            summary += `- ${c.name}${value}\n`;
+        }
+        if (constants.length > 20) {
+            summary += `- ... and ${constants.length - 20} more\n`;
+        }
+        summary += '\n';
+    }
+    
+    return summary;
+}
+
+/**
+ * Use LLM to classify the query type for large codebases
+ * Returns: 'overview' | 'domain' | 'specific' | 'general'
+ */
+async function classifyQueryWithLLM(query, fileCount) {
+    const classificationPrompt = `You are a query classifier for a code assistant. The user has ${fileCount} files attached.
+
+Classify this query into ONE of these categories:
+
+1. **overview** - User wants a high-level understanding of the entire codebase
+   Examples: "explain the code", "what does this project do", "describe the architecture", "high level functionality", "summarize the attached files"
+
+2. **domain** - User asks about a specific feature/functionality that may span multiple files
+   Examples: "how is ABA validation handled", "describe the payment processing flow", "where is authentication implemented", "how does wire transfer work"
+
+3. **specific** - User asks about a specific function, file, or code element
+   Examples: "what does processPayment do", "explain the User class", "how does function X work", "find the bug in Y"
+
+4. **general** - General programming question not specifically about the attached code
+   Examples: "what is a REST API", "how do I use async/await", "best practices for error handling"
+
+USER QUERY: "${query}"
+
+Respond with ONLY the category name (overview, domain, specific, or general), nothing else.`;
+
+    try {
+        log('classifyQueryWithLLM: Classifying query...');
+        
+        // Use a quick, low-cost LLM call
+        const response = await callLanguageModelQuick(classificationPrompt);
+        
+        if (!response) {
+            log('classifyQueryWithLLM: No response from LLM, using fallback');
+            return classifyQueryFallback(query);
+        }
+        
+        const classification = response.trim().toLowerCase();
+        
+        // Validate response
+        const validTypes = ['overview', 'domain', 'specific', 'general'];
+        if (validTypes.includes(classification)) {
+            log('classifyQueryWithLLM: Result:', classification);
+            return classification;
+        }
+        
+        // Try to extract from longer response
+        for (const type of validTypes) {
+            if (response.toLowerCase().includes(type)) {
+                log('classifyQueryWithLLM: Extracted:', type);
+                return type;
+            }
+        }
+        
+        log('classifyQueryWithLLM: Could not parse response:', response);
+        return classifyQueryFallback(query);
+        
+    } catch (error) {
+        log('classifyQueryWithLLM: Error:', error.message);
+        // Fall back to regex-based classification
+        return classifyQueryFallback(query);
+    }
+}
+
+/**
+ * Quick LLM call for classification (shorter response, no streaming)
+ * Uses the configured lightweight model (astra.llm.classificationModel)
+ * to save tokens/cost on simple classification tasks
+ */
+async function callLanguageModelQuick(prompt) {
+    try {
+        if (!vscode.lm || !vscode.lm.selectChatModels) {
+            log('callLanguageModelQuick: VS Code LM API not available');
+            return null;
+        }
+        
+        // Get the configured classification model (default: gpt-4o-mini)
+        const config = vscode.workspace.getConfiguration('astra');
+        const preferredModel = config.get('llm.classificationModel') || 'gpt-4o-mini';
+        log('callLanguageModelQuick: Preferred classification model:', preferredModel);
+        
+        // Get available models
+        let models = await vscode.lm.selectChatModels({});
+        if (models.length === 0) {
+            models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+        }
+        
+        if (models.length === 0) {
+            log('callLanguageModelQuick: No models available');
+            return null;
+        }
+        
+        log('callLanguageModelQuick: Available models:', models.map(m => m.name || m.id).join(', '));
+        
+        // Try to find the preferred lightweight model
+        let model = null;
+        const preferredLower = preferredModel.toLowerCase();
+        
+        // Search order for lightweight models (prioritize mini/haiku variants)
+        const lightweightSearchOrder = [
+            // Exact match for configured model
+            m => (m.name?.toLowerCase().includes(preferredLower) || 
+                  m.id?.toLowerCase().includes(preferredLower) ||
+                  m.family?.toLowerCase().includes(preferredLower)),
+            // GPT-4o-mini variants
+            m => (m.name?.toLowerCase().includes('gpt-4o-mini') || 
+                  m.id?.toLowerCase().includes('gpt-4o-mini') ||
+                  m.family?.toLowerCase().includes('gpt-4o-mini')),
+            // GPT-3.5 variants
+            m => (m.name?.toLowerCase().includes('gpt-3.5') || 
+                  m.id?.toLowerCase().includes('gpt-3.5') ||
+                  m.family?.toLowerCase().includes('gpt-3.5')),
+            // Claude Haiku variants
+            m => (m.name?.toLowerCase().includes('haiku') || 
+                  m.id?.toLowerCase().includes('haiku') ||
+                  m.family?.toLowerCase().includes('haiku')),
+            // Any mini model
+            m => (m.name?.toLowerCase().includes('mini') || 
+                  m.id?.toLowerCase().includes('mini')),
+        ];
+        
+        // Try each search pattern
+        for (const searchFn of lightweightSearchOrder) {
+            model = models.find(searchFn);
+            if (model) {
+                log('callLanguageModelQuick: Found lightweight model:', model.name || model.id);
+                break;
+            }
+        }
+        
+        // Fallback to first available model if no lightweight model found
+        if (!model) {
+            model = models[0];
+            log('callLanguageModelQuick: No lightweight model found, using fallback:', model.name || model.id);
+        }
+        
+        log('callLanguageModelQuick: Using model:', model.name || model.id, '(preferred was:', preferredModel + ')');
+        
+        const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+        const cancellation = new vscode.CancellationTokenSource();
+        
+        // Set a timeout for quick responses
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Classification timeout')), 10000)
+        );
+        
+        const responsePromise = (async () => {
+            let result = '';
+            const chatResponse = await model.sendRequest(messages, {}, cancellation.token);
+            
+            for await (const chunk of chatResponse.text) {
+                result += chunk;
+                // For classification, we only need a short response
+                if (result.length > 100) {
+                    cancellation.cancel();
+                    break;
+                }
+            }
+            return result;
+        })();
+        
+        const result = await Promise.race([responsePromise, timeoutPromise]);
+        log('callLanguageModelQuick: Response:', result);
+        return result;
+        
+    } catch (error) {
+        log('callLanguageModelQuick: Error:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Fallback regex-based classification when LLM is unavailable
+ */
+function classifyQueryFallback(text) {
+    if (isOverviewQuery(text)) return 'overview';
+    if (isDomainQuery(text)) return 'domain';
+    return 'specific';
+}
+
+/**
+ * LLM call specifically for summarization (allows longer responses than classification)
+ * Uses lightweight model but doesn't truncate aggressively
+ */
+async function callLanguageModelForSummary(prompt, maxLength = 2000) {
+    try {
+        if (!vscode.lm || !vscode.lm.selectChatModels) {
+            log('callLanguageModelForSummary: VS Code LM API not available');
+            return null;
+        }
+        
+        // Get the configured documentation model (lightweight, good for summaries)
+        const config = vscode.workspace.getConfiguration('astra');
+        const preferredModel = config.get('llm.documentationModel') || config.get('llm.classificationModel') || 'gpt-4o-mini';
+        log('callLanguageModelForSummary: Preferred model:', preferredModel);
+        
+        // Get available models
+        let models = await vscode.lm.selectChatModels({});
+        if (models.length === 0) {
+            models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+        }
+        
+        if (models.length === 0) {
+            log('callLanguageModelForSummary: No models available');
+            return null;
+        }
+        
+        // Try to find the configured model first
+        const preferredLower = preferredModel.toLowerCase();
+        let model = models.find(m => 
+            m.name?.toLowerCase().includes(preferredLower) ||
+            m.id?.toLowerCase().includes(preferredLower) ||
+            m.family?.toLowerCase().includes(preferredLower)
+        );
+        
+        // Fallback to any lightweight model
+        if (!model) {
+            model = models.find(m => 
+                m.name?.toLowerCase().includes('mini') ||
+                m.name?.toLowerCase().includes('haiku') ||
+                m.id?.toLowerCase().includes('mini')
+            ) || models[0];
+        }
+        
+        log('callLanguageModelForSummary: Using model:', model.name || model.id);
+        
+        const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+        const cancellation = new vscode.CancellationTokenSource();
+        
+        // Longer timeout for summaries
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Summary timeout')), 30000)
+        );
+        
+        const responsePromise = (async () => {
+            let result = '';
+            const chatResponse = await model.sendRequest(messages, {}, cancellation.token);
+            
+            for await (const chunk of chatResponse.text) {
+                result += chunk;
+                // Allow longer responses for summaries
+                if (result.length > maxLength) {
+                    cancellation.cancel();
+                    break;
+                }
+            }
+            return result;
+        })();
+        
+        return await Promise.race([responsePromise, timeoutPromise]);
+        
+    } catch (error) {
+        log('callLanguageModelForSummary: Error:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Detect if query is asking for a high-level codebase overview (regex fallback)
+ */
+function isOverviewQuery(text) {
+    const normalizedText = text.trim()
+        .replace(/^(?:can\s+you\s+|could\s+you\s+|please\s+|would\s+you\s+)/i, '') // Remove polite prefixes
+        .trim();
+    
+    const overviewPatterns = [
+        /^(?:explain|describe|summarize|overview|analyze)\s+(?:the\s+)?(?:high[\s-]?level\s+)?(?:code|codebase|project|files?|attached|this)/i,
+        /^(?:explain|describe|summarize)\s+(?:the\s+)?(?:high[\s-]?level\s+)?(?:functionality|structure|architecture|purpose)/i,
+        /^(?:what\s+(?:does|is)\s+(?:this|the)\s+(?:code|codebase|project)|give\s+(?:me\s+)?(?:an?\s+)?overview)/i,
+        /^(?:how\s+does\s+(?:this|the)\s+(?:code|codebase|project)\s+work)/i,
+        /^(?:tell\s+me\s+about\s+(?:this|the)\s+(?:code|codebase|project))/i,
+        /^(?:understand|walk\s+(?:me\s+)?through)\s+(?:this|the)\s+(?:code|codebase)/i,
+        /^(?:architecture|structure|design)\s+(?:of\s+)?(?:this|the)/i,
+        /^(?:summarize|summary\s+of)\s+(?:all\s+)?(?:the\s+)?(?:attached|files?|code)/i,
+        /(?:overall|general|main|high[\s-]?level)\s+(?:purpose|functionality|structure|design)/i,
+        /what\s+(?:does|is)\s+(?:this|the)\s+(?:code|project|codebase)\s+(?:do|about|for)/i
+    ];
+    
+    return overviewPatterns.some(p => p.test(normalizedText));
+}
+
+/**
+ * Detect if query is asking about a specific domain/functionality
+ * (not overview, but about a specific feature/concept that may span multiple files)
+ */
+function isDomainQuery(text) {
+    // Don't match if it's an overview query
+    if (isOverviewQuery(text)) return false;
+    
+    // Generic/overview terms that should NOT trigger domain search
+    const overviewTerms = /\b(high[\s-]?level|overall|general|main|basic|entire|whole|all|complete|full)\b/i;
+    if (overviewTerms.test(text)) return false;
+    
+    // Must have a specific domain term (acronyms, technical terms, feature names)
+    const hasSpecificTerm = /\b([A-Z]{2,5}|payment|wire|transfer|routing|validation|account|transaction|auth|login|user|session|database|api|endpoint|join|joins|partition|partitions|partitioning|index|indexes|indexing|query|queries|scan|scans|parse|parsing|execute|execution|plan|planner|optimizer|buffer|cache|lock|locks|locking|wal|log|logging|replication|vacuum|toast|tuple|heap|btree|hash|gist|gin|brin|catalog|schema|table|tables|column|columns|constraint|trigger|function|procedure|view|sequence|cursor)\b/i.test(text);
+    if (!hasSpecificTerm) return false;
+    
+    // Domain/functionality patterns
+    const domainPatterns = [
+        /(?:describe|explain|how\s+(?:is|does|do|are))\s+(?:the\s+)?(\w+)\s+(?:functionality|feature|work|handled|implemented|processed)/i,
+        /(?:describe|explain)\s+(?:how\s+)?(\w+)\s+(?:is|are)\s+(?:implemented|handled|done|processed)/i,
+        /(?:how\s+(?:is|does|do|are))\s+(?:the\s+)?(?:code|system)\s+(?:handle|process|validate|manage|implement)\s+(\w+)/i,
+        /(?:where|how)\s+(?:is|does|are)\s+(\w+)\s+(?:validation|processing|handling|logic|implemented)/i,
+        /(?:show|find|trace)\s+(?:me\s+)?(?:the\s+)?(\w+)\s+(?:flow|logic|code|implementation)/i,
+        /(?:what|which)\s+(?:files?|functions?|code)\s+(?:handle|process|implement)\s+(\w+)/i,
+        /\b([A-Z]{2,5})\s+(?:validation|processing|handling|workflow|flow|logic)\b/i,
+        // Match "how is X implemented" or "how are Xs implemented"
+        /how\s+(?:is|are)\s+(\w+)\s+implemented/i,
+        // Match "describe how X works"
+        /describe\s+how\s+(\w+)\s+(?:works?|is\s+done|function)/i
+    ];
+    
+    return domainPatterns.some(p => p.test(text.trim()));
+}
+
+/**
+ * Extract domain keywords from a query for focused search
+ */
+function extractDomainKeywords(text) {
+    const keywords = [];
+    
+    // Common stop words to filter out
+    const stopWords = new Set([
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
+        'this', 'that', 'these', 'those', 'what', 'which', 'who', 'whom',
+        'how', 'where', 'when', 'why', 'if', 'then', 'else', 'for', 'from',
+        'to', 'in', 'on', 'at', 'by', 'with', 'about', 'into', 'through',
+        'and', 'or', 'but', 'not', 'all', 'any', 'some', 'each', 'every',
+        'describe', 'explain', 'show', 'find', 'trace', 'tell', 'me', 'please',
+        'code', 'files', 'function', 'functions', 'method', 'methods', 'work',
+        'handled', 'implemented', 'processed', 'functionality', 'feature'
+    ]);
+    
+    // Extract potential domain terms
+    // Look for specific patterns first
+    
+    // Pattern: "ABA validation" or "wire transfer"
+    const compoundMatch = text.match(/\b([A-Z]{2,}(?:\s+[a-z]+)?)\b/g);
+    if (compoundMatch) {
+        keywords.push(...compoundMatch.map(m => m.trim()));
+    }
+    
+    // Pattern: acronyms like ABA, ACH, SWIFT
+    const acronyms = text.match(/\b[A-Z]{2,5}\b/g);
+    if (acronyms) {
+        keywords.push(...acronyms);
+    }
+    
+    // Split and filter remaining words
+    const words = text.toLowerCase()
+        .replace(/[^\w\s-]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 2 && !stopWords.has(w));
+    
+    keywords.push(...words);
+    
+    // Deduplicate and return
+    return [...new Set(keywords.map(k => k.toLowerCase()))];
+}
+
+/**
+ * Find relevant context for a domain-specific query
+ * Searches symbols, file contents, and returns focused context
+ */
+function findRelevantContext(text, maxFiles = 30, maxChars = 100000) {
+    const keywords = extractDomainKeywords(text);
+    log('findRelevantContext: Keywords extracted:', keywords);
+    
+    if (keywords.length === 0) {
+        return { files: [], summary: '', keywords: [] };
+    }
+    
+    const relevantFiles = new Map(); // path -> { score, matches, content }
+    const matchedSymbols = [];
+    
+    // 1. Search symbols in code index
+    for (const [key, symbol] of codeIndex.symbols) {
+        const symbolNameLower = symbol.name.toLowerCase();
+        const summaryLower = (symbol.summary || '').toLowerCase();
+        
+        let score = 0;
+        const matches = [];
+        
+        for (const keyword of keywords) {
+            if (symbolNameLower.includes(keyword)) {
+                score += 10;
+                matches.push(`name:${keyword}`);
+            }
+            if (summaryLower.includes(keyword)) {
+                score += 5;
+                matches.push(`summary:${keyword}`);
+            }
+        }
+        
+        if (score > 0 && symbol.file) {
+            matchedSymbols.push({ symbol, score, matches });
+            
+            // Track file relevance
+            if (!relevantFiles.has(symbol.file)) {
+                relevantFiles.set(symbol.file, { score: 0, matches: [], symbols: [] });
+            }
+            const fileInfo = relevantFiles.get(symbol.file);
+            fileInfo.score += score;
+            fileInfo.matches.push(...matches);
+            fileInfo.symbols.push(symbol);
+        }
+    }
+    
+    // 2. Search file contents directly
+    for (const [path, file] of contextFiles) {
+        const contentLower = file.content.toLowerCase();
+        let contentScore = 0;
+        const contentMatches = [];
+        
+        for (const keyword of keywords) {
+            // Count occurrences
+            const regex = new RegExp(`\\b${keyword}\\b`, 'gi');
+            const occurrences = (file.content.match(regex) || []).length;
+            
+            if (occurrences > 0) {
+                contentScore += occurrences * 2;
+                contentMatches.push(`content:${keyword}(${occurrences})`);
+            }
+        }
+        
+        if (contentScore > 0) {
+            if (!relevantFiles.has(path)) {
+                relevantFiles.set(path, { score: 0, matches: [], symbols: [] });
+            }
+            const fileInfo = relevantFiles.get(path);
+            fileInfo.score += contentScore;
+            fileInfo.matches.push(...contentMatches);
+        }
+    }
+    
+    // 3. Sort files by relevance score
+    const sortedFiles = [...relevantFiles.entries()]
+        .sort((a, b) => b[1].score - a[1].score)
+        .slice(0, maxFiles);
+    
+    log('findRelevantContext: Found', sortedFiles.length, 'relevant files');
+    
+    // 4. Build focused context from top files
+    let contextContent = '';
+    let totalChars = 0;
+    const includedFiles = [];
+    
+    for (const [path, info] of sortedFiles) {
+        const file = contextFiles.get(path);
+        if (!file) continue;
+        
+        const fileName = path.split('/').pop();
+        const fileContent = file.content;
+        
+        // Check if adding this file would exceed limit
+        if (totalChars + fileContent.length > maxChars) {
+            // Try to include just the relevant functions
+            if (info.symbols.length > 0) {
+                let symbolContent = `\n=== ${fileName} (${file.language}) [PARTIAL - relevant functions] ===\n`;
+                for (const sym of info.symbols.slice(0, 10)) {
+                    const funcCode = extractFunctionCode(fileContent, sym);
+                    if (funcCode) {
+                        symbolContent += `\n// ${sym.name} (line ${sym.line})\n${funcCode}\n`;
+                    }
+                }
+                if (totalChars + symbolContent.length <= maxChars) {
+                    contextContent += symbolContent;
+                    totalChars += symbolContent.length;
+                    includedFiles.push({ name: fileName, path, score: info.score, partial: true });
+                }
+            }
+            continue;
+        }
+        
+        contextContent += `\n=== ${fileName} (${file.language}) [score: ${info.score}] ===\n`;
+        contextContent += fileContent + '\n';
+        totalChars += fileContent.length + fileName.length + 50;
+        includedFiles.push({ name: fileName, path, score: info.score, partial: false });
+    }
+    
+    // 5. Generate summary of what was found
+    let summary = `## Focused Context for: "${keywords.slice(0, 5).join(', ')}"\n\n`;
+    summary += `Found **${sortedFiles.length} relevant files** from ${contextFiles.size} total files.\n\n`;
+    summary += `### Matched Files (by relevance):\n`;
+    for (const f of includedFiles.slice(0, 15)) {
+        summary += `- **${f.name}** (score: ${f.score}${f.partial ? ', partial' : ''})\n`;
+    }
+    if (sortedFiles.length > 15) {
+        summary += `- ... and ${sortedFiles.length - 15} more files\n`;
+    }
+    
+    // Add matched symbols
+    if (matchedSymbols.length > 0) {
+        summary += `\n### Key Functions/Symbols:\n`;
+        const topSymbols = matchedSymbols.sort((a, b) => b.score - a.score).slice(0, 20);
+        for (const { symbol, score } of topSymbols) {
+            const file = symbol.file?.split('/').pop() || '';
+            const desc = symbol.summary || generateSummaryFromName(symbol.name);
+            summary += `- **${symbol.name}** (${file}): ${desc}\n`;
+        }
+    }
+    
+    return {
+        files: includedFiles,
+        content: contextContent,
+        summary: summary,
+        keywords: keywords,
+        symbolCount: matchedSymbols.length,
+        totalFiles: sortedFiles.length
+    };
+}
+
+/**
+ * Extract function/procedure code from file content
+ */
+function extractFunctionCode(content, symbol) {
+    if (!symbol.line) return null;
+    
+    const lines = content.split('\n');
+    const startLine = symbol.line - 1;
+    
+    if (startLine >= lines.length) return null;
+    
+    // Try to find the end of the function
+    let depth = 0;
+    let endLine = startLine;
+    let foundStart = false;
+    
+    for (let i = startLine; i < Math.min(lines.length, startLine + 200); i++) {
+        const line = lines[i];
+        
+        // Track brace/BEGIN depth
+        const opens = (line.match(/\{|\bBEGIN\b/gi) || []).length;
+        const closes = (line.match(/\}|\bEND\b/gi) || []).length;
+        
+        if (opens > 0) foundStart = true;
+        depth += opens - closes;
+        
+        endLine = i;
+        
+        if (foundStart && depth <= 0) break;
+    }
+    
+    // Extract the function
+    const funcLines = lines.slice(startLine, endLine + 1);
+    
+    // Limit to reasonable size
+    if (funcLines.length > 100) {
+        return funcLines.slice(0, 50).join('\n') + '\n... [truncated] ...\n' + funcLines.slice(-10).join('\n');
+    }
+    
+    return funcLines.join('\n');
+}
+
+/**
  * Find symbol and its callers/callees
  */
 function traceSymbol(symbolName) {
@@ -3455,170 +6938,6 @@ function traceVariable(varName) {
     return result;
 }
 
-/**
- * Get variable data flow summary for a specific variable
- */
-function getVariableDataFlow(varName) {
-    const trace = traceVariable(varName);
-    
-    if (!trace.variable) {
-        return `Variable "${varName}" not found in index.`;
-    }
-    
-    let summary = `## Variable: ${varName}\n\n`;
-    summary += `**Type:** ${trace.declaration.dataType}\n`;
-    summary += `**Scope:** ${trace.declaration.scope}\n`;
-    summary += `**Declared:** ${trace.declaration.file?.split('/').pop()}:${trace.declaration.line}\n`;
-    
-    if (trace.initialization) {
-        summary += `**Initialized:** Line ${trace.initialization.line}\n`;
-    } else {
-        summary += `**Initialized:** Not explicitly initialized\n`;
-    }
-    
-    summary += `\n### Read Accesses (${trace.reads.length}):\n`;
-    for (const read of trace.reads.slice(0, 20)) {
-        summary += `- Line ${read.line}: \`${read.context}\`\n`;
-    }
-    if (trace.reads.length > 20) {
-        summary += `- ... and ${trace.reads.length - 20} more\n`;
-    }
-    
-    summary += `\n### Write Accesses (${trace.writes.length}):\n`;
-    for (const write of trace.writes.slice(0, 20)) {
-        summary += `- Line ${write.line}: \`${write.context}\`\n`;
-    }
-    if (trace.writes.length > 20) {
-        summary += `- ... and ${trace.writes.length - 20} more\n`;
-    }
-    
-    return summary;
-}
-
-/**
- * Generate call graph output as Markdown with Mermaid diagram
- */
-function generateCallGraphOutput() {
-    let output = `# Call Graph Analysis
-
-Generated: ${new Date().toLocaleString()}
-Files: ${codeIndex.files.size} | Symbols: ${codeIndex.symbols.size} | Functions: ${codeIndex.callGraph.size}
-
----
-
-## Mermaid Diagram
-
-\`\`\`mermaid
-flowchart LR
-`;
-    
-    // Build mermaid nodes and edges (limit to top functions to avoid huge diagram)
-    const edges = [];
-    const nodes = new Set();
-    
-    // Get functions sorted by number of callers (most called first)
-    const funcsByCallers = Array.from(codeIndex.reverseCallGraph.entries())
-        .map(([name, callers]) => ({ name, count: callers.size }))
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 50); // Top 50 most called
-    
-    // Also include functions that call others
-    for (const [caller, callees] of codeIndex.callGraph) {
-        if (callees.size > 0) {
-            nodes.add(caller);
-            for (const callee of callees) {
-                if (codeIndex.symbols.has(callee)) { // Only include functions we know about
-                    nodes.add(callee);
-                    edges.push({ from: caller, to: callee });
-                }
-            }
-        }
-    }
-    
-    // Limit edges for readability
-    const limitedEdges = edges.slice(0, 100);
-    
-    for (const edge of limitedEdges) {
-        // Sanitize names for mermaid (remove special chars)
-        const from = edge.from.replace(/[^a-zA-Z0-9_]/g, '_');
-        const to = edge.to.replace(/[^a-zA-Z0-9_]/g, '_');
-        output += `    ${from}["${edge.from}"] --> ${to}["${edge.to}"]\n`;
-    }
-    
-    output += `\`\`\`
-
-${edges.length > 100 ? `*(Showing 100 of ${edges.length} edges)*\n\n` : ''}
----
-
-## Entry Points (No Callers)
-
-Functions that are not called by any other function in the codebase:
-
-| Function | File | Line |
-|----------|------|------|
-`;
-    
-    // Find entry points (functions with no callers)
-    for (const [funcName, calls] of codeIndex.callGraph) {
-        const callers = codeIndex.reverseCallGraph.get(funcName);
-        if (!callers || callers.size === 0) {
-            const symbol = codeIndex.symbols.get(funcName);
-            if (symbol) {
-                const file = symbol.file?.split('/').pop() || 'unknown';
-                output += `| \`${funcName}\` | ${file} | ${symbol.line} |\n`;
-            }
-        }
-    }
-    
-    output += `
----
-
-## Most Called Functions
-
-| Function | Called By | File |
-|----------|-----------|------|
-`;
-    
-    for (const { name, count } of funcsByCallers.slice(0, 30)) {
-        const symbol = codeIndex.symbols.get(name);
-        const file = symbol?.file?.split('/').pop() || 'unknown';
-        output += `| \`${name}\` | ${count} callers | ${file} |\n`;
-    }
-    
-    output += `
----
-
-## Full Call Graph (Text)
-
-`;
-    
-    // Group by file
-    const byFile = new Map();
-    for (const [funcName, calls] of codeIndex.callGraph) {
-        const symbol = codeIndex.symbols.get(funcName);
-        const file = symbol?.file?.split('/').pop() || 'unknown';
-        if (!byFile.has(file)) byFile.set(file, []);
-        byFile.get(file).push({ name: funcName, calls: [...calls], symbol });
-    }
-    
-    for (const [file, funcs] of byFile) {
-        output += `### ${file}\n\n`;
-        for (const { name, calls, symbol } of funcs) {
-            const callers = codeIndex.reverseCallGraph.get(name);
-            const callerCount = callers ? callers.size : 0;
-            output += `**${name}** (line ${symbol?.line || '?'})\n`;
-            if (callerCount > 0) {
-                output += `- Called by: ${[...callers].slice(0, 5).join(', ')}${callerCount > 5 ? ` (+${callerCount - 5} more)` : ''}\n`;
-            }
-            if (calls.length > 0) {
-                output += `- Calls: ${calls.slice(0, 10).join(', ')}${calls.length > 10 ? ` (+${calls.length - 10} more)` : ''}\n`;
-            }
-            output += '\n';
-        }
-    }
-    
-    return output;
-}
 
 /**
  * Generate HTML page with interactive call graph visualization
@@ -4564,6 +7883,441 @@ function cosineSimilarity(a, b) {
     return denominator === 0 ? 0 : dotProduct / denominator;
 }
 
+// ============================================================
+// TRIGRAM INDEX (Zoekt-style) - Fast Exact/Partial Text Search
+// ============================================================
+
+/**
+ * Extract trigrams from text
+ * @param {string} text - Text to extract trigrams from
+ * @param {boolean} caseSensitive - Whether to preserve case
+ * @returns {string[]} Array of trigrams
+ */
+function extractTrigrams(text, caseSensitive = false) {
+    const normalized = caseSensitive ? text : text.toLowerCase();
+    const trigrams = [];
+    
+    for (let i = 0; i <= normalized.length - 3; i++) {
+        const trigram = normalized.substring(i, i + 3);
+        // Skip trigrams that are all whitespace
+        if (!/^\s+$/.test(trigram)) {
+            trigrams.push(trigram);
+        }
+    }
+    
+    return trigrams;
+}
+
+/**
+ * Build trigram index for a single file
+ * @param {string} filePath - File path
+ * @param {string} content - File content
+ */
+function indexFileWithTrigrams(filePath, content) {
+    if (!content || content.length > TRIGRAM_CONFIG.MAX_FILE_SIZE) {
+        return;
+    }
+    
+    const caseSensitive = TRIGRAM_CONFIG.CASE_SENSITIVE;
+    const normalized = caseSensitive ? content : content.toLowerCase();
+    
+    // Store content for verification
+    trigramIndex.fileContent.set(filePath, content);
+    
+    // Track unique trigrams for this file
+    const fileTrigramPositions = new Map(); // trigram → positions[]
+    
+    for (let i = 0; i <= normalized.length - 3; i++) {
+        const trigram = normalized.substring(i, i + 3);
+        
+        // Skip whitespace-only trigrams
+        if (/^\s+$/.test(trigram)) continue;
+        
+        if (!fileTrigramPositions.has(trigram)) {
+            fileTrigramPositions.set(trigram, []);
+        }
+        
+        const positions = fileTrigramPositions.get(trigram);
+        if (positions.length < TRIGRAM_CONFIG.MAX_POSITIONS_PER_FILE) {
+            positions.push(i);
+        }
+    }
+    
+    // Add to global index
+    for (const [trigram, positions] of fileTrigramPositions) {
+        if (!trigramIndex.index.has(trigram)) {
+            trigramIndex.index.set(trigram, []);
+        }
+        trigramIndex.index.get(trigram).push({ file: filePath, positions });
+        trigramIndex.stats.totalPositions += positions.length;
+    }
+    
+    trigramIndex.stats.files++;
+}
+
+/**
+ * Build trigram index for all context files
+ */
+async function buildTrigramIndex(options = {}) {
+    const { showProgressUI = false, onProgress = null } = options;
+    
+    const startTime = Date.now();
+    log('=== BUILDING TRIGRAM INDEX ===');
+    
+    // Clear existing
+    trigramIndex.index.clear();
+    trigramIndex.fileContent.clear();
+    trigramIndex.stats = { trigrams: 0, files: 0, totalPositions: 0 };
+    
+    let fileCount = 0;
+    const totalFiles = contextFiles.size;
+    
+    for (const [filePath, fileInfo] of contextFiles) {
+        indexFileWithTrigrams(filePath, fileInfo.content);
+        fileCount++;
+        
+        if (onProgress && fileCount % 10 === 0) {
+            const pct = Math.round((fileCount / totalFiles) * 100);
+            onProgress(pct, `Indexing trigrams: ${fileCount}/${totalFiles} files`);
+        }
+        
+        // Yield to UI
+        if (fileCount % 20 === 0) {
+            await new Promise(r => setTimeout(r, 1));
+        }
+    }
+    
+    trigramIndex.stats.trigrams = trigramIndex.index.size;
+    trigramIndex.lastUpdated = new Date();
+    
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+    log(`Trigram index built: ${trigramIndex.stats.trigrams} unique trigrams, ${trigramIndex.stats.files} files, ${trigramIndex.stats.totalPositions} positions in ${elapsed}s`);
+    
+    if (showProgressUI) {
+        showProgress(`Trigram index: ${trigramIndex.stats.trigrams} trigrams from ${trigramIndex.stats.files} files`, 'index');
+    }
+}
+
+/**
+ * Lightweight trigram index builder for initial indexing
+ * Limits files and sizes for faster startup
+ */
+async function buildTrigramIndexLightweight(options = {}) {
+    const { 
+        maxFilesToIndex = 300,
+        maxFileSize = 50000,
+        prioritizeByExtension = true
+    } = options;
+    
+    const startTime = Date.now();
+    log('=== BUILDING LIGHTWEIGHT TRIGRAM INDEX ===');
+    
+    // Clear existing
+    trigramIndex.index.clear();
+    trigramIndex.fileContent.clear();
+    trigramIndex.stats = { trigrams: 0, files: 0, totalPositions: 0 };
+    
+    // Prioritize code files over headers/configs
+    const codeExtensions = new Set(['.c', '.cpp', '.java', '.py', '.js', '.ts', '.go', '.rs', '.tal', '.cob', '.sql']);
+    const files = Array.from(contextFiles.entries());
+    
+    // Sort: code files first, then by size (smaller first for speed)
+    if (prioritizeByExtension) {
+        files.sort((a, b) => {
+            const extA = a[0].substring(a[0].lastIndexOf('.')).toLowerCase();
+            const extB = b[0].substring(b[0].lastIndexOf('.')).toLowerCase();
+            const isCodeA = codeExtensions.has(extA) ? 0 : 1;
+            const isCodeB = codeExtensions.has(extB) ? 0 : 1;
+            if (isCodeA !== isCodeB) return isCodeA - isCodeB;
+            return (a[1].content?.length || 0) - (b[1].content?.length || 0);
+        });
+    }
+    
+    let fileCount = 0;
+    
+    for (const [filePath, fileInfo] of files) {
+        if (fileCount >= maxFilesToIndex) break;
+        
+        const content = fileInfo.content || '';
+        if (content.length > maxFileSize) {
+            // Index just the first portion of large files
+            indexFileWithTrigrams(filePath, content.substring(0, maxFileSize));
+        } else {
+            indexFileWithTrigrams(filePath, content);
+        }
+        fileCount++;
+        
+        // Yield occasionally
+        if (fileCount % 50 === 0) {
+            await new Promise(r => setTimeout(r, 1));
+        }
+    }
+    
+    trigramIndex.stats.trigrams = trigramIndex.index.size;
+    trigramIndex.lastUpdated = new Date();
+    
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+    log(`Lightweight trigram index: ${trigramIndex.stats.trigrams} trigrams from ${fileCount} files in ${elapsed}s`);
+}
+
+/**
+ * Search trigram index for exact/partial matches
+ * @param {string} query - Search query (min 3 chars)
+ * @param {Object} options - Search options
+ * @returns {Array<{file: string, matches: Array<{position: number, line: number, context: string}>}>}
+ */
+function searchTrigramIndex(query, options = {}) {
+    const {
+        caseSensitive = TRIGRAM_CONFIG.CASE_SENSITIVE,
+        maxResults = TRIGRAM_CONFIG.MAX_RESULTS,
+        contextChars = 100
+    } = options;
+    
+    if (query.length < TRIGRAM_CONFIG.MIN_QUERY_LENGTH) {
+        log('Trigram search: Query too short (min 3 chars)');
+        return [];
+    }
+    
+    const queryTrigrams = extractTrigrams(query, caseSensitive);
+    if (queryTrigrams.length === 0) {
+        return [];
+    }
+    
+    log(`Trigram search: "${query}" → ${queryTrigrams.length} trigrams`);
+    
+    // Find candidate files by intersecting trigram posting lists
+    // Start with files containing the first trigram, then filter
+    let candidateFiles = null;
+    
+    for (const trigram of queryTrigrams) {
+        const postings = trigramIndex.index.get(trigram);
+        if (!postings || postings.length === 0) {
+            // Trigram not found - no matches possible
+            log(`Trigram search: trigram "${trigram}" not found, no results`);
+            return [];
+        }
+        
+        const filesWithTrigram = new Set(postings.map(p => p.file));
+        
+        if (candidateFiles === null) {
+            candidateFiles = filesWithTrigram;
+        } else {
+            // Intersect
+            candidateFiles = new Set([...candidateFiles].filter(f => filesWithTrigram.has(f)));
+        }
+        
+        if (candidateFiles.size === 0) {
+            return [];
+        }
+    }
+    
+    log(`Trigram search: ${candidateFiles.size} candidate files`);
+    
+    // Verify actual matches in candidate files
+    const results = [];
+    const normalizedQuery = caseSensitive ? query : query.toLowerCase();
+    
+    for (const filePath of candidateFiles) {
+        const content = trigramIndex.fileContent.get(filePath);
+        if (!content) continue;
+        
+        const normalizedContent = caseSensitive ? content : content.toLowerCase();
+        const matches = [];
+        
+        let pos = 0;
+        while (pos < normalizedContent.length && matches.length < 50) {
+            const matchPos = normalizedContent.indexOf(normalizedQuery, pos);
+            if (matchPos === -1) break;
+            
+            // Calculate line number
+            const lineNum = content.substring(0, matchPos).split('\n').length;
+            
+            // Extract context
+            const contextStart = Math.max(0, matchPos - contextChars);
+            const contextEnd = Math.min(content.length, matchPos + query.length + contextChars);
+            let context = content.substring(contextStart, contextEnd);
+            
+            // Clean up context
+            if (contextStart > 0) context = '...' + context;
+            if (contextEnd < content.length) context = context + '...';
+            
+            matches.push({
+                position: matchPos,
+                line: lineNum,
+                context: context.replace(/\n/g, ' ').trim()
+            });
+            
+            pos = matchPos + 1;
+        }
+        
+        if (matches.length > 0) {
+            results.push({
+                file: filePath,
+                fileName: filePath.split('/').pop(),
+                matchCount: matches.length,
+                matches
+            });
+        }
+        
+        if (results.length >= maxResults) break;
+    }
+    
+    // Sort by match count
+    results.sort((a, b) => b.matchCount - a.matchCount);
+    
+    log(`Trigram search: found ${results.length} files with matches`);
+    return results;
+}
+
+// ============================================================
+// TF-IDF EMBEDDINGS - Better Semantic Search
+// ============================================================
+
+/**
+ * Tokenize text for TF-IDF
+ * Handles code-specific patterns (camelCase, snake_case, etc.)
+ */
+function tokenizeForTfidf(text) {
+    // Split camelCase and snake_case
+    const expanded = text
+        .replace(/([a-z])([A-Z])/g, '$1 $2')  // camelCase → camel Case
+        .replace(/_/g, ' ')                    // snake_case → snake case
+        .toLowerCase();
+    
+    // Extract words and meaningful tokens
+    const tokens = expanded
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(t => t.length >= 2 && t.length <= 30);
+    
+    return tokens;
+}
+
+/**
+ * Build TF-IDF vocabulary from all chunks
+ */
+function buildTfidfVocabulary(chunks) {
+    const startTime = Date.now();
+    log('Building TF-IDF vocabulary...');
+    
+    // Clear existing
+    tfidfVocabulary.terms.clear();
+    tfidfVocabulary.numDocs = chunks.length;
+    
+    // Count document frequency for each term
+    const docFreq = new Map(); // term → number of docs containing it
+    
+    for (const chunk of chunks) {
+        const tokens = tokenizeForTfidf(chunk.text);
+        const uniqueTokens = new Set(tokens);
+        
+        for (const token of uniqueTokens) {
+            docFreq.set(token, (docFreq.get(token) || 0) + 1);
+        }
+    }
+    
+    // Filter vocabulary - keep terms that appear in at least 2 docs but not more than 80% of docs
+    const minDf = 2;
+    const maxDf = Math.floor(chunks.length * 0.8);
+    
+    let termIndex = 0;
+    for (const [term, df] of docFreq) {
+        if (df >= minDf && df <= maxDf) {
+            tfidfVocabulary.terms.set(term, { index: termIndex, df });
+            termIndex++;
+        }
+    }
+    
+    // Compute IDF values
+    const numTerms = tfidfVocabulary.terms.size;
+    tfidfVocabulary.idf = new Float32Array(numTerms);
+    
+    for (const [term, info] of tfidfVocabulary.terms) {
+        // IDF = log(N / df) with smoothing
+        tfidfVocabulary.idf[info.index] = Math.log((chunks.length + 1) / (info.df + 1)) + 1;
+    }
+    
+    tfidfVocabulary.built = true;
+    
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+    log(`TF-IDF vocabulary: ${numTerms} terms from ${docFreq.size} unique tokens in ${elapsed}s`);
+}
+
+/**
+ * Generate TF-IDF embedding for text
+ * @param {string} text - Text to embed
+ * @param {number} dimensions - Target dimensions (uses hashing for fixed size)
+ * @returns {Float32Array} Embedding vector
+ */
+function tfidfEmbedding(text, dimensions = 384) {
+    const embedding = new Float32Array(dimensions);
+    
+    if (!tfidfVocabulary.built) {
+        // Fallback to simple hash if vocabulary not built
+        return simpleHashEmbedding(text, dimensions);
+    }
+    
+    const tokens = tokenizeForTfidf(text);
+    
+    // Count term frequencies
+    const tf = new Map();
+    for (const token of tokens) {
+        tf.set(token, (tf.get(token) || 0) + 1);
+    }
+    
+    // Compute TF-IDF weighted embedding
+    for (const [token, count] of tf) {
+        const termInfo = tfidfVocabulary.terms.get(token);
+        if (!termInfo) continue;
+        
+        // TF-IDF weight
+        const tfWeight = 1 + Math.log(count); // log-normalized TF
+        const tfidfWeight = tfWeight * tfidfVocabulary.idf[termInfo.index];
+        
+        // Hash to dimension (multiple hashes for better distribution)
+        const hash1 = simpleHash(token);
+        const hash2 = simpleHash(token + '_2');
+        const idx1 = Math.abs(hash1) % dimensions;
+        const idx2 = Math.abs(hash2) % dimensions;
+        
+        embedding[idx1] += tfidfWeight;
+        embedding[idx2] += tfidfWeight * 0.5;
+        
+        // Add character trigrams for partial matching
+        for (let i = 0; i < token.length - 2; i++) {
+            const trigram = token.substring(i, i + 3);
+            const trigramHash = simpleHash(trigram);
+            const trigramIdx = Math.abs(trigramHash) % dimensions;
+            embedding[trigramIdx] += tfidfWeight * 0.3;
+        }
+    }
+    
+    // L2 normalize
+    let norm = 0;
+    for (let i = 0; i < dimensions; i++) {
+        norm += embedding[i] * embedding[i];
+    }
+    norm = Math.sqrt(norm);
+    if (norm > 0) {
+        for (let i = 0; i < dimensions; i++) {
+            embedding[i] /= norm;
+        }
+    }
+    
+    return embedding;
+}
+
+/**
+ * Generate embedding using configured method
+ */
+function generateEmbedding(text, dimensions = 384) {
+    if (vectorIndex.model === 'tfidf' && tfidfVocabulary.built) {
+        return tfidfEmbedding(text, dimensions);
+    } else {
+        return simpleHashEmbedding(text, dimensions);
+    }
+}
+
 /**
  * Chunk code into semantic units (functions, classes, blocks)
  */
@@ -4690,7 +8444,15 @@ async function buildVectorIndex(options = {}) {
         vectorIndex.chunks = [];
         vectorIndex.embeddings = null;
         
-        // Collect all chunks from context files
+        // PHASE 1: Build Trigram Index (for exact text search)
+        log('Phase 1: Building trigram index...');
+        if (onProgress) {
+            onProgress(5, 'Building trigram index...');
+        }
+        await buildTrigramIndex({ showProgressUI: false });
+        
+        // PHASE 2: Collect all chunks from context files
+        log('Phase 2: Chunking files...');
         const allChunks = [];
         let fileCount = 0;
         const totalFiles = contextFiles.size;
@@ -4703,7 +8465,7 @@ async function buildVectorIndex(options = {}) {
             fileCount++;
             
             if (showProgress && onProgress) {
-                const pct = Math.round((fileCount / totalFiles) * 50); // First 50% is chunking
+                const pct = 10 + Math.round((fileCount / totalFiles) * 30); // 10-40% is chunking
                 onProgress(pct, `Chunking ${fileCount}/${totalFiles} files...`);
             }
             
@@ -4721,13 +8483,21 @@ async function buildVectorIndex(options = {}) {
             return;
         }
         
-        // Generate embeddings
+        // PHASE 3: Build TF-IDF vocabulary
+        log('Phase 3: Building TF-IDF vocabulary...');
+        if (onProgress) {
+            onProgress(45, 'Building TF-IDF vocabulary...');
+        }
+        buildTfidfVocabulary(allChunks);
+        
+        // PHASE 4: Generate embeddings using TF-IDF
+        log('Phase 4: Generating embeddings...');
         const dimensions = vectorIndex.dimensions;
         const embeddings = new Float32Array(allChunks.length * dimensions);
         
         for (let i = 0; i < allChunks.length; i++) {
             const chunk = allChunks[i];
-            const embedding = simpleHashEmbedding(chunk.text, dimensions);
+            const embedding = generateEmbedding(chunk.text, dimensions);
             
             // Store in flat array
             embeddings.set(embedding, i * dimensions);
@@ -4736,7 +8506,7 @@ async function buildVectorIndex(options = {}) {
             chunk.embedding = embedding;
             
             if (showProgress && onProgress && i % 50 === 0) {
-                const pct = 50 + Math.round((i / allChunks.length) * 50); // Second 50% is embedding
+                const pct = 50 + Math.round((i / allChunks.length) * 45); // 50-95% is embedding
                 onProgress(pct, `Embedding ${i}/${allChunks.length} chunks...`);
             }
             
@@ -4751,10 +8521,10 @@ async function buildVectorIndex(options = {}) {
         vectorIndex.lastUpdated = new Date();
         
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        log(`Vector index built: ${allChunks.length} chunks in ${elapsed}s`);
+        log(`Vector index built: ${allChunks.length} chunks, ${trigramIndex.stats.trigrams} trigrams in ${elapsed}s`);
         
         if (onProgress) {
-            onProgress(100, `✓ ${allChunks.length} chunks indexed`);
+            onProgress(100, `✓ ${allChunks.length} chunks + ${trigramIndex.stats.trigrams} trigrams indexed`);
         }
         
         // Persist to disk
@@ -4778,9 +8548,9 @@ function searchVectorIndex(query, topK = VECTOR_CONFIG.TOP_K_RESULTS) {
         return [];
     }
     
-    // Embed the query
-    const queryEmbedding = simpleHashEmbedding(query, vectorIndex.dimensions);
-    log('Query embedded, dimensions:', queryEmbedding.length);
+    // Embed the query using same method as index
+    const queryEmbedding = generateEmbedding(query, vectorIndex.dimensions);
+    log('Query embedded, dimensions:', queryEmbedding.length, 'model:', vectorIndex.model);
     
     // Calculate similarities
     const results = [];
@@ -4820,74 +8590,32 @@ function searchVectorIndex(query, topK = VECTOR_CONFIG.TOP_K_RESULTS) {
 }
 
 /**
- * Hybrid search combining symbol index, grep, and vector search
+ * Hybrid Search - Clean 3-Layer Architecture
+ * 
+ * Layer 1: SYMBOL INDEX - Structured lookups (functions, classes, variables)
+ * Layer 2: TRIGRAM INDEX - Exact/partial text search (replaces grep)
+ * Layer 3: VECTOR INDEX - Semantic similarity search (TF-IDF)
+ * 
+ * Results are merged and boosted when found by multiple methods.
  */
 async function hybridSearch(query, options = {}) {
-    const { maxResults = 15, includeGrep = true, includeVector = true } = options;
+    const { maxResults = 20, includeVector = true } = options;
     
-    log('=== HYBRID SEARCH START ===');
+    log('=== HYBRID SEARCH (3-Layer) ===');
     log('Query:', query);
-    log('Index state - symbols:', codeIndex.symbols.size, 'codeIndex.files:', codeIndex.files.size, 'contextFiles:', contextFiles.size, 'vectors:', vectorIndex.chunks.length);
-    
-    // Log contextFiles for debugging
-    if (contextFiles.size > 0) {
-        log('Context files:');
-        for (const [path, info] of contextFiles) {
-            log('  -', path, '(', info.content?.length || 0, 'chars)');
-        }
-    } else {
-        log('WARNING: No files in contextFiles!');
-    }
+    log('Index state - symbols:', codeIndex.symbols.size, 
+        'trigrams:', trigramIndex.index.size, 
+        'vectors:', vectorIndex.chunks.length);
     
     const results = new Map(); // key: file:line -> result data
     
-    // 0. Simple text search in contextFiles (always works, no index needed)
-    const queryLower = query.toLowerCase();
-    const queryWords = queryLower.split(/\s+/).filter(w => w.length > 2);
-    log('Query words for text search:', queryWords);
-    
-    for (const [filePath, file] of contextFiles) {
-        const content = file.content || '';
-        const lines = content.split('\n');
-        const fileName = filePath.split('/').pop();
-        let matchCount = 0;
-        
-        for (let i = 0; i < lines.length; i++) {
-            const lineLower = lines[i].toLowerCase();
-            
-            // Check if any query word appears in the line
-            for (const word of queryWords) {
-                if (lineLower.includes(word)) {
-                    const key = `${filePath}:${i + 1}`;
-                    if (!results.has(key)) {
-                        results.set(key, {
-                            file: filePath,
-                            fileName: fileName,
-                            line: i + 1,
-                            symbol: null,
-                            type: 'text',
-                            score: 0.5,
-                            sources: new Set(['text']),
-                            preview: lines[i].trim().substring(0, 100)
-                        });
-                        matchCount++;
-                    } else {
-                        results.get(key).sources.add('text');
-                        results.get(key).score += 0.1; // Boost for multiple word matches
-                    }
-                    break; // Only count once per line
-                }
-            }
-        }
-        log('Text matches in', fileName, ':', matchCount);
-    }
-    
-    log('Simple text search total:', results.size, 'matches');
-    
-    // 1. Symbol Index Search (exact matches)
+    // ================================================================
+    // LAYER 1: SYMBOL INDEX (Structured - functions, classes, variables)
+    // ================================================================
     try {
-        const symbolMatches = fuzzySearchSymbols(query, null, 20, 20);
-        log('Symbol matches found:', symbolMatches.length);
+        const symbolMatches = fuzzySearchSymbols(query, null, 25, 20);
+        log('L1 Symbol: found', symbolMatches.length, 'matches');
+        
         for (const match of symbolMatches) {
             const key = `${match.file}:${match.line}`;
             if (!results.has(key)) {
@@ -4897,66 +8625,71 @@ async function hybridSearch(query, options = {}) {
                     line: match.line || 1,
                     symbol: match.name,
                     type: match.type,
-                    score: (match.matchScore || match.score || 50) / 100,
+                    score: (match.matchScore || 50) / 100,
                     sources: new Set(['symbol']),
                     preview: match.signature || match.name
                 });
             } else {
                 results.get(key).sources.add('symbol');
-                results.get(key).score = Math.max(results.get(key).score, (match.matchScore || match.score || 50) / 100);
+                results.get(key).score = Math.max(results.get(key).score, (match.matchScore || 50) / 100);
             }
         }
     } catch (err) {
-        log('Symbol search error:', err.message);
+        log('L1 Symbol error:', err.message);
     }
     
-    // 2. Grep Search (word boundary matches) - searches contextFiles directly
-    if (includeGrep && contextFiles.size > 0) {
+    // ================================================================
+    // LAYER 2: TRIGRAM INDEX (Exact text - replaces grep)
+    // ================================================================
+    if (trigramIndex.index.size > 0) {
         try {
-            // Extract keywords from query
-            const keywords = query.toLowerCase()
-                .replace(/[^a-z0-9\s]/g, ' ')
+            // Extract search terms from query
+            const searchTerms = query
+                .replace(/[^a-zA-Z0-9_]/g, ' ')
                 .split(/\s+/)
-                .filter(w => w.length > 2);
+                .filter(w => w.length >= 3);
             
-            log('Grep keywords:', keywords.slice(0, 3));
+            log('L2 Trigram: searching for', searchTerms.slice(0, 5));
             
-            for (const keyword of keywords.slice(0, 3)) {
-                const grepResult = grepCodeForSymbol(keyword, { maxResults: 10 });
-                const grepMatches = grepResult.all || [];
-                log('Grep results for', keyword, ':', grepMatches.length);
-                for (const match of grepMatches.slice(0, 10)) {
-                    const key = `${match.file}:${match.line}`;
-                    if (!results.has(key)) {
-                        results.set(key, {
-                            file: match.file,
-                            fileName: match.fileName || match.file?.split('/').pop() || 'unknown',
-                            line: match.line || 1,
-                            symbol: null,
-                            type: 'grep',
-                            score: 0.6,
-                            sources: new Set(['grep']),
-                            preview: match.code?.substring(0, 100) || match.content?.substring(0, 100)
-                        });
-                    } else {
-                        results.get(key).sources.add('grep');
-                        results.get(key).score += 0.1;
+            for (const term of searchTerms.slice(0, 5)) {
+                const trigramResults = searchTrigramIndex(term, { maxResults: 15 });
+                
+                for (const fileResult of trigramResults) {
+                    for (const match of fileResult.matches.slice(0, 5)) {
+                        const key = `${fileResult.file}:${match.line}`;
+                        if (!results.has(key)) {
+                            results.set(key, {
+                                file: fileResult.file,
+                                fileName: fileResult.fileName,
+                                line: match.line,
+                                symbol: null,
+                                type: 'text',
+                                score: 0.8, // High score for exact matches
+                                sources: new Set(['trigram']),
+                                preview: match.context?.substring(0, 100)
+                            });
+                        } else {
+                            results.get(key).sources.add('trigram');
+                            results.get(key).score += 0.15; // Boost for exact match
+                        }
                     }
                 }
             }
+            log('L2 Trigram: total results now', results.size);
         } catch (err) {
-            log('Grep search error:', err.message);
+            log('L2 Trigram error:', err.message);
         }
     }
     
-    // 3. Vector Search (semantic matches)
-    log('Vector search check - chunks:', vectorIndex.chunks.length, 'includeVector:', includeVector);
+    // ================================================================
+    // LAYER 3: VECTOR INDEX (Semantic - TF-IDF similarity)
+    // ================================================================
     if (includeVector && vectorIndex.chunks.length > 0) {
         try {
             const vectorResults = searchVectorIndex(query, 15);
-            log('Vector search returned:', vectorResults.length, 'results');
+            log('L3 Vector: found', vectorResults.length, 'semantic matches');
+            
             for (const match of vectorResults) {
-                log('  Vector match:', match.fileName, 'line', match.startLine, 'similarity:', match.similarity?.toFixed(3));
                 const key = `${match.file}:${match.startLine}`;
                 if (!results.has(key)) {
                     results.set(key, {
@@ -4965,27 +8698,30 @@ async function hybridSearch(query, options = {}) {
                         line: match.startLine,
                         endLine: match.endLine,
                         symbol: match.symbolName,
-                        type: match.type,
-                        score: match.similarity * 0.9, // Vector similarity
+                        type: match.type || 'semantic',
+                        score: match.similarity * 0.85,
                         sources: new Set(['vector']),
                         preview: match.text?.substring(0, 100)
                     });
                 } else {
                     results.get(key).sources.add('vector');
-                    results.get(key).score += match.similarity * 0.3; // Boost for semantic match
+                    results.get(key).score += match.similarity * 0.25;
                 }
             }
         } catch (err) {
-            log('Vector search error:', err.message);
+            log('L3 Vector error:', err.message);
         }
-    } else if (vectorIndex.chunks.length === 0) {
-        log('Vector index empty - run "AstraCode: Rebuild Index" to build it');
     }
     
-    // Boost items found by multiple methods
+    // ================================================================
+    // MERGE & RANK: Boost items found by multiple methods
+    // ================================================================
     for (const [key, data] of results) {
-        if (data.sources.size > 1) {
-            data.score *= 1.0 + (data.sources.size * 0.25); // 25% boost per additional source
+        const sourceCount = data.sources.size;
+        if (sourceCount > 1) {
+            // Significant boost for multi-source matches
+            data.score *= 1.0 + (sourceCount * 0.3);
+            log(`Multi-source boost: ${key} (${Array.from(data.sources).join('+')})`);
         }
     }
     
@@ -4994,7 +8730,7 @@ async function hybridSearch(query, options = {}) {
         .sort((a, b) => b.score - a.score)
         .slice(0, maxResults);
     
-    log(`Hybrid search complete: ${sortedResults.length} results returned`);
+    log(`Hybrid search: ${sortedResults.length} results from ${results.size} candidates`);
     log('=== HYBRID SEARCH END ===');
     
     return sortedResults;
@@ -5758,6 +9494,39 @@ class ChatViewProvider {
             flex-wrap: wrap;
             gap: 4px;
             flex: 1;
+            max-height: 60px;
+            overflow: hidden;
+            transition: max-height 0.3s ease;
+        }
+        
+        .context-files-list.expanded {
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .context-summary {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 8px;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            border-radius: 10px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        
+        .context-summary:hover {
+            opacity: 0.9;
+        }
+        
+        .context-summary .expand-icon {
+            font-size: 10px;
+            transition: transform 0.2s;
+        }
+        
+        .context-summary.expanded .expand-icon {
+            transform: rotate(180deg);
         }
         
         .context-file-chip {
@@ -5836,6 +9605,17 @@ class ChatViewProvider {
             min-width: 80px;
         }
         
+        /* Summary Progress - distinct styling */
+        #summaryProgressInline {
+            background: linear-gradient(135deg, var(--vscode-editor-background), rgba(100, 149, 237, 0.1));
+            border-color: rgba(100, 149, 237, 0.3);
+        }
+        
+        #summaryProgressText {
+            min-width: 140px;
+            color: var(--vscode-textLink-foreground);
+        }
+        
         /* Flashing Indexing Indicator */
         .indexing-indicator {
             font-size: 14px;
@@ -5874,6 +9654,10 @@ class ChatViewProvider {
                 <span id="indexingIndicator" class="indexing-indicator">💡</span>
                 <span id="indexProgressText" class="index-progress-text-inline">0%</span>
             </div>
+            <div id="summaryProgressInline" class="index-progress-inline" style="display: none;">
+                <span class="indexing-indicator">📚</span>
+                <span id="summaryProgressText" class="index-progress-text-inline">Summaries...</span>
+            </div>
             <button id="rebuildIndexBtn" class="index-btn" title="Rebuild code index">🔄 Rebuild</button>
             <button id="clearContextBtn" class="clear-context-btn" title="Clear all files and index">🗑️ Clear All</button>
         </div>
@@ -5892,7 +9676,7 @@ class ChatViewProvider {
             <button class="quick-action-btn" data-prompt="Find bugs and issues">🐛 Debug</button>
             <button class="quick-action-btn graph-btn" data-command="openCallGraphInBrowser">⬡ Graph</button>
             <button class="quick-action-btn search-btn" data-command="semanticSearch">🧠 Search</button>
-            <button class="quick-action-btn" data-prompt="Generate full documentation (DeepWiki style)">📄 Docs</button>
+            <button class="quick-action-btn" data-prompt="Generate full documentation (DeepWiki style)">📄 Code Docs</button>
         </div>
         <div class="input-row">
             <textarea id="chatInput" placeholder="Ask a question... (Ctrl+Enter to send)" rows="2"></textarea>
@@ -6058,6 +9842,9 @@ class ChatViewProvider {
                 case 'indexProgress':
                     showIndexProgress(message.progress, message.message);
                     break;
+                case 'summaryProgress':
+                    showSummaryProgress(message.progress, message.message, message.count);
+                    break;
             }
         });
         
@@ -6078,6 +9865,26 @@ class ChatViewProvider {
                 setTimeout(() => {
                     progressContainer.style.display = 'none';
                 }, 1500);
+            }
+        }
+        
+        // Summary progress indicator
+        function showSummaryProgress(progress, message, count) {
+            const progressContainer = document.getElementById('summaryProgressInline');
+            const progressText = document.getElementById('summaryProgressText');
+            
+            if (!progressContainer || !progressText) return;
+            
+            if (progress < 100) {
+                // Show progress
+                progressContainer.style.display = 'flex';
+                progressText.textContent = message || 'Summarizing...';
+            } else {
+                // Complete - show count briefly then hide
+                progressText.textContent = count ? '✓ ' + count + ' summaries' : '✓ Done';
+                setTimeout(() => {
+                    progressContainer.style.display = 'none';
+                }, 3000);
             }
         }
         
@@ -6132,23 +9939,67 @@ class ChatViewProvider {
                 contextBar.style.display = 'flex';
                 contextFilesData = status.files;
                 
-                contextFilesList.innerHTML = status.files.map((file, index) => 
-                    '<span class="context-file-chip">' +
-                        file.name +
-                        '<span class="remove-file" data-index="' + index + '" title="Remove">✕</span>' +
-                    '</span>'
-                ).join('');
+                const fileCount = status.files.length;
+                const COLLAPSE_THRESHOLD = 10; // Show summary if more than this many files
                 
-                // Add click handlers for remove buttons
-                contextFilesList.querySelectorAll('.remove-file').forEach(btn => {
-                    btn.addEventListener('click', (e) => {
-                        const index = parseInt(e.target.dataset.index);
-                        const file = contextFilesData[index];
-                        if (file) {
-                            vscode.postMessage({ type: 'removeFile', path: file.path });
-                        }
+                if (fileCount > COLLAPSE_THRESHOLD) {
+                    // Show collapsed summary view for large file counts
+                    contextFilesList.innerHTML = 
+                        '<div class="context-summary" id="contextSummary">' +
+                            '<span>📁 ' + fileCount + ' files in context</span>' +
+                            '<span class="expand-icon">▼</span>' +
+                        '</div>' +
+                        '<div id="contextFilesExpanded" class="context-files-expanded" style="display:none; flex-wrap:wrap; gap:4px; margin-top:4px; max-height:150px; overflow-y:auto;">' +
+                            status.files.map((file, index) => 
+                                '<span class="context-file-chip">' +
+                                    file.name +
+                                    '<span class="remove-file" data-index="' + index + '" title="Remove">✕</span>' +
+                                '</span>'
+                            ).join('') +
+                        '</div>';
+                    
+                    // Toggle expand/collapse
+                    const summary = document.getElementById('contextSummary');
+                    const expanded = document.getElementById('contextFilesExpanded');
+                    if (summary && expanded) {
+                        summary.addEventListener('click', () => {
+                            const isExpanded = expanded.style.display !== 'none';
+                            expanded.style.display = isExpanded ? 'none' : 'flex';
+                            summary.classList.toggle('expanded', !isExpanded);
+                        });
+                    }
+                    
+                    // Add click handlers for remove buttons
+                    contextFilesList.querySelectorAll('.remove-file').forEach(btn => {
+                        btn.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            const index = parseInt(e.target.dataset.index);
+                            const file = contextFilesData[index];
+                            if (file) {
+                                vscode.postMessage({ type: 'removeFile', path: file.path });
+                            }
+                        });
                     });
-                });
+                } else {
+                    // Show all files as chips for small counts
+                    contextFilesList.innerHTML = status.files.map((file, index) => 
+                        '<span class="context-file-chip">' +
+                            file.name +
+                            '<span class="remove-file" data-index="' + index + '" title="Remove">✕</span>' +
+                        '</span>'
+                    ).join('');
+                    
+                    // Add click handlers for remove buttons
+                    contextFilesList.querySelectorAll('.remove-file').forEach(btn => {
+                        btn.addEventListener('click', (e) => {
+                            const index = parseInt(e.target.dataset.index);
+                            const file = contextFilesData[index];
+                            if (file) {
+                                vscode.postMessage({ type: 'removeFile', path: file.path });
+                            }
+                        });
+                    });
+                }
             } else {
                 contextBar.style.display = 'none';
                 contextFilesList.innerHTML = '';
@@ -6611,6 +10462,7 @@ const AGENT_TOOLS = {
             const { pattern, type, fuzzy = true } = params;
             
             log('search_index: Searching for pattern:', pattern, 'type:', type || 'all', 'fuzzy:', fuzzy);
+            showProgress(`Searching index for: "${pattern}"${type ? ` (type: ${type})` : ''}`, 'index');
             
             const results = {
                 symbols: [],
@@ -6688,6 +10540,13 @@ const AGENT_TOOLS = {
                 }
             }
             
+            // Show results
+            showProgress(`Found ${results.symbols.length} symbols, ${results.functions.length} functions`, 'found');
+            if (results.symbols.length > 0) {
+                const topMatches = results.symbols.slice(0, 5).map(s => s.name).join(', ');
+                showProgress(`Top matches: ${topMatches}`, 'found');
+            }
+            
             log('search_index: Found', results.symbols.length, 'symbols,', 
                 results.functions.length, 'functions,',
                 results.classes.length, 'classes');
@@ -6703,6 +10562,113 @@ const AGENT_TOOLS = {
                         hasCallGraph: results.callGraph.length > 0
                     }
                 } 
+            };
+        }
+    },
+    
+    // === TRIGRAM SEARCH (exact/partial text matching - Zoekt-style) ===
+    search_trigram: {
+        name: 'search_trigram',
+        description: 'Fast exact/partial text search using trigram index (like Sourcegraph/Zoekt). Best for finding exact strings, variable names, or partial matches in code.',
+        parameters: { query: 'string', caseSensitive: 'boolean?', maxResults: 'number?' },
+        execute: async (params) => {
+            const { query, caseSensitive = false, maxResults = 20 } = params;
+            
+            log('search_trigram: Searching for:', query);
+            showProgress(`Trigram search: "${query}"`, 'search');
+            
+            if (trigramIndex.index.size === 0) {
+                return { 
+                    success: false, 
+                    error: 'Trigram index not built. Run "Rebuild Index" first.' 
+                };
+            }
+            
+            const results = searchTrigramIndex(query, { caseSensitive, maxResults });
+            
+            if (results.length === 0) {
+                showProgress(`No exact matches for "${query}"`, 'warn');
+                return { 
+                    success: true, 
+                    data: { matches: [], totalMatches: 0, message: 'No exact matches found' }
+                };
+            }
+            
+            // Format results
+            const formattedResults = results.map(r => ({
+                file: r.file,
+                fileName: r.fileName,
+                matchCount: r.matchCount,
+                matches: r.matches.map(m => ({
+                    line: m.line,
+                    context: m.context
+                }))
+            }));
+            
+            const totalMatches = results.reduce((sum, r) => sum + r.matchCount, 0);
+            showProgress(`Trigram: found ${totalMatches} matches in ${results.length} files`, 'found');
+            
+            return {
+                success: true,
+                data: {
+                    matches: formattedResults,
+                    totalMatches,
+                    filesSearched: trigramIndex.stats.files,
+                    trigramsIndexed: trigramIndex.stats.trigrams
+                }
+            };
+        }
+    },
+    
+    // === VECTOR/SEMANTIC SEARCH ===
+    search_semantic: {
+        name: 'search_semantic',
+        description: 'Semantic code search using TF-IDF embeddings. Finds conceptually similar code even without exact keyword matches.',
+        parameters: { query: 'string', topK: 'number?' },
+        execute: async (params) => {
+            const { query, topK = 10 } = params;
+            
+            log('search_semantic: Searching for:', query);
+            showProgress(`Semantic search: "${query}"`, 'search');
+            
+            if (vectorIndex.chunks.length === 0) {
+                return { 
+                    success: false, 
+                    error: 'Vector index not built. Run "Rebuild Index" first.' 
+                };
+            }
+            
+            const results = searchVectorIndex(query, topK);
+            
+            if (results.length === 0) {
+                showProgress(`No semantic matches for "${query}"`, 'warn');
+                return { 
+                    success: true, 
+                    data: { matches: [], message: 'No semantic matches found' }
+                };
+            }
+            
+            // Format results
+            const formattedResults = results.map(r => ({
+                file: r.file,
+                fileName: r.fileName,
+                startLine: r.startLine,
+                endLine: r.endLine,
+                type: r.type,
+                symbolName: r.symbolName,
+                similarity: r.similarity.toFixed(3),
+                preview: r.text?.substring(0, 200)
+            }));
+            
+            showProgress(`Semantic: found ${results.length} matches (best: ${results[0]?.similarity?.toFixed(2)})`, 'found');
+            
+            return {
+                success: true,
+                data: {
+                    matches: formattedResults,
+                    model: vectorIndex.model,
+                    vocabulary: tfidfVocabulary.built ? tfidfVocabulary.terms.size : 0
+                }
             };
         }
     },
@@ -6791,12 +10757,13 @@ const AGENT_TOOLS = {
     // === COMPREHENSIVE SEARCH (combines index + grep) ===
     search_code: {
         name: 'search_code',
-        description: 'Comprehensive code search: combines fuzzy index search AND grep for thorough results. Use this for implementation questions.',
+        description: 'Comprehensive code search: combines symbol index (fuzzy) + trigram index (exact text) for thorough results. Use this for implementation questions.',
         parameters: { query: 'string', contextLines: 'number?', expandTerms: 'boolean?' },
         execute: async (params) => {
             const { query, contextLines = 5, expandTerms = true } = params;
             
             log('search_code: Comprehensive search for:', query);
+            showProgress(`Searching for: "${query}"`, 'search');
             
             // Build search terms from query
             let searchTerms = query.split(/[\s,|]+/).filter(t => t.length >= 2);
@@ -6805,6 +10772,7 @@ const AGENT_TOOLS = {
             // LLM-powered term expansion - find related function/variable names
             if (expandTerms && searchTerms.length < 10) {
                 try {
+                    showProgress('Expanding search terms with LLM...', 'info');
                     const expansionPrompt = `Given this search query about code: "${query}"
 
 Generate additional search terms that would help find the IMPLEMENTATION code.
@@ -6833,6 +10801,7 @@ Return ONLY a comma-separated list of 5-10 additional search terms (single words
                         }
                     }
                     log('search_code: Expanded terms:', searchTerms);
+                    showProgress(`Search terms: ${searchTerms.slice(0, 8).join(', ')}${searchTerms.length > 8 ? '...' : ''}`, 'info');
                 } catch (err) {
                     log('search_code: Term expansion failed:', err.message);
                 }
@@ -6848,8 +10817,104 @@ Return ONLY a comma-separated list of 5-10 additional search terms (single words
                 combinedContext: ''
             };
             
-            // 1. Search index with fuzzy matching for each term
+            // 0. FILE NAME MATCHING (HIGH PRIORITY)
+            // For queries like "explain partitioning", find files with "partition" in name
+            // Bidirectional: keyword in filename OR common prefix match
+            showProgress('Searching by file name...', 'search');
+            const fileMatches = [];
             const seenSymbols = new Set();
+            for (const term of searchTerms) {
+                if (term.length < 3) continue;
+                const termLower = term.toLowerCase();
+                
+                for (const [filePath, file] of contextFiles) {
+                    const fileName = filePath.split('/').pop().toLowerCase();
+                    const fileNameNoExt = fileName.replace(/\.[^.]+$/, '');
+                    
+                    // Check BOTH directions:
+                    // 1. term in filename: "part" matches "partdesc.c"
+                    // 2. common prefix: "partitioning" and "partdesc" both start with "part"
+                    const termInFile = fileNameNoExt.includes(termLower) || fileName.includes(termLower);
+                    const commonPrefix = fileNameNoExt.length >= 4 && termLower.length >= 4 && 
+                                        fileNameNoExt.substring(0, 4) === termLower.substring(0, 4);
+                    
+                    if (termInFile || commonPrefix) {
+                        // Get all symbols from this file
+                        const fileSymbols = [];
+                        for (const [symKey, symbol] of codeIndex.symbols) {
+                            if (symbol.file === filePath && !symKey.includes('@')) {
+                                fileSymbols.push(symbol);
+                            }
+                        }
+                        
+                        fileMatches.push({
+                            file: filePath,
+                            fileName: filePath.split('/').pop(),
+                            matchedTerm: term,
+                            symbolCount: fileSymbols.length,
+                            symbols: fileSymbols.slice(0, 20)
+                        });
+                        log(`search_code: File name match: ${fileName} for term "${term}"`);
+                    }
+                }
+            }
+            
+            // Add file matches to results with high priority
+            if (fileMatches.length > 0) {
+                results.indexResults.fileMatches = fileMatches;
+                log('search_code: Found', fileMatches.length, 'files matching search terms by name');
+                
+                // Also add their symbols to the symbol results
+                for (const fm of fileMatches.slice(0, 10)) {
+                    for (const sym of fm.symbols) {
+                        if (!seenSymbols.has(sym.name)) {
+                            seenSymbols.add(sym.name);
+                            results.indexResults.symbols.push({
+                                name: sym.name,
+                                type: sym.type,
+                                file: sym.file,
+                                line: sym.line,
+                                matchScore: 100, // High score for file name match
+                                source: 'filename-match'
+                            });
+                        }
+                    }
+                }
+                
+                // IMPORTANT: Also include actual code from these files
+                // This ensures the LLM has real implementation code to reference
+                for (const fm of fileMatches.slice(0, 5)) {
+                    const file = contextFiles.get(fm.file);
+                    if (!file) continue;
+                    
+                    const lines = file.content.split('\n');
+                    
+                    // Include key functions from the file
+                    for (const sym of fm.symbols.slice(0, 8)) {
+                        if (sym.type === 'function' || sym.type === 'procedure' || sym.type === 'method') {
+                            const start = Math.max(0, sym.line - 1);
+                            const end = Math.min(lines.length - 1, start + 50); // Up to 50 lines per function
+                            
+                            const codeBlock = lines.slice(start, end + 1)
+                                .map((line, i) => `${(start + i + 1).toString().padStart(4)}: ${line}`)
+                                .join('\n');
+                            
+                            results.grepResults.push({
+                                fileName: fm.fileName,
+                                startLine: start + 1,
+                                endLine: end + 1,
+                                matchCount: 1,
+                                content: codeBlock,
+                                source: 'filename-match',
+                                functionName: sym.name
+                            });
+                        }
+                    }
+                }
+            }
+            
+            // 1. Search index with fuzzy matching for each term
+            showProgress('Searching symbol index...', 'index');
             for (const term of searchTerms) {
                 const fuzzyResults = fuzzySearchSymbols(term, null, 40);
                 for (const symbol of fuzzyResults.slice(0, 10)) { // Top 10 per term
@@ -6882,90 +10947,60 @@ Return ONLY a comma-separated list of 5-10 additional search terms (single words
             }
             
             log('search_code: Index search found', results.indexResults.symbols.length, 'symbols');
+            showProgress(`Symbol index: found ${results.indexResults.symbols.length} symbols, ${results.indexResults.functions.length} functions`, 'found');
             
-            // 2. Grep for patterns in actual code
-            // Limit files to search for large repos
-            const MAX_FILES_TO_GREP = 200;
-            const MAX_TOTAL_GREP_RESULTS = 50;
+            // 2. Trigram search for exact text matches (replaces grep - faster and more accurate)
+            showProgress(`Trigram searching ${trigramIndex.stats.files} indexed files...`, 'search');
             
-            const grepPattern = searchTerms.join('|');
-            const grepRegex = new RegExp(grepPattern, 'gi');
+            const MAX_TRIGRAM_RESULTS = 50;
+            const seenBlocks = new Set();
             
-            let filesSearched = 0;
-            for (const [path, file] of contextFiles) {
-                // Stop if we have enough results
-                if (results.grepResults.length >= MAX_TOTAL_GREP_RESULTS) {
-                    log('search_code: Hit grep result limit at', MAX_TOTAL_GREP_RESULTS);
-                    break;
-                }
+            for (const term of searchTerms.slice(0, 8)) {
+                if (term.length < 3) continue; // Trigram needs at least 3 chars
                 
-                // Stop if we've searched enough files
-                if (filesSearched++ >= MAX_FILES_TO_GREP) {
-                    log('search_code: Hit file limit at', MAX_FILES_TO_GREP);
-                    break;
-                }
+                const trigramResults = searchTrigramIndex(term, { maxResults: 15 });
                 
-                const fileName = path.split('/').pop();
-                const lines = file.content.split('\n');
-                const matchedLineNums = new Set();
-                
-                // Skip very large files in large repos
-                if (contextFiles.size > 100 && lines.length > 5000) {
-                    log('search_code: Skipping large file', fileName, 'with', lines.length, 'lines');
-                    continue;
-                }
-                
-                lines.forEach((line, idx) => {
-                    grepRegex.lastIndex = 0;
-                    if (grepRegex.test(line)) {
-                        matchedLineNums.add(idx);
-                    }
-                });
-                
-                if (matchedLineNums.size > 0) {
-                    const sortedMatches = Array.from(matchedLineNums).sort((a, b) => a - b);
+                for (const fileResult of trigramResults) {
+                    if (results.grepResults.length >= MAX_TRIGRAM_RESULTS) break;
                     
-                    // Group nearby matches
-                    let ranges = [];
-                    let currentRange = null;
+                    const file = contextFiles.get(fileResult.file);
+                    if (!file) continue;
                     
-                    for (const lineNum of sortedMatches) {
-                        const start = Math.max(0, lineNum - contextLines);
-                        const end = Math.min(lines.length - 1, lineNum + contextLines);
+                    const lines = file.content.split('\n');
+                    
+                    // Group matches into code blocks
+                    for (const match of fileResult.matches.slice(0, 5)) {
+                        const blockKey = `${fileResult.file}:${Math.floor(match.line / 10)}`;
+                        if (seenBlocks.has(blockKey)) continue;
+                        seenBlocks.add(blockKey);
                         
-                        if (currentRange && start <= currentRange.end + 2) {
-                            currentRange.end = end;
-                            currentRange.matchLines.push(lineNum);
-                        } else {
-                            if (currentRange) ranges.push(currentRange);
-                            currentRange = { start, end, matchLines: [lineNum] };
-                        }
-                    }
-                    if (currentRange) ranges.push(currentRange);
-                    
-                    // Extract code blocks - limit per file
-                    const maxBlocksPerFile = contextFiles.size > 100 ? 2 : 5;
-                    for (const range of ranges.slice(0, maxBlocksPerFile)) {
-                        const codeBlock = lines.slice(range.start, range.end + 1)
+                        const contextLines = 5;
+                        const start = Math.max(0, match.line - 1 - contextLines);
+                        const end = Math.min(lines.length - 1, match.line - 1 + contextLines);
+                        
+                        const codeBlock = lines.slice(start, end + 1)
                             .map((line, i) => {
-                                const actualLineNum = range.start + i + 1;
-                                const isMatch = range.matchLines.includes(range.start + i);
+                                const actualLineNum = start + i + 1;
+                                const isMatch = actualLineNum === match.line;
                                 return `${actualLineNum.toString().padStart(4)}: ${isMatch ? '>>> ' : '    '}${line}`;
                             })
                             .join('\n');
                         
                         results.grepResults.push({
-                            fileName,
-                            startLine: range.start + 1,
-                            endLine: range.end + 1,
-                            matchCount: range.matchLines.length,
+                            fileName: fileResult.fileName,
+                            startLine: start + 1,
+                            endLine: end + 1,
+                            matchCount: 1,
                             content: codeBlock
                         });
                     }
                 }
+                
+                if (results.grepResults.length >= MAX_TRIGRAM_RESULTS) break;
             }
             
-            log('search_code: Grep found', results.grepResults.length, 'code blocks from', filesSearched, 'files');
+            log('search_code: Trigram found', results.grepResults.length, 'code blocks');
+            showProgress(`Trigram: found ${results.grepResults.length} code blocks`, 'found');
             
             // 3. Build combined context for LLM
             let combined = '# SEARCH RESULTS\n\n';
@@ -6974,6 +11009,7 @@ Return ONLY a comma-separated list of 5-10 additional search terms (single words
             const foundNothing = results.indexResults.symbols.length === 0 && results.grepResults.length === 0;
             
             if (foundNothing) {
+                showProgress('No results found - try different search terms', 'warn');
                 combined += `## No Results Found\n`;
                 combined += `Search query "${query}" did not match any symbols or code in the attached files.\n\n`;
                 combined += `### Files searched:\n`;
@@ -6985,6 +11021,30 @@ Return ONLY a comma-separated list of 5-10 additional search terms (single words
                 combined += `- Check if the relevant code is in the attached files\n`;
                 combined += `- Use more general terms\n`;
             } else {
+                // Show top matches to user
+                const topSymbols = results.indexResults.symbols.slice(0, 5).map(s => s.name).join(', ');
+                if (topSymbols) {
+                    showProgress(`Top matches: ${topSymbols}`, 'found');
+                }
+                
+                // Include file matches (files with search terms in name) - HIGH PRIORITY
+                if (results.indexResults.fileMatches?.length > 0) {
+                    combined += '## 📁 KEY FILES (name matches search terms)\n';
+                    combined += 'These files are highly relevant based on filename matching:\n\n';
+                    for (const fm of results.indexResults.fileMatches.slice(0, 10)) {
+                        combined += `### ${fm.fileName}\n`;
+                        combined += `Matched term: "${fm.matchedTerm}" | ${fm.symbolCount} symbols\n`;
+                        if (fm.symbols.length > 0) {
+                            combined += 'Key functions/types:\n';
+                            for (const sym of fm.symbols.slice(0, 15)) {
+                                combined += `- ${sym.name} (${sym.type}) line ${sym.line}\n`;
+                            }
+                        }
+                        combined += '\n';
+                    }
+                    combined += '\n';
+                }
+                
                 // Include ALL index results - answer_question will handle chunking
                 if (results.indexResults.symbols.length > 0) {
                     combined += '## Symbols Found (by relevance)\n';
@@ -7024,6 +11084,73 @@ Return ONLY a comma-separated list of 5-10 additional search terms (single words
             results.combinedContext = combined;
             log('search_code: Final context size:', combined.length, 'chars');
             log('search_code: Will be chunked if > 18KB by answer_question');
+            
+            // VERBOSE: Show detailed search results summary to user
+            if (AGENT_CONFIG.verboseSearch) {
+                let verboseOutput = '\n**🔎 search_code Verbose Results:**\n\n';
+                
+                // Search terms used
+                verboseOutput += `**Search Terms:** \`${searchTerms.slice(0, 12).join('`, `')}\`\n\n`;
+                
+                // File name matches
+                if (results.indexResults.fileMatches?.length > 0) {
+                    verboseOutput += `**File Name Matches (${results.indexResults.fileMatches.length}):**\n`;
+                    verboseOutput += `| File | Matched Term | Symbols |\n`;
+                    verboseOutput += `|:-----|:-------------|:--------|\n`;
+                    for (const fm of results.indexResults.fileMatches.slice(0, 10)) {
+                        const topSyms = fm.symbols.slice(0, 3).map(s => s.name).join(', ');
+                        verboseOutput += `| \`${fm.fileName}\` | "${fm.matchedTerm}" | ${topSyms}... |\n`;
+                    }
+                    verboseOutput += '\n';
+                }
+                
+                // Symbol index hits
+                verboseOutput += `**Symbol Index Hits (${results.indexResults.symbols.length}):**\n`;
+                verboseOutput += `| Symbol | Type | Location | Score |\n`;
+                verboseOutput += `|:-------|:-----|:---------|:------|\n`;
+                for (const sym of results.indexResults.symbols.slice(0, 15)) {
+                    const fileName = sym.file?.split('/').pop() || 'unknown';
+                    verboseOutput += `| \`${sym.name}\` | ${sym.type} | ${fileName}:${sym.line} | ${sym.matchScore || '-'} |\n`;
+                }
+                if (results.indexResults.symbols.length > 15) {
+                    verboseOutput += `| ... | +${results.indexResults.symbols.length - 15} more | | |\n`;
+                }
+                verboseOutput += '\n';
+                
+                // Trigram/grep hits
+                verboseOutput += `**Code Block Hits (${results.grepResults.length}):**\n`;
+                verboseOutput += `| File | Lines | Source |\n`;
+                verboseOutput += `|:-----|:------|:-------|\n`;
+                for (const block of results.grepResults.slice(0, 15)) {
+                    verboseOutput += `| \`${block.fileName}\` | ${block.startLine}-${block.endLine} | ${block.source || 'trigram'} |\n`;
+                }
+                if (results.grepResults.length > 15) {
+                    verboseOutput += `| ... | +${results.grepResults.length - 15} more | |\n`;
+                }
+                verboseOutput += '\n';
+                
+                // Call graph relationships
+                if (results.indexResults.callGraph.length > 0) {
+                    verboseOutput += `**Call Graph (${results.indexResults.callGraph.length} functions):**\n`;
+                    for (const cg of results.indexResults.callGraph.slice(0, 8)) {
+                        if (cg.calls.length > 0) {
+                            verboseOutput += `- \`${cg.function}\` → calls: ${cg.calls.slice(0, 5).join(', ')}${cg.calls.length > 5 ? '...' : ''}\n`;
+                        }
+                        if (cg.calledBy.length > 0) {
+                            verboseOutput += `- \`${cg.function}\` ← called by: ${cg.calledBy.slice(0, 5).join(', ')}${cg.calledBy.length > 5 ? '...' : ''}\n`;
+                        }
+                    }
+                    verboseOutput += '\n';
+                }
+                
+                verboseOutput += `**Total Context Size:** ${Math.round(combined.length/1024)}KB\n`;
+                verboseOutput += '\n---\n';
+                
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: verboseOutput
+                });
+            }
             
             return {
                 success: true,
@@ -7770,6 +11897,108 @@ What the code does well`;
         }
     },
     
+    review_file: {
+        name: 'review_file',
+        description: 'Review a specific file for bugs, issues, and improvements. Takes a filename and automatically loads the content.',
+        parameters: { fileName: 'string', focus: 'string?' },
+        execute: async (params) => {
+            const { fileName, focus = 'bugs' } = params;
+            
+            log('review_file: Reviewing file:', fileName, 'focus:', focus);
+            
+            // Find the file in context
+            let targetFile = null;
+            let targetPath = null;
+            
+            for (const [path, file] of contextFiles) {
+                const pathFileName = path.split('/').pop();
+                if (pathFileName === fileName || pathFileName.toLowerCase() === fileName.toLowerCase() || path.endsWith(fileName)) {
+                    targetFile = file;
+                    targetPath = path;
+                    break;
+                }
+            }
+            
+            if (!targetFile) {
+                return { success: false, error: `File "${fileName}" not found in context. Available files: ${Array.from(contextFiles.keys()).map(p => p.split('/').pop()).slice(0, 20).join(', ')}` };
+            }
+            
+            log('review_file: Found file:', targetPath);
+            
+            // Get symbols from this file for context
+            const fileSymbols = [];
+            for (const [key, sym] of codeIndex.symbols) {
+                if (sym.file === targetPath) {
+                    fileSymbols.push(`${sym.type}: ${sym.name} (line ${sym.line})`);
+                }
+            }
+            
+            const focusPrompt = focus === 'bugs' 
+                ? 'potential bugs, logic errors, edge cases, memory issues, race conditions, and security vulnerabilities'
+                : focus === 'security' 
+                ? 'security vulnerabilities, injection risks, authentication issues, and data exposure'
+                : focus === 'performance'
+                ? 'performance issues, inefficient algorithms, unnecessary allocations, and optimization opportunities'
+                : 'bugs, issues, and improvements';
+            
+            const prompt = `Review this file for ${focusPrompt}:
+
+**File:** ${targetPath}
+**Language:** ${targetFile.language || 'unknown'}
+**Symbols in file:** ${fileSymbols.slice(0, 30).join(', ')}
+
+\`\`\`${targetFile.language || ''}
+${targetFile.content.substring(0, 20000)}
+\`\`\`
+
+CRITICAL: Find REAL, SPECIFIC bugs - not vague "could be" issues. Look for:
+- NULL pointer dereferences without checks
+- Buffer overflows / out-of-bounds access
+- Memory leaks (allocated but not freed)
+- Use-after-free patterns
+- Integer overflow/underflow
+- Missing error checking after function calls
+- Race conditions / thread safety issues
+- Logic errors (wrong operators, off-by-one, etc.)
+- Uninitialized variables
+- Resource leaks (file handles, locks, etc.)
+
+For EACH issue found, you MUST provide:
+1. The EXACT line number
+2. The SPECIFIC code snippet that's buggy
+3. WHY it's a bug (what could go wrong)
+4. HOW to fix it (concrete code change)
+
+## 📄 File Overview
+Brief description of what this file does
+
+## 🔴 Critical Issues (HIGH SEVERITY)
+Bugs that could cause crashes, data corruption, or security vulnerabilities.
+Format each as:
+**Line [X]:** \`problematic code snippet\`
+- **Bug:** [What's wrong]
+- **Impact:** [What could happen]
+- **Fix:** [Specific code change]
+
+## 🟡 Potential Issues (MEDIUM SEVERITY)
+Logic errors, edge cases, or risky patterns.
+(Same format as above)
+
+## 🔵 Code Quality (LOW SEVERITY)
+Style issues, maintainability concerns, missing error handling.
+(Same format as above)
+
+## ✅ Summary
+- Total issues found: X critical, Y medium, Z low
+- Most important fix: [Brief description]
+
+If you find NO bugs, explain what defensive patterns the code uses that prevent common bugs.`;
+
+            const review = await callLanguageModel(prompt);
+            return { success: true, data: { review, fileName: targetPath, focus } };
+        }
+    },
+    
     explain_code: {
         name: 'explain_code',
         description: 'Explain what a piece of code does',
@@ -7994,14 +12223,15 @@ Output ONLY the new code:`;
     answer_question: {
         name: 'answer_question',
         description: 'Answer a question using ONLY the provided code context. Handles large contexts by chunking and summarizing.',
-        parameters: { question: 'string', context: 'string?', domain: 'string?', domain_notes: 'string?', requireCodeCitations: 'boolean?' },
+        parameters: { question: 'string', context: 'string?', domain: 'string?', domain_notes: 'string?', requireCodeCitations: 'boolean?', useProvidedContext: 'boolean?' },
         execute: async (params) => {
-            const { question, context, domain, domain_notes, requireCodeCitations = true } = params;
+            const { question, context, domain, domain_notes, requireCodeCitations = true, useProvidedContext = false } = params;
             
             log('answer_question: Received params');
             log('answer_question: question length:', question?.length || 0);
             log('answer_question: context length:', context?.length || 0);
             log('answer_question: domain:', domain || 'none');
+            log('answer_question: useProvidedContext:', useProvidedContext);
             
             // === STEP 1: Decompose compound questions ===
             const subQuestions = decomposeQuestion(question);
@@ -8029,339 +12259,278 @@ Output ONLY the new code:`;
                 return await processAnswerDirect(question, context, domain, domain_notes);
             }
             
-            // Large context - need to chunk and iterate
-            log('answer_question: Large context detected, using chunked processing');
-            log('answer_question: Total context size:', context.length, 'chars');
+            // ================================================================
+            // LARGE CONTEXT HANDLING - USE COMPREHENSIVE SEARCH
+            // For large codebases, use the same search strategy as handleDetailedQuery
+            // which includes filename matching (partition.c for "partitioning" queries)
+            // ================================================================
+            log('answer_question: Large context - using comprehensiveSearch');
+            log('answer_question: Context size:', context.length, 'chars');
             
-            // Notify user
             chatWebviewView?.webview.postMessage({ 
                 type: 'appendResponse', 
-                text: `*Processing ${Math.ceil(context.length / 1000)}KB of code in chunks...*\n\n`
+                text: `*Large codebase (${Math.ceil(context.length / 1000)}KB) - using comprehensive search...*\n\n`
             });
             
-            // Split context into chunks by code blocks (### headers)
-            const chunks = splitContextIntoChunks(context, CHUNK_SIZE);
+            // Use handleDetailedQuery's approach - it has filename matching!
+            try {
+                const result = await handleDetailedQuery(question);
+                return result;
+            } catch (err) {
+                log('answer_question: comprehensiveSearch failed, falling back to chunk scoring:', err.message);
+            }
+            
+            // FALLBACK: Original chunk scoring (if comprehensiveSearch fails)
+            log('answer_question: Falling back to keyword-based chunk scoring');
+            
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `*Fallback: scoring chunks by keywords...*\n\n`
+            });
+            
+            // Step 1: Chunk the context
+            const chunks = chunkContext(context, CHUNK_SIZE);
             log('answer_question: Split into', chunks.length, 'chunks');
             
-            // Process each chunk to extract relevant findings
-            const chunkFindings = [];
+            // Step 2: Score each chunk for relevance (quick LLM call)
+            const scoredChunks = [];
+            const keywords = extractSearchKeywords(question + ' ' + subQuestions.join(' '));
             
-            for (let i = 0; i < chunks.length; i++) {
-                log(`answer_question: Processing chunk ${i + 1}/${chunks.length}`);
-                
+            // VERBOSE: Show extracted keywords
+            if (AGENT_CONFIG.verboseSearch) {
+                const keywordInfo = `\n**🔍 Search Debug - Keywords Extracted:**\n\`${keywords.slice(0, 15).join('`, `')}\`\n`;
                 chatWebviewView?.webview.postMessage({ 
                     type: 'appendResponse', 
-                    text: `\n*Analyzing chunk ${i + 1}/${chunks.length}...*\n`
+                    text: keywordInfo
                 });
-                
-                const chunkPrompt = `# CODE CHUNK ${i + 1}/${chunks.length}
-${chunks[i]}
-
-# ORIGINAL QUESTION
-"${question}"
-
-# SUB-QUESTIONS TO ANSWER
-${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}
-
-# EXTRACTION TASK
-Find code that answers the questions above. For each finding:
-
-1. **Call Direction**: Who calls whom? (A calls B, not B calls A)
-2. **Request vs Response**: If question mentions encoding/processing, distinguish:
-   - REQUEST encoding: How outgoing data is formatted (prepare, encode, serialize)
-   - RESPONSE encoding: How incoming data is parsed (decode, parse, read)
-3. **Entry Points**: Where does the flow START? (public API functions users call)
-4. **Implementation**: Where is the actual WORK done? (internal functions)
-5. **Configurability**: What parameters control behavior? What options exist?
-
-# FORMAT
-- Be PRECISE about call direction: "get() calls request()" not "request() handles get()"
-- Include file:line for everything
-- Note which sub-question each finding answers
-- Say "No relevant code in this chunk" if nothing matches
-
-Findings:`;
-                
-                try {
-                    const chunkResult = await callLanguageModel(chunkPrompt);
-                    if (chunkResult && !chunkResult.includes('No relevant code')) {
-                        chunkFindings.push(`## Chunk ${i + 1} Findings:\n${chunkResult}`);
-                    }
-                } catch (err) {
-                    log('answer_question: Chunk', i + 1, 'error:', err.message);
-                }
+                log('VERBOSE: Keywords:', keywords.slice(0, 15));
             }
-            
-            // Now synthesize all findings
-            if (chunkFindings.length === 0) {
-                return {
-                    success: true,
-                    data: {
-                        answer: `**No relevant code found for "${question.substring(0, 100)}..."**\n\nSearched through ${chunks.length} code chunks but found no relevant implementations.\n\nThe attached files may not contain the code you're looking for.`
-                    }
-                };
-            }
-            
-            log('answer_question: Synthesizing', chunkFindings.length, 'chunk findings');
             
             chatWebviewView?.webview.postMessage({ 
                 type: 'appendResponse', 
-                text: `\n*Synthesizing findings from ${chunkFindings.length} chunks...*\n\n`
+                text: `*Scoring ${chunks.length} chunks against query...*\n`
             });
             
-            // For large number of findings, use hierarchical summarization
-            // Group findings → summarize each group → synthesize summaries
-            const MAX_FINDINGS_PER_SYNTHESIS = 10;
-            const MAX_CHARS_PER_SYNTHESIS = 35000;
+            // VERBOSE: Track keyword hit details
+            const keywordHits = new Map(); // keyword -> [{chunk, count}]
+            const fileHits = new Map();    // file -> [{chunk, context}]
             
-            let findingsToSynthesize = chunkFindings;
-            
-            if (chunkFindings.length > MAX_FINDINGS_PER_SYNTHESIS) {
-                log('answer_question: Large findings set, using hierarchical summarization');
-                chatWebviewView?.webview.postMessage({ 
-                    type: 'appendResponse', 
-                    text: `*(${chunkFindings.length} chunks - using hierarchical summarization)*\n`
-                });
+            for (let i = 0; i < chunks.length; i++) {
+                const chunk = chunks[i];
                 
-                // Group findings into batches
-                const batches = [];
-                for (let i = 0; i < chunkFindings.length; i += MAX_FINDINGS_PER_SYNTHESIS) {
-                    batches.push(chunkFindings.slice(i, i + MAX_FINDINGS_PER_SYNTHESIS));
-                }
+                // Quick relevance score based on keyword density + structure
+                let score = 0;
+                const chunkLower = chunk.toLowerCase();
+                const chunkKeywordHits = [];
                 
-                log('answer_question: Created', batches.length, 'batches for summarization');
-                
-                // Summarize each batch
-                const batchSummaries = [];
-                for (let b = 0; b < batches.length; b++) {
-                    chatWebviewView?.webview.postMessage({ 
-                        type: 'appendResponse', 
-                        text: `*Summarizing batch ${b + 1}/${batches.length}...*\n`
-                    });
+                // Keyword matches (weighted)
+                for (const kw of keywords.slice(0, 10)) {
+                    const kwLower = kw.toLowerCase();
+                    const matches = (chunkLower.match(new RegExp(kwLower, 'g')) || []).length;
+                    const kwScore = matches * (kw.length > 5 ? 2 : 1); // Longer keywords worth more
+                    score += kwScore;
                     
-                    const batchContent = batches[b].join('\n\n');
-                    const batchPrompt = `# BATCH ${b + 1}/${batches.length} FINDINGS
-
-${batchContent}
-
-# TASK
-Summarize the KEY findings from this batch that are relevant to: "${question}"
-
-Focus on:
-- Entry points and main functions
-- Call flow (who calls whom)
-- Important data structures
-- Keep file:line references
-
-Be concise but preserve important details. Output a summary (not the raw findings).`;
-
-                    try {
-                        const summary = await callLanguageModel(batchPrompt);
-                        if (summary && summary.length > 50) {
-                            batchSummaries.push(`## Batch ${b + 1} Summary\n${summary}`);
-                        }
-                    } catch (err) {
-                        log('answer_question: Batch', b + 1, 'summarization error:', err.message);
+                    // VERBOSE: Track keyword hits
+                    if (AGENT_CONFIG.verboseSearch && matches > 0) {
+                        chunkKeywordHits.push({ keyword: kw, matches, score: kwScore });
+                        if (!keywordHits.has(kw)) keywordHits.set(kw, []);
+                        keywordHits.get(kw).push({ chunk: i, count: matches });
                     }
                 }
                 
-                findingsToSynthesize = batchSummaries;
-                log('answer_question: Reduced to', batchSummaries.length, 'batch summaries');
+                // Bonus for containing file matches (filenames in section headers)
+                const fileMatches = chunk.match(/###\s+[\w]+\.(c|h|cpp|py|js|java)/g) || [];
+                score += fileMatches.length * 5;
+                
+                // Bonus for function definitions
+                const funcMatches = chunk.match(/function\s+\w+|def\s+\w+|\w+\s*\([^)]*\)\s*{/g) || [];
+                score += funcMatches.length * 2;
+                
+                // Extract file names from chunk for reference
+                const filesInChunk = [...new Set((chunk.match(/[\w-]+\.(c|h|cpp|py|js|java)/g) || []))];
+                
+                // VERBOSE: Track file hits
+                if (AGENT_CONFIG.verboseSearch) {
+                    for (const file of filesInChunk) {
+                        if (!fileHits.has(file)) fileHits.set(file, []);
+                        // Get some context around the file mention
+                        const fileIdx = chunkLower.indexOf(file.toLowerCase());
+                        const context = fileIdx >= 0 ? chunk.substring(Math.max(0, fileIdx - 20), fileIdx + file.length + 50).replace(/\n/g, ' ').trim() : '';
+                        fileHits.get(file).push({ chunk: i, context: context.substring(0, 80) });
+                    }
+                }
+                
+                scoredChunks.push({
+                    index: i,
+                    chunk,
+                    score,
+                    filesInChunk,
+                    keywordHits: chunkKeywordHits,
+                    preview: chunk.substring(0, 100).replace(/\n/g, ' ')
+                });
             }
             
-            let combinedFindings = findingsToSynthesize.join('\n\n');
+            // Sort by score descending
+            scoredChunks.sort((a, b) => b.score - a.score);
             
-            // Final safety truncation if still too large
-            if (combinedFindings.length > MAX_CHARS_PER_SYNTHESIS) {
-                log('answer_question: Truncating findings from', combinedFindings.length, 'to', MAX_CHARS_PER_SYNTHESIS);
-                combinedFindings = combinedFindings.substring(0, MAX_CHARS_PER_SYNTHESIS) + '\n\n... (truncated) ...';
+            // VERBOSE: Output detailed search hits
+            if (AGENT_CONFIG.verboseSearch) {
+                let verboseOutput = '\n**📊 Search Hit Summary:**\n';
+                
+                // Files found
+                verboseOutput += `\n| File | Chunks Found | Sample Context |\n`;
+                verboseOutput += `|:-----|:-------------|:---------------|\n`;
+                const sortedFiles = [...fileHits.entries()].sort((a, b) => b[1].length - a[1].length);
+                for (const [file, hits] of sortedFiles.slice(0, 15)) {
+                    const chunkNums = hits.map(h => h.chunk).join(', ');
+                    const sampleCtx = hits[0]?.context || '-';
+                    verboseOutput += `| \`${file}\` | chunks: ${chunkNums} | ${sampleCtx.substring(0, 40)}... |\n`;
+                }
+                
+                // Keyword coverage
+                verboseOutput += `\n**Keyword Coverage:**\n`;
+                for (const [kw, hits] of keywordHits) {
+                    const totalHits = hits.reduce((sum, h) => sum + h.count, 0);
+                    verboseOutput += `- \`${kw}\`: ${totalHits} hits across ${hits.length} chunks\n`;
+                }
+                
+                // Top scored chunks
+                verboseOutput += `\n**Top Scored Chunks:**\n`;
+                for (const sc of scoredChunks.slice(0, 8)) {
+                    const kwBreakdown = sc.keywordHits?.slice(0, 3).map(k => `${k.keyword}:${k.matches}`).join(', ') || 'n/a';
+                    verboseOutput += `- Chunk ${sc.index}: score=${sc.score}, files=[${sc.filesInChunk.slice(0, 3).join(', ')}], keywords={${kwBreakdown}}\n`;
+                }
+                
+                verboseOutput += '\n---\n\n';
+                
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: verboseOutput
+                });
+                
+                log('VERBOSE: File hits:', [...fileHits.keys()]);
+                log('VERBOSE: Keyword hits:', Object.fromEntries(keywordHits));
             }
             
-            // Final synthesis prompt - developer-oriented summary
-            const synthesisPrompt = `# FINDINGS FROM CODE ANALYSIS
-${combinedFindings}
+            // Log scoring results
+            log('answer_question: Chunk scores:');
+            for (const sc of scoredChunks.slice(0, 5)) {
+                log(`  Chunk ${sc.index}: score=${sc.score}, files=${sc.filesInChunk.slice(0, 3).join(', ')}`);
+            }
+            
+            // Step 3: Process top-scoring chunks (up to 5)
+            const MAX_CHUNKS_TO_PROCESS = 5;
+            const MIN_SCORE_THRESHOLD = 3; // Skip chunks with very low scores
+            
+            const chunksToProcess = scoredChunks
+                .filter(sc => sc.score >= MIN_SCORE_THRESHOLD)
+                .slice(0, MAX_CHUNKS_TO_PROCESS);
+            
+            if (chunksToProcess.length === 0) {
+                // Fall back to top 2 chunks even if low score
+                chunksToProcess.push(...scoredChunks.slice(0, 2));
+            }
+            
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `*Processing ${chunksToProcess.length} most relevant chunks (scores: ${chunksToProcess.map(c => c.score).join(', ')})...*\n\n`
+            });
+            
+            // Collect findings from each chunk
+            const findings = [];
+            const allFilesFound = new Set();
+            const allFunctionsFound = new Set();
+            
+            for (let i = 0; i < chunksToProcess.length; i++) {
+                const { chunk, score, filesInChunk, index } = chunksToProcess[i];
+                
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n*Analyzing chunk ${i + 1}/${chunksToProcess.length} (score: ${score})...*\n`
+                });
+                
+                // Track files for references
+                filesInChunk.forEach(f => allFilesFound.add(f));
+                
+                const chunkPrompt = `# CODE CONTEXT (Relevance Score: ${score}/100)
 
-# ORIGINAL QUESTION
+${chunk}
+
+# QUESTION
 ${question}
 
-# SUB-QUESTIONS TO ANSWER
+# SUB-QUESTIONS
 ${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}
 
-${domain ? `# DOMAIN: ${domain}` : ''}
-${domain_notes ? `# NOTES: ${domain_notes}` : ''}
-
 # TASK
-Create a DEVELOPER ORIENTATION GUIDE that DIRECTLY ANSWERS each sub-question.
+Extract SPECIFIC findings that help answer the question. For each finding:
+1. State the finding clearly
+2. Include exact file:line references
+3. Note the function/struct names involved
+4. Explain WHY this is relevant to the question
 
-# CRITICAL RULES
-1. **Answer each sub-question explicitly** in the Direct Answers section
-2. **Code flow direction**: Show who CALLS whom (caller → callee), e.g., "get() calls request()" 
-3. **Entry points**: Functions that USERS call (public API), not internal helpers
-4. **If asked "is X configurable?"**: Answer YES/NO with specific parameters and examples
+Format as:
+### Finding: [Title]
+- **Location:** \`filename.c:line\`
+- **Key Code:** \`function_name()\` or \`StructName\`
+- **Relevance:** [How this answers the question]
+- **Details:** [Specific implementation details]`;
 
-# FORMAT REQUIREMENTS
-- Use the EXACT section headers shown below (with emojis)
-- Keep descriptions concise (1-2 sentences max per item)
-- Always use \`code formatting\` for function names, files, and structs
-- Include file:line references for everything
-
-# TEMPLATE:
-
-## 💬 Direct Answers
-
-${subQuestions.map((sq, idx) => `**Q${idx + 1}: ${sq}**
-> [Direct answer with code references]
-`).join('\n')}
-
----
-
-## 🚀 Quick Summary
-> **One sentence** describing what this code does and where to start.
-> 
-> **Entry Point:** \`function_name()\` in \`file.c:line\`
-
----
-
-## 📁 Key Files
-
-| File | Purpose | Key Functions |
-|:-----|:--------|:--------------|
-| \`file.c\` | Brief description | \`func1()\`, \`func2()\` |
-
----
-
-## 🔄 Code Flow
-
-IMPORTANT: Show actual call direction. The CALLER is on the left, CALLEE on the right.
-User calls → Public API → Internal implementation → Helper functions
-
-\`\`\`
-1. user_calls_this()   [api.py:100]      → PUBLIC entry point
-   │
-   ├─► internal_func() [impl.py:200]     → Does the actual work
-   │   │
-   │   └─► helper()    [utils.py:50]     → Helper function
-\`\`\`
-
----
-
-## 📦 Data Structures
-
-| Structure | Location | Purpose |
-|:----------|:---------|:--------|
-| \`StructName\` | \`file.h:line\` | What it stores |
-
----
-
-## 🔍 Key Functions
-
-| Function | Location | Purpose |
-|:---------|:---------|:--------|
-| \`func_name()\` | \`file.c:line\` | What it does |
-
----
-
-## 🔧 Configurability (if applicable)
-
-| Parameter/Option | Values | Effect |
-|:-----------------|:-------|:-------|
-| \`param_name\` | value1, value2 | What it controls |
-
----
-
-## 🎯 Where to Start (Developer Onboarding)
-
-**If you want to understand this feature:**
-1. **First, read** \`main_file.c\` - Start here to see the entry point
-2. **Then explore** \`core_file.c\` - This is where the main logic lives
-3. **Debug tip:** Set a breakpoint in \`key_function()\` and trace the flow
-
-**If you want to modify this feature:**
-- To change behavior X → Edit \`file.c:function()\`
-- To add a new option → Look at how \`existing_option\` is handled in \`config.c\`
-
-**Key insight:** [One sentence explaining the most important thing a new developer should know]
-
----
-
-## ⚠️ Notes
-- Any gaps in the findings
-- Areas needing more investigation
-
-CRITICAL: Only include information from the findings above. Use actual file:line references.`;
-            
-            let finalResult;
-            try {
-                log('answer_question: Calling LLM for synthesis, prompt length:', synthesisPrompt.length);
-                
-                chatWebviewView?.webview.postMessage({ 
-                    type: 'appendResponse', 
-                    text: `*(Synthesis prompt: ${Math.round(synthesisPrompt.length/1000)}KB)*\n`
-                });
-                
-                finalResult = await callLanguageModel(synthesisPrompt);
-                
-                if (!finalResult || finalResult.trim().length < 50) {
-                    log('answer_question: Synthesis returned empty/short result:', finalResult);
-                    chatWebviewView?.webview.postMessage({ 
-                        type: 'appendResponse', 
-                        text: `\n**⚠️ Synthesis returned empty result**\n`
-                    });
-                    // Fallback: return raw findings
-                    finalResult = `## Synthesis returned empty - showing raw findings\n\n${combinedFindings.substring(0, 15000)}`;
-                }
-            } catch (synthError) {
-                log('answer_question: Synthesis error:', synthError.message);
-                chatWebviewView?.webview.postMessage({ 
-                    type: 'appendResponse', 
-                    text: `\n**⚠️ Synthesis error: ${synthError.message}**\n`
-                });
-                finalResult = `## Synthesis Error\n\n**Error:** ${synthError.message}\n\n### Raw Findings (first 15KB):\n${combinedFindings.substring(0, 15000)}`;
-            }
-            
-            // Validate answer if enabled
-            if (AGENT_CONFIG.enableJudge) {
-                log('answer_question: Running judge validation');
-                chatWebviewView?.webview.postMessage({ 
-                    type: 'appendResponse', 
-                    text: `\n*Validating response...*\n`
-                });
-                
                 try {
-                    // Give judge access to context files with reasonable limits
-                    let fullContext = '';
-                    let contextSize = 0;
-                    const MAX_JUDGE_CONTEXT = 50000;  // ~12K tokens
-                    const MAX_PER_FILE = 5000;  // 5KB per file max
+                    const chunkFindings = await callLanguageModel(chunkPrompt);
+                    findings.push({
+                        chunkIndex: index,
+                        score,
+                        content: chunkFindings,
+                        files: filesInChunk
+                    });
                     
-                    for (const [path, file] of contextFiles) {
-                        if (contextSize > MAX_JUDGE_CONTEXT) {
-                            fullContext += '\n... (remaining files omitted for token limit) ...\n';
-                            break;
-                        }
-                        const fileName = path.split('/').pop();
-                        const fileContent = file.content.substring(0, MAX_PER_FILE);
-                        fullContext += `### ${fileName}\n\`\`\`\n${fileContent}\n\`\`\`\n\n`;
-                        contextSize += fileContent.length;
-                    }
+                    // Extract function names mentioned
+                    const funcNames = chunkFindings.match(/`(\w+)\(\)`/g) || [];
+                    funcNames.forEach(f => allFunctionsFound.add(f.replace(/`|\(\)/g, '')));
                     
-                    const validatedResult = await validateAndRefineAnswer(question, finalResult, fullContext);
-                    return { success: true, data: { answer: validatedResult } };
-                } catch (judgeError) {
-                    log('answer_question: Judge error:', judgeError.message);
-                    // Return unvalidated result on error
-                    return { success: true, data: { answer: finalResult } };
+                } catch (err) {
+                    log('answer_question: Chunk', index, 'error:', err.message);
                 }
             }
             
-            return { success: true, data: { answer: finalResult } };
+            // Step 4: Collect files NOT processed (for "Related Topics" section)
+            const unprocessedChunks = scoredChunks
+                .filter(sc => !chunksToProcess.find(c => c.index === sc.index))
+                .slice(0, 10);
+            
+            const relatedFiles = new Set();
+            for (const sc of unprocessedChunks) {
+                sc.filesInChunk.forEach(f => {
+                    if (!allFilesFound.has(f)) {
+                        relatedFiles.add(f);
+                    }
+                });
+            }
+            
+            // Step 5: Synthesize with structured format
+            const synthesisContext = findings.map(f => f.content).join('\n\n---\n\n');
+            
+            const result = await synthesizeFindingsWithReferences(
+                question, 
+                synthesisContext, 
+                domain, 
+                domain_notes, 
+                subQuestions,
+                Array.from(allFilesFound),
+                Array.from(relatedFiles),
+                Array.from(allFunctionsFound)
+            );
+            
+            return result;
         }
     }
 };
 
 // Agent configuration
 const AGENT_CONFIG = {
-    enableJudge: true  // Enable judge LLM to validate answers
+    enableJudge: true,  // Enable judge LLM to validate answers
+    verboseSearch: true // Log detailed search hits for debugging
 };
 
 /**
@@ -9370,187 +13539,1153 @@ function extractTopic(text) {
 }
 
 /**
- * Split context into chunks, trying to keep code blocks intact
+ * Chunk context into manageable pieces, trying to break at natural boundaries
  */
-function splitContextIntoChunks(context, maxChunkSize) {
-    const chunks = [];
-    
-    // Try to split by code block headers (### filename)
-    const blocks = context.split(/(?=###\s)/);
-    
-    let currentChunk = '';
-    
-    for (const block of blocks) {
-        // If adding this block would exceed limit, save current chunk
-        if (currentChunk.length + block.length > maxChunkSize && currentChunk.length > 0) {
-            chunks.push(currentChunk);
-            currentChunk = '';
-        }
-        
-        // If single block is too large, split it
-        if (block.length > maxChunkSize) {
-            // Save any current chunk first
-            if (currentChunk.length > 0) {
-                chunks.push(currentChunk);
-                currentChunk = '';
-            }
-            
-            // Split large block by lines
-            const lines = block.split('\n');
-            let subChunk = '';
-            for (const line of lines) {
-                if (subChunk.length + line.length + 1 > maxChunkSize) {
-                    chunks.push(subChunk);
-                    subChunk = '';
-                }
-                subChunk += line + '\n';
-            }
-            if (subChunk.length > 0) {
-                currentChunk = subChunk;
-            }
-        } else {
-            currentChunk += block;
-        }
+function chunkContext(context, maxChunkSize = 18000) {
+    if (!context || context.length <= maxChunkSize) {
+        return [context];
     }
     
-    // Don't forget the last chunk
-    if (currentChunk.length > 0) {
-        chunks.push(currentChunk);
+    const chunks = [];
+    let remaining = context;
+    
+    while (remaining.length > 0) {
+        if (remaining.length <= maxChunkSize) {
+            chunks.push(remaining);
+            break;
+        }
+        
+        // Try to break at a natural boundary (file section, double newline)
+        let breakPoint = maxChunkSize;
+        
+        // Look for file section boundary (### filename)
+        const fileBoundary = remaining.lastIndexOf('\n### ', maxChunkSize);
+        if (fileBoundary > maxChunkSize * 0.5) {
+            breakPoint = fileBoundary;
+        } else {
+            // Look for double newline
+            const doubleLine = remaining.lastIndexOf('\n\n', maxChunkSize);
+            if (doubleLine > maxChunkSize * 0.5) {
+                breakPoint = doubleLine;
+            }
+        }
+        
+        chunks.push(remaining.substring(0, breakPoint));
+        remaining = remaining.substring(breakPoint).trim();
     }
     
     return chunks;
 }
 
 /**
+ * Validate extracted facts against the actual codeIndex
+ * Removes hallucinated functions/files that don't exist in the index
+ */
+function validateExtractedFacts(facts) {
+    if (!facts) return facts;
+    
+    // Helper: Check if a function exists in codeIndex
+    const functionExists = (funcName) => {
+        if (!funcName || funcName === 'unknown') return false;
+        // Clean the name (remove parentheses, etc.)
+        const cleanName = funcName.replace(/\(\)$/, '').replace(/\(.*\)$/, '').trim();
+        // Check both direct name and name@file pattern
+        for (const [key, symbol] of codeIndex.symbols) {
+            if (symbol.name === cleanName || 
+                symbol.name.toLowerCase() === cleanName.toLowerCase()) {
+                return true;
+            }
+        }
+        return false;
+    };
+    
+    // Helper: Check if a file exists in contextFiles or codeIndex
+    const fileExists = (fileName) => {
+        if (!fileName || fileName === 'unknown') return false;
+        // Clean the filename
+        const cleanFile = fileName.replace(/^📄\s*/, '').trim();
+        // Check contextFiles
+        for (const [path] of contextFiles) {
+            if (path.endsWith(cleanFile) || path.includes(cleanFile)) {
+                return true;
+            }
+        }
+        // Check codeIndex.files
+        for (const [path] of codeIndex.files) {
+            if (path.endsWith(cleanFile) || path.includes(cleanFile)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    
+    // Patterns that indicate hallucinated entry points
+    const hallucinated_patterns = [
+        /^main_\w+_function$/i,      // main_partitioning_function
+        /^main_\w+$/i,               // main_something
+        /^entry_\w+$/i,              // entry_something
+        /^\w+_main$/i,               // something_main
+        /^do_\w+$/i,                 // do_something (too generic)
+        /^handle_\w+$/i,             // handle_something (too generic unless confirmed)
+    ];
+    
+    const isLikelyHallucinated = (funcName) => {
+        if (!funcName) return true;
+        const cleanName = funcName.replace(/\(\)$/, '').trim();
+        return hallucinated_patterns.some(p => p.test(cleanName));
+    };
+    
+    // Validate entry_point
+    if (facts.entry_point) {
+        const entryFunc = facts.entry_point.function;
+        const entryFile = facts.entry_point.file;
+        
+        // Check if entry point looks hallucinated AND doesn't exist in index
+        if (isLikelyHallucinated(entryFunc) && !functionExists(entryFunc)) {
+            log(`validateExtractedFacts: Removing hallucinated entry_point "${entryFunc}" (not in index)`);
+            facts.entry_point = null;
+        }
+        // Also check if function exists at all
+        else if (entryFunc && entryFunc !== 'unknown' && !functionExists(entryFunc)) {
+            // Check if file at least exists
+            if (!fileExists(entryFile)) {
+                log(`validateExtractedFacts: Removing unverified entry_point "${entryFunc}" (neither function nor file in index)`);
+                facts.entry_point = null;
+            }
+        }
+    }
+    
+    // Validate key_functions - remove those that don't exist
+    if (facts.key_functions && Array.isArray(facts.key_functions)) {
+        const originalCount = facts.key_functions.length;
+        facts.key_functions = facts.key_functions.filter(fn => {
+            if (!fn.name) return false;
+            // Keep if function exists OR if file exists (file might have the function even if not indexed)
+            if (functionExists(fn.name)) return true;
+            if (fileExists(fn.file)) return true;
+            log(`validateExtractedFacts: Removing unverified function "${fn.name}" (not in index)`);
+            return false;
+        });
+        if (facts.key_functions.length < originalCount) {
+            log(`validateExtractedFacts: Filtered key_functions ${originalCount} -> ${facts.key_functions.length}`);
+        }
+    }
+    
+    // Validate code_flow - remove flows with non-existent functions
+    if (facts.code_flow && Array.isArray(facts.code_flow)) {
+        const originalCount = facts.code_flow.length;
+        facts.code_flow = facts.code_flow.filter(flow => {
+            // Keep if at least one of caller/callee exists or file exists
+            const callerExists = functionExists(flow.caller);
+            const calleeExists = functionExists(flow.callee);
+            const flowFileExists = fileExists(flow.file);
+            return callerExists || calleeExists || flowFileExists;
+        });
+        if (facts.code_flow.length < originalCount) {
+            log(`validateExtractedFacts: Filtered code_flow ${originalCount} -> ${facts.code_flow.length}`);
+        }
+    }
+    
+    // Validate key_files - files should exist
+    if (facts.key_files && Array.isArray(facts.key_files)) {
+        const originalCount = facts.key_files.length;
+        facts.key_files = facts.key_files.filter(f => {
+            if (!f.file) return false;
+            if (fileExists(f.file)) return true;
+            log(`validateExtractedFacts: Removing unverified file "${f.file}" (not in context)`);
+            return false;
+        });
+        if (facts.key_files.length < originalCount) {
+            log(`validateExtractedFacts: Filtered key_files ${originalCount} -> ${facts.key_files.length}`);
+        }
+    }
+    
+    return facts;
+}
+
+/**
+ * Find real entry points from call graph data for the given files/functions
+ * Entry points are functions that are called by others but don't call much themselves,
+ * OR functions that call others but aren't called by anything (public APIs)
+ */
+function findRealEntryPoints(keyFiles, keyFunctions) {
+    const entryPoints = [];
+    
+    if (!codeIndex.callGraph || codeIndex.callGraph.size === 0) {
+        return entryPoints;
+    }
+    
+    // Collect function names from key files and key functions
+    const relevantFunctions = new Set();
+    
+    // Add functions from keyFunctions
+    if (keyFunctions) {
+        keyFunctions.forEach(fn => {
+            if (fn.name) relevantFunctions.add(fn.name);
+        });
+    }
+    
+    // Add functions from keyFiles
+    if (keyFiles) {
+        keyFiles.forEach(kf => {
+            if (kf.functions) {
+                kf.functions.forEach(fn => relevantFunctions.add(fn));
+            }
+        });
+    }
+    
+    // Find entry points: functions not called by others (or called by few) that call others
+    for (const funcName of relevantFunctions) {
+        const callers = codeIndex.reverseCallGraph?.get(funcName)?.size || 0;
+        const callees = codeIndex.callGraph.get(funcName)?.size || 0;
+        
+        // Entry point criteria: calls others but isn't called much
+        if (callees > 0 && callers <= 2) {
+            // Find the function in symbols to get file/line
+            for (const [key, symbol] of codeIndex.symbols) {
+                if (symbol.name === funcName && key.includes('@')) {
+                    entryPoints.push({
+                        name: symbol.name,
+                        file: symbol.file?.split('/').pop() || 'unknown',
+                        line: symbol.line || 0,
+                        callees: callees,
+                        callers: callers
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Sort by: more callees (more important), fewer callers (more entry-like)
+    entryPoints.sort((a, b) => (b.callees - b.callers) - (a.callees - a.callers));
+    
+    // Return top 3 at most
+    return entryPoints.slice(0, 3);
+}
+
+/**
+ * Try to extract partial facts from a malformed LLM response
+ * Uses regex patterns to salvage useful data even when JSON parsing fails
+ */
+function tryExtractPartialFacts(response, subQuestions, filesAnalyzed) {
+    const facts = {
+        summary: "Analysis completed - see details below",
+        entry_point: null,  // Don't fabricate an entry point
+        answers: [],
+        key_files: [],
+        code_flow: [],
+        data_structures: [],
+        key_functions: [],
+        config_options: [],
+        notes: []
+    };
+    
+    try {
+        // Try to extract summary
+        const summaryMatch = response.match(/"summary"\s*:\s*"([^"]+)"/);
+        if (summaryMatch) {
+            facts.summary = summaryMatch[1];
+        }
+        
+        // Try to extract entry point
+        const entryMatch = response.match(/"entry_point"\s*:\s*\{[^}]*"function"\s*:\s*"([^"]+)"[^}]*"file"\s*:\s*"([^"]+)"[^}]*"line"\s*:\s*(\d+)/);
+        if (entryMatch) {
+            facts.entry_point = { 
+                function: entryMatch[1], 
+                file: cleanFileName(entryMatch[2]),  // Clean file name!
+                line: parseInt(entryMatch[3]) 
+            };
+        }
+        
+        // Try to extract key_files array
+        const keyFilesMatch = response.match(/"key_files"\s*:\s*\[([\s\S]*?)\]/);
+        if (keyFilesMatch) {
+            const fileMatches = keyFilesMatch[1].matchAll(/"file"\s*:\s*"([^"]+)"/g);
+            for (const match of fileMatches) {
+                const cleanedFile = cleanFileName(match[1]);  // Clean file name!
+                if (!facts.key_files.find(f => f.file === cleanedFile)) {
+                    facts.key_files.push({ file: cleanedFile, purpose: "See analysis", functions: [] });
+                }
+            }
+        }
+        
+        // Try to extract key_functions array
+        const keyFuncsMatch = response.match(/"key_functions"\s*:\s*\[([\s\S]*?)\]/);
+        if (keyFuncsMatch) {
+            const funcMatches = keyFuncsMatch[1].matchAll(/"name"\s*:\s*"([^"]+)"[^}]*"file"\s*:\s*"([^"]+)"[^}]*"line"\s*:\s*(\d+)/g);
+            for (const match of funcMatches) {
+                facts.key_functions.push({ 
+                    name: match[1], 
+                    file: cleanFileName(match[2]),  // Clean file name!
+                    line: parseInt(match[3]),
+                    purpose: "See analysis"
+                });
+            }
+        }
+        
+        // If we couldn't extract key_files, use filesAnalyzed as fallback
+        if (facts.key_files.length === 0 && filesAnalyzed.length > 0) {
+            // Clean and dedupe file names
+            const seenFiles = new Set();
+            for (const f of filesAnalyzed.slice(0, 10)) {
+                const clean = cleanFileName(f);
+                if (!seenFiles.has(clean)) {
+                    seenFiles.add(clean);
+                    facts.key_files.push({ file: clean, purpose: "Contains relevant code", functions: [] });
+                }
+            }
+        }
+        
+        // Generate answers from subQuestions
+        facts.answers = subQuestions.map(sq => ({ 
+            question: sq, 
+            answer: "See analysis below for details", 
+            references: [] 
+        }));
+        
+        // Add note about partial extraction
+        if (facts.key_files.length > 0 || facts.key_functions.length > 0) {
+            facts.notes.push("Partial data extracted from response");
+        } else {
+            facts.notes.push("Could not extract structured data - showing analyzed files");
+        }
+        
+    } catch (err) {
+        log('tryExtractPartialFacts: Error:', err.message);
+        facts.notes.push("Fallback extraction failed");
+    }
+    
+    return facts;
+}
+
+/**
+ * Synthesize findings from multiple chunks into final answer
+ */
+async function synthesizeFindings(question, findingsContext, domain, domain_notes, subQuestions) {
+    return await synthesizeFindingsWithReferences(question, findingsContext, domain, domain_notes, subQuestions, [], [], []);
+}
+
+/**
+ * Synthesize findings with related topics and references
+ * Uses TWO-STAGE generation:
+ *   Stage 1: Extract structured facts (JSON)
+ *   Stage 2: Format facts into template (deterministic)
+ */
+async function synthesizeFindingsWithReferences(question, findingsContext, domain, domain_notes, subQuestions, filesAnalyzed, relatedFiles, functionsFound) {
+    
+    // Truncate findings early to prevent prompt overflow
+    // API limit is ~25K chars, leave room for JSON template (~5K)
+    const maxFindingsSize = 18000;
+    let truncatedFindings = findingsContext;
+    if (findingsContext && findingsContext.length > maxFindingsSize) {
+        truncatedFindings = findingsContext.substring(0, maxFindingsSize) + 
+            '\n\n[... truncated for processing ...]';
+        log(`synthesizeFindingsWithReferences: Truncated findings from ${findingsContext.length} to ${maxFindingsSize}`);
+    }
+    
+    // ================================================================
+    // STAGE 1: EXTRACT STRUCTURED FACTS
+    // ================================================================
+    const extractionPrompt = `# FINDINGS FROM CODE ANALYSIS
+${truncatedFindings}
+
+# ORIGINAL QUESTION
+${question}
+
+# SUB-QUESTIONS
+${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}
+
+# TASK
+Extract structured facts from the findings above. Output ONLY valid JSON with this exact structure:
+
+{
+  "summary": "2-3 sentences describing what this code does and its main purpose",
+  "entry_point": {
+    "function": "actual_function_name_from_findings",
+    "file": "filename.c",
+    "line": 123
+  },
+  "answers": [
+    {
+      "question": "The sub-question text",
+      "answer": "Detailed answer (2-4 sentences) with specific function names, patterns, and code references",
+      "references": ["file.c:123", "other.c:456"]
+    }
+  ],
+  "key_files": [
+    {
+      "file": "filename.c",
+      "purpose": "Detailed purpose (1-2 sentences) explaining what this file does",
+      "functions": ["func1", "func2", "func3"]
+    }
+  ],
+  "code_flow": [
+    {
+      "caller": "entry_function",
+      "callee": "called_function", 
+      "file": "file.c",
+      "line": 100,
+      "purpose": "Why this call happens"
+    }
+  ],
+  "data_structures": [
+    {
+      "name": "StructName",
+      "file": "header.h",
+      "line": 50,
+      "purpose": "What data it holds"
+    }
+  ],
+  "key_functions": [
+    {
+      "name": "function_name",
+      "file": "file.c",
+      "line": 200,
+      "purpose": "What it does"
+    }
+  ],
+  "config_options": [
+    {
+      "param": "parameter_name",
+      "values": ["value1", "value2"],
+      "effect": "What it controls"
+    }
+  ],
+  "notes": [
+    "Any limitations or areas needing more investigation"
+  ]
+}
+
+CRITICAL RULES:
+1. Output ONLY valid JSON - no markdown, no explanation, no text before or after the JSON
+2. Start your response with { and end with }
+3. Extract ACTUAL data from the findings - DO NOT invent or hallucinate function names, line numbers, or file names
+4. NEVER fabricate an "entry_point" - only include it if the findings clearly identify a main entry function. If unsure, set entry_point to null
+5. Include at least 3-5 items in key_files, key_functions, and code_flow - but ONLY from data actually present in the findings
+6. For key_files: PRIORITIZE files whose names contain the query topic (e.g., for "partitioning", include partdesc.c, partbounds.c, partprune.c BEFORE generic files)
+7. For key_files: Include BOTH implementation files (.c/.cpp/.java) AND header files (.h/.hpp) when relevant
+8. If a field has no data, use empty array [] or null for entry_point
+9. Do NOT wrap JSON in \`\`\` code fences
+10. For architectural questions about "how X is implemented", there may be MULTIPLE entry points or NO single entry point - this is normal. Don't invent a "main_X_function()" that doesn't exist.
+
+BEGIN JSON OUTPUT:`;
+
+    try {
+        log('synthesizeFindingsWithReferences: Stage 1 - Extracting structured facts');
+        
+        // VERBOSE: Show code path
+        if (AGENT_CONFIG.verboseSearch) {
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n**🔧 Debug: Using synthesizeFindingsWithReferences (findings ${Math.round(findingsContext.length/1024)}KB)**\n\n`
+            });
+        }
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n*Stage 1: Extracting structured facts...*\n`
+        });
+        
+        // extractionPrompt already built with truncated findings (truncation done at start)
+        const extractionResult = await callLanguageModel(extractionPrompt);
+        
+        // Check if LLM is unavailable
+        if (isLlmErrorResponse(extractionResult)) {
+            log('synthesizeFindingsWithReferences: LLM unavailable');
+            return {
+                success: false,
+                data: {
+                    answer: `**Unable to analyze code**
+
+The LLM is currently unavailable. Please check your GitHub Copilot or API configuration.
+
+Check the Output panel (View → Output → AstraCode) for details.`
+                }
+            };
+        }
+        
+        // VERBOSE: Show what LLM returned
+        if (AGENT_CONFIG.verboseSearch) {
+            const preview = extractionResult?.substring(0, 500).replace(/\n/g, '\\n') || 'null';
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n**🔧 Debug: LLM returned (first 500 chars):**\n\`\`\`\n${preview}\n\`\`\`\n\n`
+            });
+        }
+        
+        // Parse JSON from response
+        let facts;
+        let jsonParsed = false;
+        try {
+            // Clean up response - remove markdown code fences if present
+            let jsonStr = extractionResult.trim();
+            if (jsonStr.startsWith('```')) {
+                jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+            }
+            // Also try to find JSON object in the response
+            const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                jsonStr = jsonMatch[0];
+            }
+            facts = JSON.parse(jsonStr);
+            jsonParsed = true;
+            log('synthesizeFindingsWithReferences: Successfully parsed facts JSON');
+        } catch (parseErr) {
+            log('synthesizeFindingsWithReferences: JSON parse error:', parseErr.message);
+            log('synthesizeFindingsWithReferences: Raw response:', extractionResult.substring(0, 500));
+            
+            // VERBOSE: Show parse error
+            if (AGENT_CONFIG.verboseSearch) {
+                const lastPart = extractionResult?.substring(extractionResult.length - 300).replace(/\n/g, '\\n') || '';
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n**⚠️ JSON Parse Error:** ${parseErr.message}\n**Last 300 chars of response:**\n\`\`\`\n${lastPart}\n\`\`\`\n**Attempting partial extraction...**\n\n`
+                });
+            }
+            
+            // Try to extract partial data from malformed response
+            facts = tryExtractPartialFacts(extractionResult, subQuestions, filesAnalyzed);
+        }
+        
+        // VERBOSE: Show parsed facts summary
+        if (AGENT_CONFIG.verboseSearch) {
+            const factsSummary = `**📊 Extracted Facts (JSON parsed: ${jsonParsed}):**
+- Summary: ${facts.summary?.substring(0, 50) || 'none'}...
+- Entry point: \`${facts.entry_point?.function || 'none'}()\`
+- Key files: ${facts.key_files?.length || 0}
+- Code flow: ${facts.code_flow?.length || 0} relationships
+- Data structures: ${facts.data_structures?.length || 0}
+- Key functions: ${facts.key_functions?.length || 0}
+- Config options: ${facts.config_options?.length || 0}
+`;
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: factsSummary + '\n---\n\n'
+            });
+        }
+        
+        // ================================================================
+        // VALIDATION: Verify extracted functions exist in codeIndex
+        // ================================================================
+        facts = validateExtractedFacts(facts);
+        
+        // ================================================================
+        // DECISION: Use template OR raw response?
+        // ================================================================
+        // If JSON parsing failed and we didn't extract much useful data,
+        // the raw LLM response might be better than an empty template
+        const hasUsefulStructuredData = jsonParsed || 
+            (facts.key_functions?.length >= 2) ||
+            (facts.key_files?.length >= 3 && facts.code_flow?.length >= 1);
+        
+        if (!hasUsefulStructuredData && extractionResult && extractionResult.length > 500) {
+            // LLM returned substantial content but we couldn't parse it as JSON
+            // Check if it looks like prose/markdown rather than JSON
+            const looksLikeProse = !extractionResult.trim().startsWith('{') || 
+                                   extractionResult.includes('##') ||
+                                   extractionResult.includes('**');
+            
+            if (looksLikeProse) {
+                log('synthesizeFindingsWithReferences: Falling back to raw LLM response (better than empty template)');
+                
+                if (AGENT_CONFIG.verboseSearch) {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `**📝 Using raw LLM response (structured extraction insufficient)**\n\n---\n\n`
+                    });
+                }
+                
+                // Return the raw response - it's probably better than an empty template
+                return { success: true, data: { answer: extractionResult } };
+            }
+        }
+        
+        // ================================================================
+        // STAGE 2: FORMAT INTO TEMPLATE (Deterministic)
+        // ================================================================
+        log('synthesizeFindingsWithReferences: Stage 2 - Formatting into template');
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `*Stage 2: Formatting structured response...*\n\n`
+        });
+        
+        const formatted = formatFactsToTemplate(facts, subQuestions, relatedFiles, functionsFound, findingsContext, question);
+        
+        return { success: true, data: { answer: formatted } };
+        
+    } catch (err) {
+        log('synthesizeFindingsWithReferences: Error:', err.message);
+        return {
+            success: true,
+            data: { answer: `## Synthesis Error\n\n**Error:** ${err.message}\n\n### Raw Findings:\n${findingsContext.substring(0, 15000)}` }
+        };
+    }
+}
+
+/**
+ * Clean file name: remove emojis, path prefixes, backticks
+ * Handles LLM output that includes emojis like "📄 partdesc.c"
+ */
+function cleanFileName(fileName) {
+    if (!fileName) return 'unknown';
+    let cleaned = fileName;
+    
+    // Remove specific emoji characters used in formatting
+    // DO NOT use \p{Emoji} as it strips digits (1,2,3 etc are classified as emoji components)
+    cleaned = cleaned
+        .replace(/📄/g, '')
+        .replace(/📁/g, '')
+        .replace(/🔧/g, '')
+        .replace(/⭐/g, '')
+        .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')  // Miscellaneous symbols/pictographs
+        .replace(/[\u{2600}-\u{26FF}]/gu, '')    // Misc symbols  
+        .replace(/[\u{2700}-\u{27BF}]/gu, '');   // Dingbats
+    
+    // Remove other formatting
+    cleaned = cleaned
+        .replace(/^[\s*\-•]+/, '')            // Leading whitespace, bullets
+        .replace(/^.*\//, '')                  // Path prefixes
+        .replace(/`/g, '')                     // Backticks
+        .replace(/^\s+|\s+$/g, '');            // Trim
+    
+    return cleaned || 'unknown';
+}
+
+/**
+ * Format extracted facts into the standard template
+ * This is deterministic - always produces correct format
+ * @param {string} originalQuery - Original query for determining which sections to show
+ */
+function formatFactsToTemplate(facts, subQuestions, relatedFiles, functionsFound, rawFindings, originalQuery = '') {
+    let output = '';
+    
+    // Determine if this is a "trace/explain" type query that benefits from call graph
+    const queryLower = originalQuery.toLowerCase();
+    const showCallGraph = queryLower.includes('explain') || 
+                          queryLower.includes('how') ||
+                          queryLower.includes('trace') ||
+                          queryLower.includes('implement') ||
+                          queryLower.includes('call') ||
+                          queryLower.includes('flow') ||
+                          queryLower.includes('where') ||
+                          subQuestions.some(sq => /explain|how|trace|implement|call|flow/i.test(sq));
+    
+    // === Direct Answers ===
+    output += `## 💬 Direct Answers\n\n`;
+    if (facts.answers && facts.answers.length > 0) {
+        facts.answers.forEach((ans, idx) => {
+            const refs = ans.references?.length > 0 ? ` (${ans.references.join(', ')})` : '';
+            output += `**Q${idx + 1}: ${ans.question || subQuestions[idx] || 'Question ' + (idx + 1)}**\n`;
+            output += `> ${ans.answer}${refs}\n\n`;
+        });
+    } else {
+        subQuestions.forEach((sq, idx) => {
+            output += `**Q${idx + 1}: ${sq}**\n`;
+            output += `> See analysis below for details.\n\n`;
+        });
+    }
+    
+    output += `---\n\n`;
+    
+    // === Quick Summary ===
+    output += `## 🚀 Quick Summary\n\n`;
+    output += `> ${facts.summary || 'This code implements the requested functionality.'}\n>\n`;
+    
+    // Check for valid entry point (not placeholder, unknown, or null after validation)
+    const entryFn = facts.entry_point?.function || '';
+    const isValidEntryPoint = facts.entry_point && entryFn && 
+        entryFn !== 'unknown' && 
+        entryFn !== 'main_function_name' &&  // JSON template placeholder
+        entryFn !== 'entry_function' &&      // JSON template placeholder
+        entryFn !== 'actual_function_name_from_findings' &&  // JSON template placeholder
+        !entryFn.includes('unknown');
+    
+    if (isValidEntryPoint) {
+        const entryFile = cleanFileName(facts.entry_point.file);
+        output += `> **Entry Point:** \`${entryFn}()\` in \`${entryFile}:${facts.entry_point.line}\`\n\n`;
+    } else {
+        // Try to find real entry points from call graph for the key files
+        const realEntryPoints = findRealEntryPoints(facts.key_files, facts.key_functions);
+        
+        if (realEntryPoints.length === 1) {
+            const ep = realEntryPoints[0];
+            output += `> **Entry Point:** \`${ep.name}()\` in \`${ep.file}:${ep.line}\`\n\n`;
+        } else if (realEntryPoints.length > 1) {
+            output += `> **Entry Points:** Multiple functions serve as entry points - see Key Functions below\n\n`;
+        } else if (facts.key_functions && facts.key_functions.length > 0) {
+            // Fall back to first key function
+            const firstFn = facts.key_functions[0];
+            const firstFile = cleanFileName(firstFn.file);
+            output += `> **Primary Function:** \`${firstFn.name}()\` in \`${firstFile}:${firstFn.line}\`\n\n`;
+        } else {
+            output += `> **Entry Point:** See Key Functions below\n\n`;
+        }
+    }
+    
+    output += `---\n\n`;
+    
+    // === Key Files ===
+    output += `## 📁 Key Files\n\n`;
+    output += `| File | Purpose | Key Functions |\n`;
+    output += `|:-----|:--------|:--------------|\n`;
+    if (facts.key_files && facts.key_files.length > 0) {
+        facts.key_files.slice(0, 10).forEach(f => {
+            const funcs = f.functions?.slice(0, 4).map(fn => `\`${fn}()\``).join(', ') || '-';
+            const rawFile = f.file || 'unknown';
+            const file = cleanFileName(rawFile);
+            // Debug: log if there's a mismatch suggesting emoji wasn't removed
+            if (rawFile !== file && rawFile.length > file.length + 2) {
+                log(`cleanFileName: "${rawFile}" -> "${file}"`);
+            }
+            // Add emoji prefix after cleaning to ensure consistent display
+            output += `| 📄 \`${file}\` | ${f.purpose || '-'} | ${funcs} |\n`;
+        });
+    } else {
+        output += `| - | No files identified | - |\n`;
+    }
+    
+    output += `\n---\n\n`;
+    
+    // === Code Flow ===
+    output += `## 🔄 Code Flow\n\n`;
+    output += `\`\`\`\n`;
+    if (facts.code_flow && facts.code_flow.length > 0) {
+        // Build tree structure from call relationships
+        const firstCall = facts.code_flow[0];
+        const firstFile = cleanFileName(firstCall.file);
+        output += `1. ${firstCall.caller}()   [${firstFile}:${firstCall.line}]   → ${firstCall.purpose || 'Entry point'}\n`;
+        output += `   │\n`;
+        
+        facts.code_flow.slice(0, 6).forEach((call, idx) => {
+            if (idx === 0) return; // Skip first (already shown)
+            const isLast = idx === Math.min(facts.code_flow.length - 1, 5);
+            const prefix = isLast ? '└─►' : '├─►';
+            const callFile = cleanFileName(call.file);
+            output += `   ${prefix} ${call.callee || call.caller}()   [${callFile}:${call.line}]   → ${call.purpose || 'Processing'}\n`;
+            if (!isLast) output += `   │\n`;
+        });
+    } else {
+        output += `1. [Entry function not identified]\n`;
+        output += `   │\n`;
+        output += `   └─► [See Key Functions below]\n`;
+    }
+    output += `\`\`\`\n\n`;
+    
+    output += `---\n\n`;
+    
+    // === Data Structures ===
+    output += `## 📦 Data Structures\n\n`;
+    output += `| Structure | Location | Purpose |\n`;
+    output += `|:----------|:---------|:--------|\n`;
+    if (facts.data_structures && facts.data_structures.length > 0) {
+        facts.data_structures.slice(0, 8).forEach(ds => {
+            const dsFile = cleanFileName(ds.file);
+            output += `| \`${ds.name}\` | \`${dsFile}:${ds.line}\` | ${ds.purpose || '-'} |\n`;
+        });
+    } else {
+        output += `| - | No structures identified | See code analysis |\n`;
+    }
+    
+    output += `\n---\n\n`;
+    
+    // === Key Functions ===
+    output += `## 🔍 Key Functions\n\n`;
+    output += `| Function | Location | Purpose |\n`;
+    output += `|:---------|:---------|:--------|\n`;
+    if (facts.key_functions && facts.key_functions.length > 0) {
+        facts.key_functions.slice(0, 10).forEach(fn => {
+            const fnFile = cleanFileName(fn.file);
+            output += `| \`${fn.name}()\` | \`${fnFile}:${fn.line}\` | ${fn.purpose || '-'} |\n`;
+        });
+    } else {
+        output += `| - | No functions identified | See code analysis |\n`;
+    }
+    
+    output += `\n---\n\n`;
+    
+    // === Call Graph (from index, not LLM) ===
+    // Only show for explain/trace type queries when we have data
+    if (showCallGraph && facts.key_functions && facts.key_functions.length > 0 && codeIndex.symbols.size > 0) {
+        const callGraphData = [];
+        
+        // Trace top 3 key functions
+        for (const fn of facts.key_functions.slice(0, 3)) {
+            const fnName = fn.name?.replace(/\(\)$/, ''); // Remove trailing ()
+            if (!fnName) continue;
+            
+            const trace = traceSymbol(fnName);
+            if (trace.callers.length > 0 || trace.callees.length > 0) {
+                callGraphData.push({
+                    name: fnName,
+                    file: cleanFileName(fn.file),
+                    line: fn.line,
+                    callers: trace.callers.slice(0, 5).map(c => ({
+                        name: c.name,
+                        file: cleanFileName(c.file),
+                        line: c.line
+                    })),
+                    callees: trace.callees.slice(0, 5).map(c => ({
+                        name: c.name,
+                        file: cleanFileName(c.file),
+                        line: c.line
+                    }))
+                });
+            }
+        }
+        
+        if (callGraphData.length > 0) {
+            output += `## 📞 Call Graph\n\n`;
+            output += `*Showing callers (who invokes) and callees (what it calls) for key functions:*\n\n`;
+            
+            for (const fn of callGraphData) {
+                output += `**\`${fn.name}()\`** in \`${fn.file}:${fn.line}\`\n`;
+                
+                if (fn.callers.length > 0) {
+                    output += `├── **Called by:** `;
+                    output += fn.callers.map(c => `\`${c.name}()\``).join(', ');
+                    output += `\n`;
+                }
+                
+                if (fn.callees.length > 0) {
+                    const prefix = fn.callers.length > 0 ? '└──' : '├──';
+                    output += `${prefix} **Calls:** `;
+                    output += fn.callees.map(c => `\`${c.name}()\``).join(', ');
+                    output += `\n`;
+                }
+                
+                if (fn.callers.length === 0 && fn.callees.length === 0) {
+                    output += `└── *No call relationships found in index*\n`;
+                }
+                
+                output += `\n`;
+            }
+            
+            output += `---\n\n`;
+        }
+    }
+    
+    // === Configurability ===
+    output += `## 🔧 Configurability\n\n`;
+    if (facts.config_options && facts.config_options.length > 0) {
+        output += `| Parameter | Values | Effect |\n`;
+        output += `|:----------|:-------|:-------|\n`;
+        facts.config_options.slice(0, 6).forEach(opt => {
+            const values = Array.isArray(opt.values) ? opt.values.join(', ') : opt.values || '-';
+            output += `| \`${opt.param}\` | ${values} | ${opt.effect || '-'} |\n`;
+        });
+    } else {
+        output += `No configurable parameters identified in the analyzed code.\n`;
+    }
+    
+    output += `\n---\n\n`;
+    
+    // === Where to Start ===
+    output += `## 🎯 Where to Start\n\n`;
+    output += `**To understand this feature:**\n`;
+    if (facts.key_files && facts.key_files.length > 0) {
+        const file1 = cleanFileName(facts.key_files[0].file);
+        output += `1. Start with 📄 \`${file1}\` - ${facts.key_files[0].purpose || 'Main implementation'}\n`;
+        if (facts.key_files.length > 1) {
+            const file2 = cleanFileName(facts.key_files[1].file);
+            output += `2. Then read 📄 \`${file2}\` - ${facts.key_files[1].purpose || 'Supporting code'}\n`;
+        }
+    } else {
+        output += `1. Review the key functions listed above\n`;
+    }
+    
+    // Use valid entry point or first key function for debug tip
+    const debugFn = isValidEntryPoint ? facts.entry_point.function : 
+        (facts.key_functions?.[0]?.name || null);
+    if (debugFn) {
+        output += `3. Debug tip: Set breakpoint in \`${debugFn}()\`\n`;
+    }
+    output += `\n`;
+    
+    output += `**To modify this feature:**\n`;
+    if (facts.key_functions && facts.key_functions.length > 0) {
+        const mainFn = facts.key_functions[0];
+        const mainFile = cleanFileName(mainFn.file);
+        output += `- Change core behavior → Edit \`${mainFn.name}()\` in 📄 \`${mainFile}\`\n`;
+    }
+    if (facts.config_options && facts.config_options.length > 0) {
+        output += `- Add new option → Follow pattern of \`${facts.config_options[0].param}\`\n`;
+    }
+    
+    output += `\n---\n\n`;
+    
+    // === Related Topics ===
+    output += `## 📚 Related Topics (For Further Exploration)\n\n`;
+    
+    if (relatedFiles && relatedFiles.length > 0) {
+        output += `**Related Files Not Fully Analyzed:**\n`;
+        relatedFiles.slice(0, 8).forEach(f => {
+            const file = cleanFileName(f);
+            output += `- 📄 \`${file}\` - May contain additional implementation details\n`;
+        });
+        output += `\n`;
+    }
+    
+    if (functionsFound && functionsFound.length > 0) {
+        output += `**Related Functions to Explore:**\n`;
+        output += functionsFound.slice(0, 10).map(f => `\`${f}()\``).join(', ') + `\n\n`;
+    }
+    
+    output += `**Suggested Next Questions:**\n`;
+    if (facts.key_functions && facts.key_functions.length > 0) {
+        output += `- "How does \`${facts.key_functions[0].name}()\` work in detail?"\n`;
+    }
+    // Use valid entry point or first key function for suggested question
+    const suggestFn = isValidEntryPoint ? facts.entry_point.function : 
+        (facts.key_functions?.[0]?.name || null);
+    if (suggestFn) {
+        output += `- "What calls \`${suggestFn}()\`?"\n`;
+    }
+    output += `- "Show me the data flow for this operation"\n`;
+    output += `- "Find potential bugs in this code"\n`;
+    
+    output += `\n---\n\n`;
+    
+    // === Notes ===
+    output += `## ⚠️ Notes\n\n`;
+    if (facts.notes && facts.notes.length > 0) {
+        facts.notes.forEach(note => {
+            output += `- ${note}\n`;
+        });
+    } else {
+        output += `- Analysis based on provided code context\n`;
+        output += `- Some implementation details may require deeper investigation\n`;
+    }
+    
+    // === Detailed Technical Analysis ===
+    // Include the raw analysis for developers who want the full details
+    if (rawFindings && rawFindings.length > 500) {
+        output += `\n---\n\n`;
+        output += `## 📝 Detailed Technical Analysis\n\n`;
+        output += `<details>\n<summary>Click to expand full analysis (${Math.round(rawFindings.length / 1000)}KB)</summary>\n\n`;
+        
+        // Truncate if very large, but keep substantial detail
+        const maxDetailLength = 15000;
+        if (rawFindings.length > maxDetailLength) {
+            output += rawFindings.substring(0, maxDetailLength);
+            output += `\n\n*[Analysis truncated - ${Math.round((rawFindings.length - maxDetailLength) / 1000)}KB omitted]*\n`;
+        } else {
+            output += rawFindings;
+        }
+        
+        output += `\n</details>\n`;
+    }
+    
+    return output;
+}
+
+
+/**
  * Process answer directly (when context fits in single call)
+ * Uses TWO-STAGE generation for consistent formatting
  */
 async function processAnswerDirect(question, context, domain, domain_notes) {
     // Decompose question into sub-questions
     const subQuestions = decomposeQuestion(question);
     log('processAnswerDirect: Sub-questions:', subQuestions);
     
-    let prompt = '';
+    // VERBOSE: Show which code path we're in
+    if (AGENT_CONFIG.verboseSearch) {
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n**🔧 Debug: Using processAnswerDirect (context ${Math.round((context?.length || 0)/1024)}KB)**\n\n`
+        });
+    }
+    
+    // ================================================================
+    // STAGE 1: EXTRACT STRUCTURED FACTS
+    // ================================================================
+    let extractionPrompt = '';
     
     if (domain || domain_notes) {
-        prompt += `# Domain: ${domain || 'Code Analysis'}\n`;
-        if (domain_notes) prompt += `Notes: ${domain_notes}\n`;
-        prompt += '\n';
+        extractionPrompt += `# Domain: ${domain || 'Code Analysis'}\n`;
+        if (domain_notes) extractionPrompt += `Notes: ${domain_notes}\n`;
+        extractionPrompt += '\n';
     }
     
-    if (context) {
-        prompt += `# SOURCE CODE\n${context}\n\n`;
+    // Truncate context if needed (API limit ~25K chars)
+    const MAX_CONTEXT = 12000;
+    let truncatedContext = context;
+    if (context && context.length > MAX_CONTEXT) {
+        log(`processAnswerDirect: Truncating context from ${context.length} to ${MAX_CONTEXT}`);
+        truncatedContext = context.substring(0, MAX_CONTEXT) + '\n\n[... truncated ...]';
     }
     
-    prompt += `# ORIGINAL QUESTION\n${question}\n\n`;
+    if (truncatedContext) {
+        extractionPrompt += `# SOURCE CODE\n${truncatedContext}\n\n`;
+    }
     
-    prompt += `# SUB-QUESTIONS TO ANSWER\n${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}\n\n`;
+    extractionPrompt += `# ORIGINAL QUESTION\n${question}\n\n`;
+    extractionPrompt += `# SUB-QUESTIONS\n${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}\n\n`;
     
-    // Developer orientation format with better visual structure
-    prompt += `# TASK
-Create a DEVELOPER ORIENTATION GUIDE that DIRECTLY ANSWERS each sub-question.
+    extractionPrompt += `# TASK
+Extract structured facts from the code above. Output ONLY valid JSON with this exact structure:
 
-# CRITICAL RULES
-1. **Answer each sub-question explicitly** in the Direct Answers section
-2. **Code flow direction**: Show who CALLS whom (caller → callee)
-3. **Entry points**: Functions that USERS call (public API), not internal helpers
-4. **If asked "is X configurable?"**: Answer YES/NO with specific parameters and examples
-5. **Request vs Response**: If discussing encoding, distinguish between:
-   - REQUEST encoding: How data is formatted before SENDING
-   - RESPONSE encoding: How data is parsed after RECEIVING
+{
+  "summary": "2-3 sentences describing what this code does and its main purpose",
+  "entry_point": {
+    "function": "main_function_name",
+    "file": "filename.c",
+    "line": 123
+  },
+  "answers": [
+    {
+      "question": "The sub-question text",
+      "answer": "Detailed answer (2-4 sentences) with specific function names, patterns, and code references",
+      "references": ["file.c:123", "other.c:456"]
+    }
+  ],
+  "key_files": [
+    {
+      "file": "filename.c",
+      "purpose": "Detailed purpose (1-2 sentences) explaining what this file does",
+      "functions": ["func1", "func2", "func3"]
+    }
+  ],
+  "code_flow": [
+    {
+      "caller": "entry_function",
+      "callee": "called_function", 
+      "file": "file.c",
+      "line": 100,
+      "purpose": "Why this call happens"
+    }
+  ],
+  "data_structures": [
+    {
+      "name": "StructName",
+      "file": "header.h",
+      "line": 50,
+      "purpose": "What data it holds"
+    }
+  ],
+  "key_functions": [
+    {
+      "name": "function_name",
+      "file": "file.c",
+      "line": 200,
+      "purpose": "What it does"
+    }
+  ],
+  "config_options": [
+    {
+      "param": "parameter_name",
+      "values": ["value1", "value2"],
+      "effect": "What it controls"
+    }
+  ],
+  "notes": [
+    "Any limitations or areas needing more investigation"
+  ]
+}
 
-# FORMAT REQUIREMENTS
-- Use the EXACT section headers shown below (with emojis)
-- Keep descriptions concise (1-2 sentences max per item)
-- Always use \`code formatting\` for function names, files, and structs
-- Include file:line references for everything
+CRITICAL RULES:
+1. Output ONLY valid JSON - no markdown, no explanation, no text before or after the JSON
+2. Start your response with { and end with }
+3. Extract ACTUAL data from the code - use real line numbers from the context
+4. Include at least 3-5 items in key_files, key_functions, and code_flow
+5. For key_files: PRIORITIZE files whose names contain the query topic (e.g., for "partitioning", include partdesc.c, partbounds.c, partprune.c BEFORE generic files)
+6. For key_files: Include BOTH implementation files (.c/.cpp/.java) AND header files (.h/.hpp) when relevant
+7. If a field has no data, use empty array []
+8. Do NOT wrap JSON in \`\`\` code fences
 
-# TEMPLATE:
-
-## 💬 Direct Answers
-
-${subQuestions.map((sq, idx) => `**Q${idx + 1}: ${sq}**
-> [Direct answer with code references]
-`).join('\n')}
-
----
-
-## 🚀 Quick Summary
-> **One sentence** describing what this code does and where to start.
-> 
-> **Entry Point:** \`function_name()\` in \`file.c:line\`
-
----
-
-## 📁 Key Files
-
-| File | Purpose | Key Functions |
-|:-----|:--------|:--------------|
-| \`file.c\` | Brief description | \`func1()\`, \`func2()\` |
-
----
-
-## 🔄 Code Flow
-
-Show actual call direction: CALLER → CALLEE
-
-\`\`\`
-1. user_calls_this()   [api.py:100]      → PUBLIC entry point
-   │
-   ├─► internal_func() [impl.py:200]     → Does the actual work
-   │   │
-   │   └─► helper()    [utils.py:50]     → Helper function
-\`\`\`
-
----
-
-## 📦 Data Structures
-
-| Structure | Location | Purpose |
-|:----------|:---------|:--------|
-| \`StructName\` | \`file.h:line\` | What it stores |
-
----
-
-## 🔍 Key Functions
-
-| Function | Location | Purpose |
-|:---------|:---------|:--------|
-| \`func_name()\` | \`file.c:line\` | What it does |
-
----
-
-## 🔧 Configurability (if applicable)
-
-| Parameter/Option | Values | Effect |
-|:-----------------|:-------|:-------|
-| \`param_name\` | value1, value2 | What it controls |
-
----
-
-## 🎯 Where to Start (Developer Onboarding)
-
-**If you want to understand this feature:**
-1. **First, read** \`main_file.c\` - Start here to see the entry point
-2. **Then explore** \`core_file.c\` - This is where the main logic lives
-3. **Debug tip:** Set a breakpoint in \`key_function()\` and trace the flow
-
-**If you want to modify this feature:**
-- To change behavior X → Edit \`file.c:function()\`
-- To add a new option → Look at how \`existing_option\` is handled in \`config.c\`
-
-**Key insight:** [One sentence explaining the most important thing a new developer should know]
-
----
-
-## ⚠️ Notes
-- Any gaps in the provided code
-- Areas needing more investigation
-
-CRITICAL: Only reference code actually shown above. No invented information.`;
+BEGIN JSON OUTPUT:`;
     
-    log('processAnswerDirect: Prompt length:', prompt.length);
+    log('processAnswerDirect: Stage 1 - Extracting facts, prompt length:', extractionPrompt.length);
     
-    const result = await callLanguageModel(prompt);
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `*Stage 1: Extracting structured facts...*\n`
+    });
+    
+    const extractionResult = await callLanguageModel(extractionPrompt);
+    
+    // VERBOSE: Show what LLM returned
+    if (AGENT_CONFIG.verboseSearch) {
+        const preview = extractionResult?.substring(0, 300).replace(/\n/g, '\\n') || 'null';
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n**🔧 Debug: LLM returned (first 300 chars):**\n\`\`\`\n${preview}\n\`\`\`\n\n`
+        });
+    }
+    
+    // Parse JSON from response
+    let facts;
+    let jsonParsed = false;
+    try {
+        // Clean up response - remove markdown code fences if present
+        let jsonStr = extractionResult.trim();
+        if (jsonStr.startsWith('```')) {
+            jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+        }
+        // Also try to find JSON object in the response
+        const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+            jsonStr = jsonMatch[0];
+        }
+        facts = JSON.parse(jsonStr);
+        jsonParsed = true;
+        log('processAnswerDirect: Successfully parsed facts JSON');
+    } catch (parseErr) {
+        log('processAnswerDirect: JSON parse error:', parseErr.message);
+        log('processAnswerDirect: Raw response (first 500):', extractionResult?.substring(0, 500));
+        
+        // VERBOSE: Show parse error
+        if (AGENT_CONFIG.verboseSearch) {
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n**⚠️ JSON Parse Error:** ${parseErr.message}\n**Falling back to defaults**\n\n`
+            });
+        }
+        
+        // Fallback: use defaults
+        facts = {
+            summary: "Analysis of the provided code",
+            entry_point: null,  // Don't fabricate an entry point
+            answers: subQuestions.map(sq => ({ question: sq, answer: "See code analysis below", references: [] })),
+            key_files: [],
+            code_flow: [],
+            data_structures: [],
+            key_functions: [],
+            config_options: [],
+            notes: ["Structured extraction encountered issues - content may be incomplete"]
+        };
+    }
+    
+    // VERBOSE: Show parsed facts summary
+    if (AGENT_CONFIG.verboseSearch) {
+        const factsSummary = `**📊 Extracted Facts (JSON parsed: ${jsonParsed}):**
+- Summary: ${facts.summary?.substring(0, 50) || 'none'}...
+- Entry point: \`${facts.entry_point?.function || 'none'}()\`
+- Key files: ${facts.key_files?.length || 0}
+- Code flow: ${facts.code_flow?.length || 0} relationships
+- Data structures: ${facts.data_structures?.length || 0}
+- Key functions: ${facts.key_functions?.length || 0}
+- Config options: ${facts.config_options?.length || 0}
+`;
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: factsSummary + '\n---\n\n'
+        });
+    }
+    
+    // ================================================================
+    // STAGE 2: FORMAT INTO TEMPLATE (Deterministic)
+    // ================================================================
+    log('processAnswerDirect: Stage 2 - Formatting into template');
+    
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `*Stage 2: Formatting structured response...*\n\n`
+    });
+    
+    const formatted = formatFactsToTemplate(facts, subQuestions, [], [], context, question);
     
     // Validate answer if enabled
     if (AGENT_CONFIG.enableJudge) {
@@ -9567,11 +14702,11 @@ CRITICAL: Only reference code actually shown above. No invented information.`;
             fullContext += `### ${fileName}\n\`\`\`\n${file.content}\n\`\`\`\n\n`;
         }
         
-        const validatedResult = await validateAndRefineAnswer(question, result, fullContext || context);
+        const validatedResult = await validateAndRefineAnswer(question, formatted, fullContext || context);
         return { success: true, data: { answer: validatedResult } };
     }
     
-    return { success: true, data: { answer: result } };
+    return { success: true, data: { answer: formatted } };
 }
 
 /**
@@ -9621,13 +14756,295 @@ function getResourcesSummary() {
 }
 
 /**
+ * ============================================================
+ * QUERY ANALYSIS FRAMEWORK
+ * ============================================================
+ * Systematically analyzes developer queries before execution:
+ * 1. PARSE: Extract task type, target, scope
+ * 2. VALIDATE: Check if targets exist in context/index
+ * 3. SELECT: Choose appropriate tool based on task
+ * 4. RETURN: Structured analysis for planner
+ */
+
+/**
+ * Analyze a developer query and extract structured information
+ * @param {string} query - The user's query
+ * @returns {Object} Structured query analysis
+ */
+function analyzeQuery(query) {
+    const analysis = {
+        originalQuery: query,
+        taskType: null,        // EXPLAIN | REVIEW | SEARCH | TRACE | GENERATE | TRANSLATE | DOCUMENT | COMPARE
+        target: {
+            type: null,        // file | function | concept | codebase
+            value: null,       // The actual target (filename, function name, etc.)
+            exists: false,     // Whether target was found in context/index
+            path: null         // Full path if found
+        },
+        scope: 'focused',      // focused | broad | comprehensive
+        suggestedTool: null,   // The tool that should be used
+        keywords: [],          // Extracted search keywords (task words removed)
+        confidence: 'high'     // high | medium | low
+    };
+    
+    const queryLower = query.toLowerCase();
+    
+    // ================================================================
+    // STEP 1: IDENTIFY TASK TYPE
+    // ================================================================
+    const taskPatterns = [
+        // REVIEW: Must have bug/issue/problem context
+        { type: 'REVIEW', patterns: [
+            /\b(identify|find|check|detect)\s*(bugs?|issues?|problems?|errors?|vulnerabilities)/i, 
+            /\breview\s+\w+\.(c|h|cpp|py|js|java)/i, 
+            /\b(bug|issue|problem)\s+in\b/i
+        ] },
+        // EXPLAIN: Understanding/describing code
+        { type: 'EXPLAIN', patterns: [
+            /\b(explain|describe|what\s+is|what\s+does|how\s+does|how\s+is.*implemented)\b/i, 
+            /\btell\s+me\s+about\b/i
+        ] },
+        // TRACE: Following execution flow
+        { type: 'TRACE', patterns: [
+            /\b(trace|flow|call\s*graph|what\s+calls|calls\s+what|execution\s+path)\b/i
+        ] },
+        // SEARCH: Finding code - includes "identify code", "find code", "show me", etc.
+        { type: 'SEARCH', patterns: [
+            /\b(show\s+me|find|list|where\s+is|locate|search\s+for)\b/i, 
+            /\ball\s+(functions?|classes?|files?|symbols?)\b/i,
+            /\b(identify|find)\s+(code|function|class|the\s+code|implementation)\b/i,  // "identify code", "find the code"
+            /\bcode\s+that\s+(handles?|implements?|processes?|manages?)\b/i  // "code that handles X"
+        ] },
+        // GENERATE: Creating new code
+        { type: 'GENERATE', patterns: [
+            /\b(create|write|generate|make|implement)\s+(a|an|the|new)?\s*(function|class|code|test)/i
+        ] },
+        // TRANSLATE: Converting between languages
+        { type: 'TRANSLATE', patterns: [
+            /\b(translate|convert|port|transform)\s+(this|these|to)\b/i
+        ] },
+        // DOCUMENT: Generating documentation
+        { type: 'DOCUMENT', patterns: [
+            /\b(document|generate\s+docs?|create\s+documentation)\b/i
+        ] },
+        // COMPARE: Comparing code/implementations
+        { type: 'COMPARE', patterns: [
+            /\b(compare|difference|vs|versus|between)\b/i
+        ] }
+    ];
+    
+    for (const { type, patterns } of taskPatterns) {
+        for (const pattern of patterns) {
+            if (pattern.test(query)) {
+                analysis.taskType = type;
+                break;
+            }
+        }
+        if (analysis.taskType) break;
+    }
+    
+    // Default to EXPLAIN if no task type detected
+    if (!analysis.taskType) {
+        analysis.taskType = 'EXPLAIN';
+        analysis.confidence = 'medium';
+    }
+    
+    log('analyzeQuery: Task type:', analysis.taskType);
+    
+    // ================================================================
+    // STEP 2: EXTRACT AND VALIDATE TARGET
+    // ================================================================
+    
+    // Check for specific file mentioned
+    const fileMatch = query.match(/\b([\w-]+\.(?:c|h|cpp|hpp|java|py|js|ts|go|rs|rb|sql|tal|cob|cbl|json|xml|yaml|yml))\b/i);
+    if (fileMatch) {
+        const fileName = fileMatch[1];
+        analysis.target.type = 'file';
+        analysis.target.value = fileName;
+        
+        // Validate: Check if file exists in context
+        for (const [path, file] of contextFiles) {
+            const pathFileName = path.split('/').pop();
+            if (pathFileName.toLowerCase() === fileName.toLowerCase()) {
+                analysis.target.exists = true;
+                analysis.target.path = path;
+                break;
+            }
+        }
+        
+        log('analyzeQuery: File target:', fileName, 'exists:', analysis.target.exists);
+    }
+    
+    // Check for specific function mentioned (if no file found)
+    if (!analysis.target.value) {
+        // Look for function-like patterns: functionName(), function_name, FunctionName
+        const funcPatterns = [
+            /\b(?:function|method|proc|procedure)\s+(\w+)/i,
+            /\b(\w+)\s*\(\s*\)/,  // name()
+            /\bthe\s+(\w+)\s+function\b/i,
+            /\b(\w{3,})\s+(?:function|method)\b/i
+        ];
+        
+        for (const pattern of funcPatterns) {
+            const match = query.match(pattern);
+            if (match && match[1] && match[1].length > 2) {
+                const funcName = match[1];
+                // Skip common words
+                if (!['the', 'this', 'that', 'and', 'for', 'how', 'what'].includes(funcName.toLowerCase())) {
+                    analysis.target.type = 'function';
+                    analysis.target.value = funcName;
+                    
+                    // Validate: Check if function exists in index
+                    if (codeIndex.symbols.has(funcName)) {
+                        analysis.target.exists = true;
+                        const sym = codeIndex.symbols.get(funcName);
+                        analysis.target.path = sym.file;
+                    } else {
+                        // Try partial match
+                        for (const [key, sym] of codeIndex.symbols) {
+                            if (sym.name.toLowerCase() === funcName.toLowerCase()) {
+                                analysis.target.exists = true;
+                                analysis.target.path = sym.file;
+                                analysis.target.value = sym.name; // Use correct casing
+                                break;
+                            }
+                        }
+                    }
+                    
+                    log('analyzeQuery: Function target:', funcName, 'exists:', analysis.target.exists);
+                    break;
+                }
+            }
+        }
+    }
+    
+    // If still no target, it's a concept-based query
+    if (!analysis.target.value) {
+        analysis.target.type = 'concept';
+        // Extract the main concept from query
+        const keywords = extractSearchKeywords(query);
+        analysis.target.value = keywords.slice(0, 3).join(' ');
+        analysis.keywords = keywords;
+        
+        log('analyzeQuery: Concept target:', analysis.target.value);
+    } else {
+        analysis.keywords = extractSearchKeywords(query);
+    }
+    
+    // ================================================================
+    // STEP 3: DETERMINE SCOPE
+    // ================================================================
+    if (/\ball\b|\bevery\b|\bentire\b|\bwhole\b|\bcomprehensive\b/i.test(query)) {
+        analysis.scope = 'comprehensive';
+    } else if (/\bhigh.?level\b|\boverview\b|\bsummary\b|\bbrief\b/i.test(query)) {
+        analysis.scope = 'broad';
+    } else {
+        analysis.scope = 'focused';
+    }
+    
+    // ================================================================
+    // STEP 4: SELECT SUGGESTED TOOL
+    // ================================================================
+    const toolMap = {
+        'REVIEW': {
+            'file': 'review_file',
+            'function': 'review_code',
+            'concept': 'review_code'
+        },
+        'EXPLAIN': {
+            'file': 'search_code',  // Search file then explain
+            'function': 'get_function_context',
+            'concept': 'search_code'
+        },
+        'TRACE': {
+            'file': 'search_code',
+            'function': 'get_function_context',  // Includes call graph
+            'concept': 'search_code'
+        },
+        'SEARCH': {
+            'file': 'search_index',
+            'function': 'search_index',
+            'concept': 'search_code'
+        },
+        'GENERATE': {
+            'file': 'generate_code',
+            'function': 'generate_code',
+            'concept': 'generate_code'
+        },
+        'TRANSLATE': {
+            'file': 'translate_all_files',
+            'function': 'translate_all_files',
+            'concept': 'translate_all_files'
+        },
+        'DOCUMENT': {
+            'file': 'generate_full_documentation',
+            'function': 'document_code',
+            'concept': 'generate_full_documentation'
+        },
+        'COMPARE': {
+            'file': 'search_code',
+            'function': 'search_code',
+            'concept': 'search_code'
+        }
+    };
+    
+    analysis.suggestedTool = toolMap[analysis.taskType]?.[analysis.target.type] || 'search_code';
+    
+    log('analyzeQuery: Complete analysis:', JSON.stringify({
+        taskType: analysis.taskType,
+        targetType: analysis.target.type,
+        targetValue: analysis.target.value,
+        targetExists: analysis.target.exists,
+        suggestedTool: analysis.suggestedTool,
+        scope: analysis.scope
+    }));
+    
+    return analysis;
+}
+
+/**
+ * Format query analysis for planner prompt
+ */
+function formatQueryAnalysis(analysis) {
+    let formatted = `## Query Analysis (Pre-processed)
+**Task Type:** ${analysis.taskType}
+**Target:** ${analysis.target.type} → "${analysis.target.value}"
+**Target Found:** ${analysis.target.exists ? '✓ Yes' : '✗ No'} ${analysis.target.path ? `(${analysis.target.path})` : ''}
+**Scope:** ${analysis.scope}
+**Suggested Tool:** ${analysis.suggestedTool}
+**Keywords:** ${analysis.keywords.join(', ')}
+**Confidence:** ${analysis.confidence}
+
+`;
+    
+    // Add warnings/guidance
+    if (!analysis.target.exists && analysis.target.type === 'file') {
+        formatted += `⚠️ WARNING: File "${analysis.target.value}" not found in context. May need to search or ask user.\n`;
+    }
+    if (!analysis.target.exists && analysis.target.type === 'function') {
+        formatted += `⚠️ WARNING: Function "${analysis.target.value}" not found in index. May need fuzzy search.\n`;
+    }
+    
+    return formatted;
+}
+
+/**
  * PLANNER: Uses LLM to create an execution plan
  */
 async function createExecutionPlan(query, conversationHistory = []) {
     log('PLANNER: Creating execution plan for:', query);
     
+    // ================================================================
+    // STEP 0: ANALYZE QUERY FIRST
+    // ================================================================
+    const queryAnalysis = analyzeQuery(query);
+    const analysisContext = formatQueryAnalysis(queryAnalysis);
+    
     const toolsSummary = getToolsSummary();
     const resourcesSummary = getResourcesSummary();
+    
+    // Get discovered domain from indexed code
+    const domainContext = getDomainContext();
     
     // Include recent conversation context
     let conversationContext = '';
@@ -9645,35 +15062,83 @@ async function createExecutionPlan(query, conversationHistory = []) {
 # USER REQUEST
 "${query}"
 
+${analysisContext}
 ${conversationContext}
+${domainContext}
 ${resourcesSummary}
 ${toolsSummary}
 
 # YOUR TASK
-1. FIRST: Identify the domain/context (e.g., "ISO 20022 payments", "PostgreSQL internals", "React frontend", "COBOL banking", etc.)
-2. THEN: Create a step-by-step execution plan
+Use the Query Analysis above to create the execution plan. The analysis has already:
+1. Identified the TASK TYPE (${queryAnalysis.taskType})
+2. Extracted the TARGET (${queryAnalysis.target.type}: ${queryAnalysis.target.value})
+3. Validated if target exists (${queryAnalysis.target.exists})
+4. Suggested the tool (${queryAnalysis.suggestedTool})
 
-# DOMAIN DISCOVERY
-- Analyze the query and any attached files to identify the technical domain
-- Note any domain-specific terminology, standards, or frameworks mentioned
-- This domain context will be used to provide precise, accurate answers
+Your job is to confirm or adjust this analysis and create the step-by-step plan.
+
+# MANDATORY TOOL MAPPINGS (FOLLOW THESE EXACTLY)
+Based on TASK TYPE, you MUST use these tools:
+
+| Task Type | Target Type | REQUIRED Tool |
+|-----------|-------------|---------------|
+| REVIEW    | file        | review_file   |
+| REVIEW    | function    | review_code   |
+| EXPLAIN   | file        | search_code → answer_question |
+| EXPLAIN   | function    | get_function_context → answer_question |
+| TRACE     | any         | search_code → answer_question |
+| SEARCH    | any         | search_code or search_index |
+
+⚠️ CRITICAL: When taskType is REVIEW, you MUST use review_file or review_code - NEVER use answer_question for bug finding!
+
+# IMPORTANT RULES
+1. If target is a SPECIFIC FILE that EXISTS → use the suggested tool directly on that file
+2. If target is a SPECIFIC FUNCTION → use get_function_context to get its code first
+3. If target is a CONCEPT → use search_code to find relevant code first
+4. NEVER search for task words like "identify", "bugs", "review" - search for TARGET words only
+5. USE the suggested tool from Query Analysis unless you have a good reason not to
 
 # PLANNING GUIDELINES
+
+## CLARIFICATION (when needed)
+If the query is AMBIGUOUS and could mean different things, return a plan with:
+- "needs_clarification": true
+- "clarification_question": "Your specific question to user"
+- "options": ["Option A description", "Option B description", ...]
+
+Example clarification response:
+{
+  "needs_clarification": true,
+  "clarification_question": "When you say 'show me the parser', do you mean:",
+  "options": ["The SQL parser (parsing SQL queries)", "The command parser (parsing user commands)", "All parser-related code"],
+  "domain": "unknown - needs clarification"
+}
+
+## TOOL SELECTION RULES
 - For "how is X implemented", "explain X", "describe X functionality", "trace X":
-  USE search_code (combines fuzzy index + grep) → answer_question
+  USE search_code (combines fuzzy index + trigram) → answer_question
   This is the PREFERRED approach for implementation questions.
   
+- For "show me all X implementing Y", "list functions/classes for X":
+  USE search_index with pattern=Y → then answer_question
+  IMPORTANT: search_index will prioritize FILES and SYMBOLS with Y in the NAME
+
 - For specific function questions ("explain function Y"): 
   USE get_function_context → answer_question
   
 - For "list all X functions", "find functions related to Y":
   USE search_index → answer_question
-  
+
+- For "identify bugs", "find issues", "review X.c", "check for problems", "find bugs in X":
+  ⚠️ MUST USE review_file with fileName=X.c → returns structured bug report
+  This is REQUIRED for bug identification on specific files
+  DO NOT use answer_question for bug finding!
+
+- For general code review (no specific file): use review_code
 - For simple questions like "what is X": use answer_question with context="$context"
 - For documentation: use generate_full_documentation  
 - For translations ("translate to X", "convert to X"): 
   USE translate_all_files - translates ALL attached files preserving symbols and decimal precision
-- For code review: use review_code
 - For new code: use generate_code
 
 CRITICAL: When user has attached code files, the answer MUST reference the actual code with file names and line numbers. Do NOT give generic explanations.
@@ -9691,23 +15156,23 @@ CRITICAL: When user has attached code files, the answer MUST reference the actua
 Example 1 - Implementation tracing (RECOMMENDED - use search_code):
 User: "describe how relation parsing is implemented"
 {
-  "domain": "SQL query parser/compiler",
-  "domain_notes": "Relation parsing involves parsing FROM clauses, table references, and join expressions",
-  "understanding": "User wants to understand relation parsing implementation",
+  "domain": "[Inferred from attached code structure and terminology]",
+  "domain_notes": "[Observations about the codebase from index analysis]",
+  "understanding": "User wants to understand implementation details",
   "strategy": "Use search_code to find symbols and code, then explain",
   "steps": [
     {
       "step": 1,
       "tool": "search_code",
-      "purpose": "Comprehensive search for relation parsing code",
-      "parameters": { "query": "relation parse FROM RangeTbl table" }
+      "purpose": "Search for code matching the query terms",
+      "parameters": { "query": "[key terms extracted from user query]" }
     },
     {
       "step": 2,
       "tool": "answer_question",
-      "purpose": "Explain relation parsing with specific code references",
+      "purpose": "Explain implementation with specific code references",
       "parameters": { 
-        "question": "Explain how relation parsing is implemented in this code. For each point, cite specific file names and line numbers: 1) Entry point functions, 2) Key data structures, 3) The parsing flow, 4) How different relation types are handled.",
+        "question": "[Reformulated question asking for: 1) Entry points, 2) Key data structures, 3) The flow, 4) How different cases are handled]",
         "context": "$step1.data.combinedContext"
       }
     }
@@ -9716,9 +15181,9 @@ User: "describe how relation parsing is implemented"
 }
 
 Example 2 - Specific function deep-dive (MULTI-STEP):
-User: "explain the processPayment function"
+User: "explain the [functionName] function"
 {
-  "domain": "Payment processing code",
+  "domain": "[Inferred from code]",
   "domain_notes": "Focus on the specific function, its inputs, outputs, and call graph",
   "understanding": "User wants to understand a specific function in detail",
   "strategy": "Get the function source and call graph, then explain",
@@ -9727,111 +15192,197 @@ User: "explain the processPayment function"
       "step": 1,
       "tool": "get_function_context",
       "purpose": "Get full source code and call relationships",
-      "parameters": { "functionName": "processPayment" }
+      "parameters": { "functionName": "[function name from query]" }
     },
     {
       "step": 2,
       "tool": "answer_question",
       "purpose": "Explain the function based on its source and call graph",
       "parameters": { 
-        "question": "Explain processPayment: 1) Purpose, 2) Parameters and return value, 3) Step-by-step logic, 4) Functions it calls and why, 5) What calls this function.",
+        "question": "Explain [functionName]: 1) Purpose, 2) Parameters and return value, 3) Step-by-step logic, 4) Functions it calls and why, 5) What calls this function.",
         "context": "$step1.data"
       }
     }
   ],
-  "final_output": "Detailed explanation of processPayment function"
+  "final_output": "Detailed explanation of the function"
 }
 
-Example 3 - Find all functions of a type:
-User: "list all the parser functions"
+Example 3 - Find all code implementing a feature (NAME-BASED SEARCH):
+User: "show me all classes and functions that implement [FEATURE]"
 {
-  "domain": "Code parsing/compilation",
-  "domain_notes": "Parser functions typically start with parse_ or Parse",
-  "understanding": "User wants to see all parser-related functions",
-  "strategy": "Search index for parser functions and summarize",
+  "domain": "[Inferred from code]",
+  "domain_notes": "Extract the key term from query - prioritize files/symbols with that term in NAME",
+  "understanding": "User wants to find all code related to [FEATURE]",
+  "strategy": "Search for files/symbols by NAME matching the key term, then gather context",
   "steps": [
     {
       "step": 1,
       "tool": "search_index",
-      "purpose": "Find all parser functions",
-      "parameters": { "pattern": "parse|Parse", "type": "function" }
+      "purpose": "Find files and symbols with the key term in their NAME",
+      "parameters": { "pattern": "[key term from query]", "type": null }
+    },
+    {
+      "step": 2,
+      "tool": "search_code", 
+      "purpose": "Get detailed context for related code",
+      "parameters": { "query": "[key term and related terms]" }
+    },
+    {
+      "step": 3,
+      "tool": "answer_question",
+      "purpose": "List and describe all related code found",
+      "parameters": { 
+        "question": "List ALL files and functions that implement [FEATURE]. For each: 1) Name, 2) File location, 3) Brief purpose.",
+        "context": "$step1.data\n\n$step2.data.combinedContext"
+      }
+    }
+  ],
+  "final_output": "Complete list of code implementing the feature"
+}
+
+Example 4 - List all functions matching a pattern:
+User: "list all the [X] functions"
+{
+  "domain": "[Inferred from code]",
+  "domain_notes": "Search for functions with [X] in their name",
+  "understanding": "User wants to see all functions related to [X]",
+  "strategy": "Search index for matching functions and summarize",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "search_index",
+      "purpose": "Find all matching functions",
+      "parameters": { "pattern": "[pattern from query]", "type": "function" }
     },
     {
       "step": 2,
       "tool": "answer_question",
-      "purpose": "Summarize the parser functions found",
+      "purpose": "Summarize the functions found",
       "parameters": { 
-        "question": "List and briefly describe each parser function found. Group them by purpose if possible.",
+        "question": "List and briefly describe each function found. Group them by purpose if possible.",
         "context": "$step1.data"
       }
     }
   ],
-  "final_output": "List of parser functions with descriptions"
+  "final_output": "List of functions with descriptions"
 }
 
-Example 4 - Simple domain question (SINGLE-STEP):
-User: "what is camt.056?"
+Example 5 - Domain-specific question (use attached code context):
+User: "what is [term]?"
 {
-  "domain": "ISO 20022 financial messaging standard",
-  "domain_notes": "camt.* = Cash Management messages. camt.056 = FIToFIPaymentCancellationRequest",
-  "understanding": "User wants to understand the camt.056 message type",
-  "strategy": "Answer with precise ISO 20022 terminology",
+  "domain": "[Inferred from attached code and the term]",
+  "domain_notes": "[Any context from the indexed code about this term]",
+  "understanding": "User wants to understand what [term] means in this codebase",
+  "strategy": "Search the attached code for context about this term, then explain",
   "steps": [
     {
       "step": 1,
+      "tool": "search_code",
+      "purpose": "Find how this term is used in the attached code",
+      "parameters": { "query": "[term]" }
+    },
+    {
+      "step": 2,
       "tool": "answer_question",
-      "purpose": "Explain camt.056 with accurate terminology",
+      "purpose": "Explain the term based on how it's used in this codebase",
       "parameters": { 
-        "question": "What is camt.056 in ISO 20022? Provide the exact message name, purpose, and typical flow.", 
-        "context": "$context" 
+        "question": "Based on the attached code, explain what [term] means and how it's used.", 
+        "context": "$step1.data.combinedContext" 
       }
     }
   ],
-  "final_output": "Accurate explanation of camt.056"
+  "final_output": "Explanation based on the actual code"
 }
 
-Example 5 - Translation (SINGLE-STEP):
-User: "translate this TAL to Java"
+Example 6 - Bug identification in a specific file (SINGLE-STEP):
+User: "identify bugs in [filename.c]" or "review [filename.c] for issues" or "find bugs in [filename.c]"
+⚠️ CRITICAL: For ANY bug/issue finding request, you MUST use review_file - NEVER answer_question!
 {
-  "domain": "Tandem TAL to Java migration",
-  "domain_notes": "TAL = Transaction Application Language for HP NonStop/Tandem systems",
-  "understanding": "User wants to translate code to Java",
+  "domain": "[Inferred from code]",
+  "domain_notes": "User wants a code review of a specific file",
+  "understanding": "User wants to find bugs/issues in [filename.c]",
+  "strategy": "Use review_file to analyze the specific file for bugs",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "review_file",
+      "purpose": "Review the specific file for bugs and issues",
+      "parameters": { "fileName": "[filename.c from query]", "focus": "bugs" }
+    }
+  ],
+  "final_output": "Structured bug report with line numbers and recommendations"
+}
+
+Example 6b - EXACT MATCH for "find bugs in X.c":
+User: "find bugs in partdesc.c"
+{
+  "domain": "PostgreSQL partition management",
+  "understanding": "Find bugs in partdesc.c",
+  "strategy": "Use review_file for bug identification",
+  "steps": [
+    {
+      "step": 1,
+      "tool": "review_file",
+      "purpose": "Review partdesc.c for bugs",
+      "parameters": { "fileName": "partdesc.c", "focus": "bugs" }
+    }
+  ],
+  "final_output": "Bug report with specific issues found"
+}
+
+Example 7 - Translation (SINGLE-STEP):
+User: "translate this [source language] to [target language]"
+{
+  "domain": "[Inferred from attached code]",
+  "domain_notes": "Preserve symbols, data types, and business logic during translation",
+  "understanding": "User wants to translate code to another language",
   "strategy": "Use translate_all_files to convert ALL attached files, preserving symbols and precision",
   "steps": [
     {
       "step": 1,
       "tool": "translate_all_files",
-      "purpose": "Translate all attached files to Java",
-      "parameters": { "targetLanguage": "java" }
+      "purpose": "Translate all attached files to target language",
+      "parameters": { "targetLanguage": "[target language from query]" }
     }
   ],
-  "final_output": "Java translation of all files"
+  "final_output": "Translated files in target language"
 }
 
-Example 6 - Multi-file Translation:
-User: "convert these Python files to TypeScript"
+Example 8 - Multi-file Translation:
+User: "convert these files to [target language]"
 {
-  "domain": "Python to TypeScript migration",
-  "domain_notes": "Preserve type hints, convert to TypeScript interfaces",
-  "understanding": "User wants all attached Python files converted to TypeScript",
+  "domain": "[Inferred from attached code]",
+  "domain_notes": "Preserve type hints, convert to target language idioms",
+  "understanding": "User wants all attached files converted to target language",
   "strategy": "Use translate_all_files to translate all files together",
   "steps": [
     {
       "step": 1,
       "tool": "translate_all_files",
-      "purpose": "Translate all Python files to TypeScript",
-      "parameters": { "targetLanguage": "typescript" }
+      "purpose": "Translate all files to target language",
+      "parameters": { "targetLanguage": "[target language]" }
     }
   ],
-  "final_output": "TypeScript files with proper types"
+  "final_output": "Files in target language with proper types"
 }
 
 # WHEN TO USE EACH TOOL
-- search_code: PREFERRED for implementation questions - combines fuzzy index search + grep in one step
-- search_index: Find symbols by name with fuzzy matching (handles cryptic names like "RTE" → "RangeTblEntry")
-- get_function_context: Get full source code of a specific named function
-- grep_context: Broad text search when you need raw pattern matching  
-- answer_question: Generate explanation based on gathered context
+
+## 3-LAYER SEARCH ARCHITECTURE
+Layer 1 - SYMBOL INDEX (structured lookups):
+- search_index: Find functions/classes/variables by name (fuzzy matching)
+- get_function_context: Get full source code of a specific function
+
+Layer 2 - TRIGRAM INDEX (exact text search - Zoekt-style):  
+- search_trigram: Fast exact/partial text search (variable names, strings, identifiers)
+- search_code: COMPREHENSIVE - combines symbol + trigram in one step (PREFERRED)
+
+Layer 3 - VECTOR INDEX (semantic similarity - TF-IDF):
+- search_semantic: Find conceptually similar code (when exact keywords don't match)
+
+## OTHER TOOLS
+- grep_context: Fallback raw pattern matching (use trigram instead when possible)
+- answer_question: Generate explanation from gathered context
 
 # FUZZY MATCHING
 The search tools support fuzzy matching for cryptic symbol names:
@@ -10371,146 +15922,6 @@ Be concise but complete. If steps failed, explain what happened.`;
 /**
  * AGENT ORCHESTRATOR: Main entry point for the agentic workflow
  */
-async function runAgent(query) {
-    log('AGENT: Starting for query:', query);
-    const startTime = Date.now();
-    
-    // Get context summary
-    const hasContext = contextFiles.size > 0;
-    const fileCount = contextFiles.size;
-    const config = vscode.workspace.getConfiguration('astra');
-    const apiUrl = config.get('apiUrl') || 'http://localhost:8080';
-    
-    // ================================================================
-    // SPECIAL CASE ROUTING (before planning)
-    // ================================================================
-    
-    // CASE 1: Full documentation request with context
-    const isDocRequest = /^(?:document|generate\s+(?:full\s+)?(?:doc|documentation)|documentation|deepwiki|full\s*doc)/i.test(query);
-    log('AGENT: Query:', query, '| isDocRequest:', isDocRequest, '| hasContext:', hasContext);
-    if (isDocRequest && hasContext) {
-        log('AGENT: Routing to full documentation generator');
-        try {
-            const fileList = [];
-            for (const [path, file] of contextFiles) {
-                log('AGENT: Adding file to doc list:', path, '| content length:', file.content?.length || 0);
-                fileList.push({ 
-                    name: path.split('/').pop(), 
-                    path, 
-                    language: file.language, 
-                    size: file.content?.length || 0 
-                });
-            }
-            log('AGENT: Generating docs for', fileList.length, 'files');
-            return await generateDocumentationFile(fileList, query);
-        } catch (error) {
-            log('AGENT: Documentation generation failed:', error.message, error.stack);
-            // Fall through to normal agent flow
-        }
-    }
-    
-    // CASE 2: No context - use API server for search/questions
-    if (!hasContext) {
-        log('AGENT: No context - checking API server');
-        
-        // Check if API is available
-        let apiAvailable = false;
-        try {
-            const response = await fetch(`${apiUrl}/health`, { 
-                method: 'GET',
-                signal: AbortSignal.timeout(2000)
-            });
-            apiAvailable = response.ok;
-        } catch (e) {
-            log('AGENT: API server not available');
-        }
-        
-        if (apiAvailable) {
-            log('AGENT: Routing to API server mode');
-            return await handleApiMode(query, apiUrl, config);
-        } else {
-            // No context and no API - direct LLM call
-            log('AGENT: No context, no API - direct LLM call');
-            return await callLanguageModel(query);
-        }
-    }
-    
-    // CASE 3: Simple question with context - fast path (skip planning)
-    // BUT: Implementation tracing questions should always go through planning
-    const isImplementationQuestion = /\b(implement|implementation|trace|tracing|flow|how\s+is.*implemented|describe\s+how|walk\s+through|step\s+by\s+step)\b/i.test(query);
-    const isSimpleQuestion = /^(?:what\s+is|what\s+are|tell\s+me\s+about|why\s+does|when\s+does|where\s+is)/i.test(query);
-    
-    if (isSimpleQuestion && hasContext && !isImplementationQuestion) {
-        log('AGENT: Fast-path for simple question with context');
-        const context = getBasicContext();
-        const prompt = `Based on this code:\n\n${context}\n\nQuestion: ${query}\n\nProvide a detailed answer explaining the relevant code, algorithms, functions, and data structures involved.`;
-        try {
-            const answer = await callLanguageModel(prompt);
-            const duration = Date.now() - startTime;
-            log(`AGENT: Fast-path completed in ${duration}ms`);
-            return answer;
-        } catch (error) {
-            log('AGENT: Fast-path failed, falling back to planning:', error.message);
-            // Fall through to normal planning
-        }
-    }
-    
-    // Log if we're routing to planner for implementation questions
-    if (isImplementationQuestion) {
-        log('AGENT: Implementation question detected - using full planning flow');
-    }
-    
-    // ================================================================
-    // NORMAL AGENTIC FLOW (with context)
-    // ================================================================
-    
-    try {
-        // PHASE 1: PLANNING
-        log('AGENT: Phase 1 - Planning');
-        const plan = await createExecutionPlan(query, chatHistory.slice(-6));
-        
-        if (!plan || !plan.steps || plan.steps.length === 0) {
-            log('AGENT: No valid plan, using direct LLM with context');
-            return await callLanguageModel(query + '\n\nContext:\n' + getBasicContext());
-        }
-        
-        log(`AGENT: Plan created - ${plan.steps.length} steps`);
-        log('AGENT: Domain:', plan.domain || 'general');
-        log('AGENT: Understanding:', plan.understanding);
-        log('AGENT: Strategy:', plan.strategy);
-        
-        // PHASE 2: EXECUTION
-        log('AGENT: Phase 2 - Execution');
-        const stepResults = [];
-        
-        for (const step of plan.steps) {
-            const result = await executeStep(step, stepResults, plan);
-            stepResults.push(result);
-            log(`AGENT: Step ${step.step} (${step.tool}):`, result.success ? 'SUCCESS' : 'FAILED');
-        }
-        
-        // PHASE 3: SYNTHESIS
-        log('AGENT: Phase 3 - Synthesis');
-        const response = await synthesizeResponse(query, plan, stepResults);
-        
-        // Ensure we have a response
-        if (!response || response.trim() === '') {
-            log('AGENT: Empty synthesis, using fallback');
-            return await callLanguageModel(query + '\n\nContext:\n' + getBasicContext());
-        }
-        
-        const duration = Date.now() - startTime;
-        log(`AGENT: Completed in ${duration}ms`);
-        
-        return response;
-        
-    } catch (error) {
-        log('AGENT ERROR:', error.message);
-        // Fallback to direct LLM call with context
-        log('AGENT: Falling back to direct LLM call');
-        return await callLanguageModel(query + '\n\nContext:\n' + getBasicContext());
-    }
-}
 
 // ============================================================
 // Chat Message Handler (Updated for Agentic Architecture)
@@ -10738,6 +16149,15 @@ async function executePlan(query, plan) {
     log('EXECUTOR: Running plan with', plan.steps.length, 'steps');
     taskController.start(`Executing plan: ${query.substring(0, 50)}...`);
     
+    // Show index statistics to user
+    showIndexStats();
+    
+    // Show plan overview
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `\n**Executing ${plan.steps.length}-step plan:**\n` 
+    });
+    
     const stepResults = [];
     
     for (const step of plan.steps) {
@@ -10749,18 +16169,54 @@ async function executePlan(query, plan) {
         
         chatWebviewView?.webview.postMessage({ 
             type: 'appendResponse', 
-            text: `**Step ${step.step}:** ${step.tool} - ${step.purpose}\n` 
+            text: `\n▶️ **Step ${step.step}:** ${step.tool} - ${step.purpose}\n` 
         });
         
         const result = await executeStep(step, stepResults, plan);
         stepResults.push(result);
         
+        // Show step result summary
+        if (result.success) {
+            const summary = getStepResultSummary(step.tool, result.data);
+            if (summary) {
+                showProgress(summary, 'found');
+            }
+        } else {
+            showProgress(`Step ${step.step} failed: ${result.error}`, 'warn');
+        }
+        
         log(`EXECUTOR: Step ${step.step} (${step.tool}):`, result.success ? 'SUCCESS' : 'FAILED');
     }
     
     // Synthesize response
+    showProgress('Generating response...', 'info');
     const response = await synthesizeResponse(query, plan, stepResults);
     return response;
+}
+
+/**
+ * Get a human-readable summary of step results
+ */
+function getStepResultSummary(tool, data) {
+    if (!data) return null;
+    
+    switch (tool) {
+        case 'search_code':
+            const symCount = data.indexResults?.symbols?.length || 0;
+            const grepCount = data.grepResults?.length || 0;
+            return `Found ${symCount} symbols, ${grepCount} code blocks`;
+        case 'search_index':
+            return `Found ${data.symbols?.length || 0} matching symbols`;
+        case 'grep_context':
+            return `Found ${data.results?.length || 0} matches`;
+        case 'get_function_context':
+            return `Retrieved function: ${data.name || 'unknown'}`;
+        case 'review_file':
+        case 'review_code':
+            return 'Code review completed';
+        default:
+            return null;
+    }
 }
 
 async function handleChatMessage(text) {
@@ -10840,6 +16296,65 @@ async function handleChatMessage(text) {
         
         const shouldSkipPlanning = skipPlanningPatterns.some(p => p.test(text.trim()));
         
+        // For large codebases, use LLM to classify the query type
+        const LARGE_CODEBASE_THRESHOLD = 50;
+        if (contextFiles.size > LARGE_CODEBASE_THRESHOLD && !isDocumentGeneration && !shouldSkipPlanning) {
+            log('CLASSIFY: Large codebase detected, using LLM to classify query');
+            
+            // Show classification status
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: '*Analyzing query type...*\n\n'
+            });
+            
+            const queryType = await classifyQueryWithLLM(text, contextFiles.size);
+            log('CLASSIFY: Query type:', queryType);
+            
+            if (queryType === 'overview' || queryType === 'domain' || queryType === 'specific') {
+                // Handle overview, domain, AND specific queries with specialized handlers
+                // These all benefit from search + chunking, not the planner
+                const response = await handleLocalMode(text, { queryType });
+                const modelName = getModelDisplayName();
+                const attribution = `\n\n---\n*AstraCode (${modelName})*`;
+                
+                // Display the actual response
+                if (response && response.length > 0) {
+                    // Check if this is an error response
+                    if (isLlmErrorResponse(response)) {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: response  // Error already formatted, no attribution
+                        });
+                    } else {
+                        chatWebviewView?.webview.postMessage({ 
+                            type: 'appendResponse', 
+                            text: response + attribution 
+                        });
+                    }
+                } else {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: attribution 
+                    });
+                }
+                
+                chatHistory.push({
+                    role: 'assistant',
+                    content: response || `Query answered using ${queryType} mode.`,
+                    timestamp: new Date()
+                });
+                
+                taskController.reset();
+                chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+                chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+                updateChatUI();
+                return;
+            }
+            
+            // For 'general' queries (not about the code), continue to planner
+            log('CLASSIFY: Query type is', queryType, '- continuing to planner');
+        }
+        
         if (isDocumentGeneration && contextFiles.size > 0) {
             // Direct documentation generation, bypass planning
             log('DOCS: Bypassing planner for documentation generation');
@@ -10875,6 +16390,55 @@ async function handleChatMessage(text) {
             chatHistory.push({
                 role: 'assistant',
                 content: response + attribution,
+                timestamp: new Date()
+            });
+            
+            taskController.reset();
+            chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+            chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+            updateChatUI();
+            return;
+        }
+        
+        // ============================================================
+        // SMALL CODEBASES: Read files directly, no planner needed
+        // ============================================================
+        const SMALL_CODEBASE_THRESHOLD = 50;
+        if (contextFiles.size > 0 && contextFiles.size <= SMALL_CODEBASE_THRESHOLD) {
+            log('SMALL CODEBASE: Bypassing planner for', contextFiles.size, 'files');
+            
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `*Analyzing ${contextFiles.size} files directly...*\n\n`
+            });
+            
+            // For small codebases, just pass all content to LLM
+            const response = await handleLocalMode(text, { queryType: 'specific' });
+            const modelName = getModelDisplayName();
+            const attribution = `\n\n---\n*AstraCode (${modelName})*`;
+            
+            if (response && response.length > 0) {
+                if (isLlmErrorResponse(response)) {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: response
+                    });
+                } else {
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: response + attribution 
+                    });
+                }
+            } else {
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: attribution 
+                });
+            }
+            
+            chatHistory.push({
+                role: 'assistant',
+                content: response || 'Analysis complete.',
                 timestamp: new Date()
             });
             
@@ -10960,7 +16524,7 @@ function determineMode(text) {
     return hasContext ? 'local' : 'api';
 }
 
-async function handleLocalMode(text, config) {
+async function handleLocalMode(text, config = {}) {
     log('LOCAL MODE: Using context files');
     
     if (contextFiles.size === 0) {
@@ -10969,7 +16533,80 @@ async function handleLocalMode(text, config) {
 - Or switch to API mode to search the codebase`;
     }
     
-    // Build context from files
+    // Use LLM-classified query type if provided, otherwise fall back to regex
+    const LARGE_CODEBASE_THRESHOLD = 50;
+    const isLargeCodebase = contextFiles.size > LARGE_CODEBASE_THRESHOLD;
+    const queryType = config.queryType || (isLargeCodebase ? classifyQueryFallback(text) : 'specific');
+    
+    log('LOCAL MODE: Query type:', queryType, '| Files:', contextFiles.size);
+    
+    // ============================================================
+    // HIGH-LEVEL QUERIES: Use pre-computed summaries + structure
+    // ============================================================
+    if (isLargeCodebase && queryType === 'overview') {
+        log('LOCAL MODE: Using smart high-level handler for', contextFiles.size, 'files');
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `*Analyzing ${contextFiles.size} files using intelligent summarization...*\n\n`
+        });
+        
+        try {
+            return await handleHighLevelQuery(text);
+        } catch (error) {
+            log('LOCAL MODE: High-level handler error:', error.message);
+            // Fall back to legacy hierarchical summary
+            const hierarchicalSummary = generateHierarchicalSummary();
+            const prompt = `Based on this codebase structure, answer: ${text}\n\n${hierarchicalSummary}`;
+            const result = await callLanguageModel(prompt);
+            if (isLlmErrorResponse(result)) {
+                return `**Unable to analyze codebase**
+
+The LLM is currently unavailable. Here's a structural summary:
+
+${hierarchicalSummary.substring(0, 2000)}
+
+Please check your GitHub Copilot or API configuration.`;
+            }
+            return result;
+        }
+    }
+    
+    // ============================================================
+    // DOMAIN/DETAILED QUERIES: Search + chunk + analyze
+    // ============================================================
+    if (isLargeCodebase && (queryType === 'domain' || queryType === 'specific')) {
+        log('LOCAL MODE: Using smart detailed handler with search + chunking');
+        
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `*Searching ${contextFiles.size} files for relevant code...*\n\n`
+        });
+        
+        try {
+            return await handleDetailedQuery(text);
+        } catch (error) {
+            log('LOCAL MODE: Detailed handler error:', error.message);
+            // Fall back to legacy focused context
+            const focusedContext = findRelevantContext(text);
+            if (focusedContext.totalFiles > 0) {
+                const prompt = `Analyze this code to answer: ${text}\n\n${focusedContext.content}`;
+                const result = await callLanguageModel(prompt);
+                if (isLlmErrorResponse(result)) {
+                    return `**Unable to analyze code**
+
+The LLM is currently unavailable. Found ${focusedContext.totalFiles} relevant files.
+
+Please check your GitHub Copilot or API configuration.`;
+                }
+                return result;
+            }
+        }
+    }
+    
+    // ============================================================
+    // SMALL CODEBASES: Direct context (original behavior)
+    // ============================================================
     let contextContent = 'FILES IN CONTEXT:\n\n';
     const fileList = [];
     for (const [path, file] of contextFiles) {
@@ -13123,9 +18760,27 @@ async function callLanguageModel(prompt, taskType = null) {
         taskType = detectTaskType(prompt);
     }
     
+    // Get the appropriate model based on task type
+    let preferredModel = null;
+    switch (taskType) {
+        case 'coding':
+            preferredModel = config.get('llm.codegenModel') || config.get('llm.copilotModel') || 'claude-sonnet-4';
+            break;
+        case 'docs':
+            preferredModel = config.get('llm.documentationModel') || 'gpt-4o-mini';
+            break;
+        case 'classification':
+            preferredModel = config.get('llm.classificationModel') || 'gpt-4o-mini';
+            break;
+        default:
+            // 'auto' and other tasks use the general copilot model
+            preferredModel = config.get('llm.copilotModel') || 'claude-sonnet-4';
+    }
+    log('LLM call - task type:', taskType, '| preferred model:', preferredModel);
+    
     // Get provider order based on task type
     const providerOrder = getProviderOrderForTask(taskType);
-    log('LLM call - task type:', taskType, '| provider order:', providerOrder.join(' -> '));
+    log('LLM call - provider order:', providerOrder.join(' -> '));
     log('Prompt size:', prompt.length, 'chars');
     
     let lastError = null;
@@ -13143,7 +18798,7 @@ async function callLanguageModel(prompt, taskType = null) {
         
         switch (provider) {
             case 'copilot': {
-                const copilotResult = await tryCopilot(prompt);
+                const copilotResult = await tryCopilot(prompt, preferredModel);
                 if (copilotResult.success) {
                     log('Copilot succeeded');
                     return copilotResult.response;
@@ -13224,13 +18879,6 @@ async function callLanguageModelForCoding(prompt) {
     return callLanguageModel(prompt, 'coding');
 }
 
-/**
- * Call LLM specifically for documentation tasks (explanation, summarization)
- * Uses Copilot (free) by default
- */
-async function callLanguageModelForDocs(prompt) {
-    return callLanguageModel(prompt, 'docs');
-}
 
 // Try GitHub Copilot with retry logic
 async function tryCopilot(prompt, preferredModel = null) {
@@ -13504,9 +19152,43 @@ async function processLargePromptWithCopilot(model, prompt, maxSize) {
     const { instructions, contextFiles, query } = parsePromptParts(prompt);
     
     if (contextFiles.length === 0) {
-        // No files to chunk, try as-is (will likely fail but let API server handle it)
-        log('No context files found to chunk');
-        return { success: false, error: 'Prompt too large and cannot be chunked' };
+        // No files to chunk - this is likely a summary-based prompt
+        // Try truncating to fit the limit instead of failing
+        log('No context files found to chunk - attempting truncated prompt');
+        
+        if (prompt.length > maxSize) {
+            // Find a good truncation point (don't cut mid-line)
+            let truncateAt = maxSize - 500; // Leave room for truncation notice
+            const newlinePos = prompt.lastIndexOf('\n', truncateAt);
+            if (newlinePos > truncateAt * 0.7) {
+                truncateAt = newlinePos;
+            }
+            
+            const truncatedPrompt = prompt.substring(0, truncateAt) + 
+                '\n\n... [context truncated for size limit - respond based on available information above]';
+            
+            log('Truncated prompt from', prompt.length, 'to', truncatedPrompt.length);
+            
+            // Try with truncated prompt
+            try {
+                const messages = [vscode.LanguageModelChatMessage.User(truncatedPrompt)];
+                const cancellation = new vscode.CancellationTokenSource();
+                const response = await model.sendRequest(messages, {}, cancellation.token);
+                
+                let fullResponse = '';
+                for await (const chunk of response.text) {
+                    fullResponse += chunk;
+                    chatWebviewView?.webview.postMessage({ type: 'appendResponse', text: chunk });
+                }
+                
+                return { success: true, response: fullResponse };
+            } catch (error) {
+                log('Truncated prompt also failed:', error.message);
+                return { success: false, error: `Prompt too large even after truncation: ${error.message}` };
+            }
+        }
+        
+        return { success: false, error: 'Prompt too large and cannot be processed' };
     }
     
     log(`Found ${contextFiles.length} context files to process`);
@@ -13737,82 +19419,6 @@ function parsePromptParts(prompt) {
     return { instructions, contextFiles, query };
 }
 
-// Call Astra API server's /llm/chat endpoint
-async function callAstraLlmApi(apiUrl, prompt) {
-    return new Promise((resolve, reject) => {
-        const url = new URL(`${apiUrl}/llm/chat`);
-        const isHttps = url.protocol === 'https:';
-        const http = require(isHttps ? 'https' : 'http');
-        
-        const postData = JSON.stringify({
-            prompt: prompt,
-            max_tokens: 4096
-        });
-        
-        const options = {
-            hostname: url.hostname,
-            port: url.port || (isHttps ? 443 : 80),
-            path: url.pathname,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-            },
-            timeout: 120000 // 2 minute timeout for LLM
-        };
-        
-        log('Calling API server LLM:', url.href);
-        
-        const req = http.request(options, (res) => {
-            let data = '';
-            res.on('data', chunk => {
-                data += chunk;
-            });
-            res.on('end', () => {
-                try {
-                    if (res.statusCode >= 400) {
-                        let errorMsg = `API error ${res.statusCode}`;
-                        try {
-                            const error = JSON.parse(data);
-                            errorMsg = error.error || error.detail || errorMsg;
-                        } catch (e) {}
-                        reject(new Error(errorMsg));
-                        return;
-                    }
-                    const json = JSON.parse(data);
-                    
-                    if (json.error) {
-                        reject(new Error(json.error));
-                        return;
-                    }
-                    
-                    const response = json.response || json.text || '';
-                    
-                    // Stream the response to UI
-                    if (response) {
-                        chatWebviewView?.webview.postMessage({ 
-                            type: 'appendResponse', 
-                            text: response
-                        });
-                    }
-                    
-                    resolve(response);
-                } catch (e) {
-                    reject(new Error(`Invalid response: ${e.message}`));
-                }
-            });
-        });
-        
-        req.on('error', (e) => reject(e));
-        req.on('timeout', () => {
-            req.destroy();
-            reject(new Error('Request timeout'));
-        });
-        
-        req.write(postData);
-        req.end();
-    });
-}
 
 // Call Anthropic Claude API directly
 async function callAnthropicApi(prompt, apiKey, model = null) {
@@ -14033,12 +19639,25 @@ function updateChatStatusUI() {
         'api': 'API Mode (search codebase)'
     };
     
-    // Include index stats in status
+    // Include index stats in status (compact format)
     let indexInfo = '';
     if (codeIndex.symbols.size > 0) {
         const callableCount = codeIndex.callGraph.size;
-        const varCount = codeIndex.variables.size;
-        indexInfo = ` • ${codeIndex.symbols.size} sym • ${varCount} vars • ${callableCount} funcs`;
+        const summaryCount = codeIndex.summaries.size;
+        const trigramCount = trigramIndex.index.size;
+        
+        // Base stats
+        indexInfo = ` • ${codeIndex.symbols.size} sym • ${callableCount} funcs`;
+        
+        // Add trigrams if available
+        if (trigramCount > 0) {
+            indexInfo += ` • ${trigramCount} tri`;
+        }
+        
+        // Add summaries if available (shows AI-enhanced search is ready)
+        if (summaryCount > 0) {
+            indexInfo += ` • ${summaryCount} sum`;
+        }
     }
     
     chatWebviewView?.webview.postMessage({
@@ -14211,11 +19830,15 @@ function clearContext() {
     codeIndex.callGraph.clear();
     codeIndex.reverseCallGraph.clear();
     codeIndex.dependencies.clear();
+    codeIndex.summaries.clear();
+    codeIndex.fileSummaries.clear();
+    codeIndex.overallSummary = null;
+    codeIndex.discoveredDomain = null;  // Clear discovered domain
     codeIndex.lastUpdated = null;
     
     contextTreeProvider.refresh();
     updateChatStatus();
-    log('Context and index cleared');
+    log('Context and index cleared (including domain)');
 }
 
 function detectLanguage(path) {
@@ -14502,7 +20125,12 @@ let contextTreeProvider;
 
 function activate(context) {
     outputChannel = vscode.window.createOutputChannel('AstraCode');
-    log('AstraCode v4.9.10 activating...');
+    log('AstraCode v4.9.73 activating...');
+    
+    // Create status bar item for summary progress
+    summaryStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    summaryStatusBarItem.name = 'AstraCode Summary';
+    context.subscriptions.push(summaryStatusBarItem);
     
     // Register context files tree provider
     contextTreeProvider = new ContextFilesProvider();
@@ -14588,20 +20216,54 @@ function activate(context) {
             updateChatStatusUI();
         }),
         
+        vscode.commands.registerCommand('astra.generateSummaries', async () => {
+            if (codeIndex.symbols.size === 0) {
+                vscode.window.showWarningMessage('No code indexed yet. Add files and rebuild index first.');
+                return;
+            }
+            
+            const funcCount = codeIndex.callGraph.size;
+            const choice = await vscode.window.showQuickPick([
+                { label: `All ${funcCount} functions`, value: null },
+                { label: 'Top 500 by importance', value: 500 },
+                { label: 'Top 200 by importance', value: 200 },
+                { label: 'Top 100 by importance', value: 100 }
+            ], {
+                placeHolder: `Generate AI summaries for functions (current: ${codeIndex.summaries.size})`
+            });
+            
+            if (!choice) return;
+            
+            vscode.window.showInformationMessage(`Generating summaries for ${choice.value || 'all'} functions...`);
+            
+            try {
+                await generateCodeSummaries(choice.value);
+                updateChatStatusUI();
+                vscode.window.showInformationMessage(`Generated ${codeIndex.summaries.size} function summaries`);
+            } catch (err) {
+                vscode.window.showErrorMessage(`Summary generation failed: ${err.message}`);
+            }
+        }),
+        
         vscode.commands.registerCommand('astra.clearIndex', async () => {
             // Clear symbol index
             codeIndex.files.clear();
             codeIndex.symbols.clear();
+            codeIndex.variables.clear();
             codeIndex.callGraph.clear();
             codeIndex.reverseCallGraph.clear();
             codeIndex.dependencies.clear();
+            codeIndex.summaries.clear();
+            codeIndex.fileSummaries.clear();
+            codeIndex.overallSummary = null;
+            codeIndex.discoveredDomain = null;  // Clear discovered domain
             codeIndex.lastUpdated = null;
             
             // Clear vector index
             await clearVectorIndex();
             
             updateChatStatusUI();
-            vscode.window.showInformationMessage('All indexes cleared (symbol + vector)');
+            vscode.window.showInformationMessage('All indexes cleared (symbol + vector + domain)');
             log('All indexes cleared manually');
         }),
         
@@ -14913,6 +20575,18 @@ function activate(context) {
             vscode.window.showInformationMessage(`AstraCode mode: ${currentMode.toUpperCase()}`);
         }),
         
+        vscode.commands.registerCommand('astra.toggleVerbose', () => {
+            AGENT_CONFIG.verboseSearch = !AGENT_CONFIG.verboseSearch;
+            const status = AGENT_CONFIG.verboseSearch ? 'ON' : 'OFF';
+            vscode.window.showInformationMessage(`AstraCode Verbose Search: ${status}`);
+            
+            // Also show in chat
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n**🔧 Verbose Search Mode: ${status}**\n\n`
+            });
+        }),
+        
         vscode.commands.registerCommand('astra.addSelectionToContext', async () => {
             const editor = vscode.window.activeTextEditor;
             if (editor && editor.selection && !editor.selection.isEmpty) {
@@ -14953,6 +20627,9 @@ function deactivate() {
     codeIndex.callGraph.clear();
     codeIndex.reverseCallGraph.clear();
     codeIndex.dependencies.clear();
+    codeIndex.summaries.clear();
+    codeIndex.fileSummaries.clear();
+    codeIndex.overallSummary = null;
     chatHistory = [];
     
     log('AstraCode deactivated');
