@@ -2,9 +2,9 @@
   "name": "astra-standalone",
   "displayName": "AstraCode - AI Code Assistant",
   "description": "Standalone AI code assistant with explicit context control",
-  "version": "4.9.73",
+  "version": "4.9.76",
   "publisher": "astra",
-  "license": "Wells Fargo",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -227,6 +227,11 @@
           "type": "string",
           "default": "spring_boot",
           "description": "Default framework for generated code"
+        },
+        "astra.debugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show debug information in chat (query routing, model selection, timing)"
         },
         "astra.llm.useCopilotForDocs": {
           "type": "boolean",
