@@ -2,7 +2,7 @@
   "name": "astra-standalone",
   "displayName": "AstraCode - AI Code Assistant",
   "description": "Standalone AI code assistant with explicit context control",
-  "version": "4.9.76",
+  "version": "4.9.77",
   "publisher": "astra",
   "license": "MIT",
   "engines": {
