@@ -2,7 +2,7 @@
   "name": "astra-standalone",
   "displayName": "AstraCode - AI Code Assistant",
   "description": "Standalone AI code assistant with explicit context control",
-  "version": "4.9.77",
+  "version": "4.9.80",
   "publisher": "astra",
   "license": "MIT",
   "engines": {
@@ -232,6 +232,12 @@
           "type": "boolean",
           "default": false,
           "description": "Show debug information in chat (query routing, model selection, timing)"
+        },
+        "astra.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Custom system prompt to guide LLM behavior. Leave empty to use the default AstraCode system prompt.",
+          "editPresentation": "multilineText"
         },
         "astra.llm.useCopilotForDocs": {
           "type": "boolean",
