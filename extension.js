@@ -33,6 +33,7 @@
 const vscode = require('vscode');
 const path = require('path');
 const pathUtils = require('./pathUtils');
+const searchModule = require('./search-module');
 
 // ============================================================
 // State Management
@@ -117,6 +118,44 @@ const taskController = {
 };
 
 /**
+ * Check if a file is a code file (not a build/config/doc file)
+ * Used to filter search results and documentation generation
+ */
+const NON_CODE_FILES = new Set([
+    'makefile', 'gnumakefile', 'readme', 'readme.md', 'readme.txt',
+    'license', 'license.md', 'license.txt', 'changelog', 'changelog.md',
+    'contributing', 'contributing.md', 'authors', 'todo', 'todo.md',
+    '.gitignore', '.gitattributes', '.editorconfig', '.prettierrc',
+    'package-lock.json', 'yarn.lock', 'poetry.lock', 'pipfile.lock'
+]);
+const NON_CODE_EXTENSIONS = new Set([
+    '.md', '.txt', '.rst', '.json', '.yaml', '.yml', '.toml', '.ini',
+    '.cfg', '.conf', '.xml', '.lock', '.sum'
+]);
+const BUILD_FILES = new Set([
+    'meson.build', 'cmakelists.txt', 'configure.ac', 'configure.in',
+    'setup.py', 'setup.cfg', 'pyproject.toml', 'cargo.toml',
+    'build.gradle', 'pom.xml', 'package.json', 'tsconfig.json'
+]);
+
+function isCodeFile(filePath) {
+    const fileName = pathUtils.getFileName(filePath);
+    const fileNameLower = fileName.toLowerCase();
+    const ext = pathUtils.getExtension(filePath).toLowerCase();
+    
+    // Explicitly non-code files
+    if (NON_CODE_FILES.has(fileNameLower)) return false;
+    
+    // Build/config files - include in indexing but exclude from search results
+    if (BUILD_FILES.has(fileNameLower)) return false;
+    
+    // Non-code extensions
+    if (NON_CODE_EXTENSIONS.has(ext)) return false;
+    
+    return true;
+}
+
+/**
  * Default System Prompt for AstraCode
  * This is prepended to every user query to guide the LLM's behavior
  */
@@ -197,6 +236,24 @@ const codeIndex = {
     discoveredDomain: null,     // Domain info discovered from attached code
     lastUpdated: null
 };
+
+/**
+ * Initialize search module with shared state
+ */
+function initializeSearchModule() {
+    searchModule.initialize(
+        codeIndex,
+        trigramIndex,
+        vectorIndex,
+        contextFiles,
+        pathUtils,
+        log,
+        showProgress
+    );
+    const config = vscode.workspace.getConfiguration('astra');
+    searchModule.searchMode = config.get('searchMode', 'detailed');
+    log('Search module initialized, mode:', searchModule.searchMode);
+}
 
 /**
  * Summary Index Configuration
@@ -708,13 +765,21 @@ async function buildCodeIndex(options = {}) {
         log('Trigram indexing error (non-fatal):', err.message);
     }
     
+    // Build fast search indexes
+    try {
+        const searchStats = searchModule.buildSearchIndexes();
+        log('Search indexes built:', JSON.stringify(searchStats));
+    } catch (err) {
+        log('Search index error (non-fatal):', err.message);
+    }
+    
     // Final progress update
     const trigramMsg = stats.trigrams > 0 ? `, ${stats.trigrams} trigrams` : '';
     if (showProgress && chatWebviewView) {
         chatWebviewView.webview.postMessage({
             type: 'indexProgress',
             progress: 100,
-            message: `Index complete: ${stats.files} files, ${stats.symbols} symbols${trigramMsg}`
+            message: `💡 Index complete: ${stats.files} files, ${stats.symbols} symbols${trigramMsg}`
         });
     }
     
@@ -2737,11 +2802,22 @@ ${context}
 ${query}
 
 ## Instructions
-1. Focus on answering the specific question
-2. Reference specific functions, line numbers, and code patterns
-3. If this chunk doesn't fully answer the question, note what's found and what might be missing
-4. Keep your analysis under 1500 words - focus on key insights
-5. Be concise but thorough
+1. Focus on answering the specific question using SOURCE CODE that IMPLEMENTS or DEFINES the functionality
+2. PRIORITIZE: Files that contain actual content or implementation:
+   - Code: .c, .h, .java, .py, .js, .ts, .go, .rs, .cpp, .hpp, .cs, .rb, .php, .swift, .kt, .scala
+   - Data: .csv, .tsv, .xls, .xlsx, .json, .xml
+   - Documents: .pdf, .txt, .doc, .docx
+   - Config with logic: .sql, .sh, .bash, .ps1, .yaml, .yml
+3. **SKIP THESE FILES ENTIRELY** - Do NOT include them in your analysis:
+   - Makefile, GNUmakefile, meson.build, CMakeLists.txt, configure.ac
+   - README, README.md, CHANGELOG, LICENSE
+   - These files only LIST or REFERENCE source files - they contain NO implementation code
+   - Example: If Makefile says "partbounds.o", the implementation is in partbounds.c - analyze partbounds.c, ignore Makefile
+4. If a Makefile mentions "freelist.o", the IMPLEMENTATION is in freelist.c - focus on the .c file
+5. Reference specific functions, line numbers, and code patterns from implementation files
+6. If this chunk doesn't fully answer the question, note what's found and what might be missing
+7. Keep your analysis under 1500 words - focus on key insights
+8. Be concise but thorough
 
 Your analysis:`;
 
@@ -2838,6 +2914,7 @@ ${batchContent}
 5. Organize by topic (e.g., "Parent/Child Relationships", "Catalog Storage", "Key Functions")
 6. Keep technical depth - this is for developers, not executives
 7. Target 2500-3000 words - detail is more important than brevity
+8. **OMIT any analysis of Makefile, meson.build, CMakeLists.txt, README** - these are build files, not implementation
 
 Merged technical summary:`;
 
@@ -2946,6 +3023,10 @@ ${combinedAnalyses}
 3. Provide a coherent, complete answer
 4. Include specific code references (function names, line numbers)
 5. Structure the answer logically (overview first, then details)
+6. FOCUS ON FILES that contain actual content - code (.c, .h, .java, .py, .js, etc.), data (.csv, .xls, .pdf), documents (.txt, .doc), scripts (.sql, .sh)
+7. **NEVER mention or summarize**: Makefile, meson.build, CMakeLists.txt, README files
+   - These are build configuration files that only LIST source files
+   - They contain ZERO implementation code - skip them entirely in your response
 
 Final synthesized answer:`;
 
@@ -9243,16 +9324,57 @@ class ChatViewProvider {
                         break;
                     }
                     
-                    // Build file list from context
+                    // Build file list from context - filter to code files only
+                    const NON_CODE_FILES = new Set([
+                        'makefile', 'gnumakefile', 'readme', 'readme.md', 'readme.txt',
+                        'license', 'license.md', 'license.txt', 'changelog', 'changelog.md',
+                        'contributing', 'contributing.md', 'authors', 'todo', 'todo.md',
+                        '.gitignore', '.gitattributes', '.editorconfig', '.prettierrc',
+                        'package-lock.json', 'yarn.lock', 'poetry.lock', 'pipfile.lock'
+                    ]);
+                    const NON_CODE_EXTENSIONS = new Set([
+                        '.md', '.txt', '.rst', '.json', '.yaml', '.yml', '.toml', '.ini',
+                        '.cfg', '.conf', '.xml', '.html', '.css', '.lock', '.sum'
+                    ]);
+                    const BUILD_FILES = new Set([
+                        'meson.build', 'cmakelists.txt', 'configure.ac', 'configure.in',
+                        'setup.py', 'setup.cfg', 'pyproject.toml', 'cargo.toml',
+                        'build.gradle', 'pom.xml', 'package.json', 'tsconfig.json'
+                    ]);
+                    
                     const docFileList = [];
+                    const buildFiles = [];
+                    
                     for (const [filePath, file] of contextFiles) {
-                        docFileList.push({
-                            name: pathUtils.getFileName(filePath),
-                            path: filePath,
-                            content: file.content,
-                            language: file.language,
-                            size: file.content.length
-                        });
+                        const fileName = pathUtils.getFileName(filePath);
+                        const fileNameLower = fileName.toLowerCase();
+                        const ext = pathUtils.getExtension(filePath).toLowerCase();
+                        
+                        // Categorize files
+                        if (NON_CODE_FILES.has(fileNameLower)) {
+                            // Skip completely (README, LICENSE, etc.)
+                            continue;
+                        } else if (BUILD_FILES.has(fileNameLower)) {
+                            // Track build files separately
+                            buildFiles.push({ name: fileName, path: filePath, content: file.content, language: file.language, size: file.content.length });
+                        } else if (NON_CODE_EXTENSIONS.has(ext) && !BUILD_FILES.has(fileNameLower)) {
+                            // Skip non-code extensions unless they're build files
+                            continue;
+                        } else {
+                            // Include as code file
+                            docFileList.push({
+                                name: fileName,
+                                path: filePath,
+                                content: file.content,
+                                language: file.language,
+                                size: file.content.length
+                            });
+                        }
+                    }
+                    
+                    // If we filtered out everything, include build files
+                    if (docFileList.length === 0 && buildFiles.length > 0) {
+                        docFileList.push(...buildFiles);
                     }
                     
                     const docType = message.docType || 'technical';
@@ -9317,6 +9439,21 @@ class ChatViewProvider {
                         });
                         log('System prompt reset to default');
                     }
+                    break;
+                case 'setSearchMode':
+                    {
+                        const mode = message.mode;
+                        if (mode === 'overview' || mode === 'detailed') {
+                            searchModule.searchMode = mode;
+                            const config = vscode.workspace.getConfiguration('astra');
+                            await config.update('searchMode', mode, vscode.ConfigurationTarget.Global);
+                            log('Search mode set to:', mode);
+                            chatWebviewView?.webview.postMessage({ type: 'searchModeUpdate', mode });
+                        }
+                    }
+                    break;
+                case 'getSearchMode':
+                    chatWebviewView?.webview.postMessage({ type: 'searchModeUpdate', mode: searchModule.searchMode });
                     break;
                 case 'openFile':
                     // Open a file in the editor
@@ -9468,6 +9605,34 @@ class ChatViewProvider {
         .status-indicator.local { background: #4ec9b0; }
         .status-indicator.api { background: #569cd6; }
         .status-indicator.auto { background: #dcdcaa; }
+        
+        .search-mode-toggle {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 8px;
+            background: var(--vscode-editor-background);
+            border-radius: 4px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .search-mode-toggle .toggle-label { font-size: 10px; color: var(--vscode-descriptionForeground); }
+        .search-mode-toggle .toggle-options { display: flex; gap: 2px; }
+        .search-mode-toggle input[type="radio"] { display: none; }
+        .search-mode-toggle .toggle-btn {
+            padding: 3px 8px;
+            font-size: 11px;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .search-mode-toggle input:checked + .toggle-btn {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+        }
+        .search-mode-toggle input:not(:checked) + .toggle-btn {
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+        }
         
         .chat-container {
             flex: 1;
@@ -10266,6 +10431,14 @@ class ChatViewProvider {
         </div>
     </div>
     
+    <div class="search-mode-toggle">
+        <span class="toggle-label">Search:</span>
+        <div class="toggle-options">
+            <label title="Search summaries only"><input type="radio" name="searchMode" value="overview"/><span class="toggle-btn">📋 Overview</span></label>
+            <label title="Search source code"><input type="radio" name="searchMode" value="detailed" checked/><span class="toggle-btn">💻 Code</span></label>
+        </div>
+    </div>
+    
     <div class="system-prompt-section">
         <div class="system-prompt-header" id="systemPromptHeader">
             <div class="system-prompt-title">
@@ -10528,6 +10701,12 @@ Example:
         
         sendBtn.addEventListener('click', sendMessage);
         
+        // Search mode toggle
+        document.querySelectorAll('input[name="searchMode"]').forEach(r => {
+            r.addEventListener('change', e => vscode.postMessage({ type: 'setSearchMode', mode: e.target.value }));
+        });
+        vscode.postMessage({ type: 'getSearchMode' });
+        
         // Cancel button
         document.getElementById('cancelBtn')?.addEventListener('click', () => {
             vscode.postMessage({ type: 'cancelTask' });
@@ -10606,6 +10785,10 @@ Example:
                             systemPromptStatus.classList.remove('saved');
                         }, 2000);
                     }
+                    break;
+                case 'searchModeUpdate':
+                    const modeRadio = document.querySelector(\`input[name="searchMode"][value="\${message.mode}"]\`);
+                    if (modeRadio) modeRadio.checked = true;
                     break;
             }
         });
@@ -11183,79 +11366,84 @@ const AGENT_TOOLS = {
     
     grep_context: {
         name: 'grep_context',
-        description: 'Search for a pattern across all context files, returns matching lines with surrounding context',
+        description: 'Search for a pattern across all context files using trigram index (fast). Returns matching lines with context.',
         parameters: { pattern: 'string', caseSensitive: 'boolean?', contextLines: 'number?' },
         execute: async (params) => {
             const { pattern, caseSensitive = false, contextLines = 5 } = params;
+            log('grep_context: Searching for:', pattern);
+            
+            // Try fast trigram search first (uses trigramIndex from extension.js, not symbolTrigramIndex)
+            if (pattern.length >= 3 && trigramIndex?.index?.size > 0) {
+                try {
+                    const matches = searchModule.findTextInCode(pattern, { caseSensitive, maxResults: 100 });
+                    const results = [];
+                    const seen = new Set();
+                    
+                    for (const m of matches) {
+                        const key = `${m.file}:${Math.floor(m.line / contextLines)}`;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        const block = searchModule.getCodeBlockForMatch(m.file, m.line, { contextLines });
+                        results.push({ fileName: m.fileName, startLine: block.startLine, endLine: block.endLine, matchCount: 1, content: block.code });
+                    }
+                    log('grep_context: Trigram found', results.length, 'blocks');
+                    return { success: true, data: { results, count: results.length, totalMatches: matches.length, method: 'trigram' } };
+                } catch (e) { log('grep_context: Trigram failed, fallback:', e.message); }
+            }
+            
+            // Fallback: linear scan
             const results = [];
             const regex = new RegExp(pattern, caseSensitive ? 'g' : 'gi');
-            
-            log('grep_context: Searching for pattern:', pattern);
-            log('grep_context: Context lines:', contextLines);
-            
             for (const [path, file] of contextFiles) {
                 const fileName = path.split('/').pop();
                 const lines = file.content.split('\n');
                 const matchedLineNums = new Set();
-                
-                // Find all matching line numbers
-                lines.forEach((line, idx) => {
-                    // Reset regex lastIndex for each test
-                    regex.lastIndex = 0;
-                    if (regex.test(line)) {
-                        matchedLineNums.add(idx);
-                    }
-                });
-                
-                log('grep_context:', fileName, '- found', matchedLineNums.size, 'matches');
-                
-                // Group matches that are close together
+                lines.forEach((line, idx) => { regex.lastIndex = 0; if (regex.test(line)) matchedLineNums.add(idx); });
                 if (matchedLineNums.size > 0) {
-                    const sortedMatches = Array.from(matchedLineNums).sort((a, b) => a - b);
-                    
-                    // Create ranges with context
-                    let ranges = [];
-                    let currentRange = null;
-                    
-                    for (const lineNum of sortedMatches) {
-                        const start = Math.max(0, lineNum - contextLines);
-                        const end = Math.min(lines.length - 1, lineNum + contextLines);
-                        
-                        if (currentRange && start <= currentRange.end + 2) {
-                            // Merge with current range
-                            currentRange.end = end;
-                            currentRange.matchLines.push(lineNum);
-                        } else {
-                            // Start new range
-                            if (currentRange) ranges.push(currentRange);
-                            currentRange = { start, end, matchLines: [lineNum] };
-                        }
+                    const sorted = Array.from(matchedLineNums).sort((a, b) => a - b);
+                    let ranges = [], cur = null;
+                    for (const ln of sorted) {
+                        const s = Math.max(0, ln - contextLines), e = Math.min(lines.length - 1, ln + contextLines);
+                        if (cur && s <= cur.end + 2) { cur.end = e; cur.matchLines.push(ln); }
+                        else { if (cur) ranges.push(cur); cur = { start: s, end: e, matchLines: [ln] }; }
                     }
-                    if (currentRange) ranges.push(currentRange);
-                    
-                    // Extract code blocks with context
-                    for (const range of ranges) {
-                        const codeBlock = lines.slice(range.start, range.end + 1)
-                            .map((line, i) => {
-                                const actualLineNum = range.start + i + 1;
-                                const isMatch = range.matchLines.includes(range.start + i);
-                                return `${actualLineNum.toString().padStart(4)}: ${isMatch ? '>>> ' : '    '}${line}`;
-                            })
-                            .join('\n');
-                        
-                        results.push({
-                            fileName,
-                            startLine: range.start + 1,
-                            endLine: range.end + 1,
-                            matchCount: range.matchLines.length,
-                            content: codeBlock
-                        });
+                    if (cur) ranges.push(cur);
+                    for (const r of ranges) {
+                        const code = lines.slice(r.start, r.end + 1).map((l, i) => {
+                            const n = r.start + i + 1, isM = r.matchLines.includes(r.start + i);
+                            return `${n.toString().padStart(4)}: ${isM ? '>>> ' : '    '}${l}`;
+                        }).join('\n');
+                        results.push({ fileName, startLine: r.start + 1, endLine: r.end + 1, matchCount: r.matchLines.length, content: code });
                     }
                 }
             }
-            
-            log('grep_context: Total result blocks:', results.length);
-            return { success: true, data: { results, count: results.length, totalMatches: results.reduce((s, r) => s + r.matchCount, 0) } };
+            log('grep_context: Linear found', results.length, 'blocks');
+            return { success: true, data: { results, count: results.length, totalMatches: results.reduce((s, r) => s + r.matchCount, 0), method: 'linear' } };
+        }
+    },
+    
+    // === CALL GRAPH SEARCH ===
+    search_calls: {
+        name: 'search_calls',
+        description: 'Search call relationships - who calls a function or what it calls.',
+        parameters: { function: 'string', direction: 'string?' },
+        execute: async (params) => {
+            const { function: fn, direction = 'both' } = params;
+            log('search_calls:', fn, direction);
+            try {
+                let result = {};
+                if (direction === 'callers' || direction === 'both') {
+                    const r = searchModule.searchWhoCallsFunction(fn);
+                    result.function = r.function; result.callers = r.callers;
+                }
+                if (direction === 'callees' || direction === 'both') {
+                    const r = searchModule.searchWhatFunctionCalls(fn);
+                    if (!result.function) result.function = r.function;
+                    result.callees = r.callees;
+                }
+                if (!result.function) return { success: false, error: `Function "${fn}" not found` };
+                return { success: true, data: result };
+            } catch (e) { return { success: false, error: e.message }; }
         }
     },
     
@@ -14769,11 +14957,16 @@ CRITICAL RULES:
 3. Extract ACTUAL data from the findings - DO NOT invent or hallucinate function names, line numbers, or file names
 4. NEVER fabricate an "entry_point" - only include it if the findings clearly identify a main entry function. If unsure, set entry_point to null
 5. Include at least 3-5 items in key_files, key_functions, and code_flow - but ONLY from data actually present in the findings
-6. For key_files: PRIORITIZE files whose names contain the query topic (e.g., for "partitioning", include partdesc.c, partbounds.c, partprune.c BEFORE generic files)
-7. For key_files: Include BOTH implementation files (.c/.cpp/.java) AND header files (.h/.hpp) when relevant
-8. If a field has no data, use empty array [] or null for entry_point
-9. Do NOT wrap JSON in \`\`\` code fences
-10. For architectural questions about "how X is implemented", there may be MULTIPLE entry points or NO single entry point - this is normal. Don't invent a "main_X_function()" that doesn't exist.
+6. For key_files: ONLY include files that IMPLEMENT or DEFINE functionality:
+   - INCLUDE: Files with actual content - code (.c, .cpp, .h, .java, .py, .js, .ts, .go, .rs, .cs, .rb, .php), data (.csv, .tsv, .xls, .xlsx, .json, .xml), documents (.pdf, .txt, .doc, .docx), scripts (.sql, .sh, .bash, .yaml)
+   - **NEVER INCLUDE**: Makefile, meson.build, CMakeLists.txt, README, .md, configure.ac - these only LIST source files, they have NO implementation
+   - If you see "Makefile" in the findings, SKIP IT - do not add it to key_files
+   - If Makefile mentions "freelist.o", the implementation is in freelist.c - include freelist.c, NOT Makefile
+7. For key_files: PRIORITIZE files whose names contain the query topic (e.g., for "partitioning", include partdesc.c, partbounds.c BEFORE generic files)
+8. For key_files: Include BOTH implementation files (.c/.cpp/.java) AND header files (.h/.hpp) when relevant
+9. If a field has no data, use empty array [] or null for entry_point
+10. Do NOT wrap JSON in \`\`\` code fences
+11. For architectural questions about "how X is implemented", there may be MULTIPLE entry points or NO single entry point - this is normal. Don't invent a "main_X_function()" that doesn't exist.
 
 BEGIN JSON OUTPUT:`;
 
@@ -15037,7 +15230,14 @@ function formatFactsToTemplate(facts, subQuestions, relatedFiles, functionsFound
     output += `| File | Purpose | Key Functions |\n`;
     output += `|:-----|:--------|:--------------|\n`;
     if (facts.key_files && facts.key_files.length > 0) {
-        facts.key_files.slice(0, 10).forEach(f => {
+        // Filter out build/config files that shouldn't be in key_files
+        const BUILD_FILES_PATTERN = /^(makefile|gnumakefile|meson\.build|cmakelists\.txt|readme|readme\.md|changelog|license|configure\.ac|configure\.in)$/i;
+        const filteredFiles = facts.key_files.filter(f => {
+            const fileName = cleanFileName(f.file || '').toLowerCase();
+            return !BUILD_FILES_PATTERN.test(fileName);
+        });
+        
+        (filteredFiles.length > 0 ? filteredFiles : facts.key_files).slice(0, 10).forEach(f => {
             const funcs = f.functions?.slice(0, 4).map(fn => `\`${fn}()\``).join(', ') || '-';
             const rawFile = f.file || 'unknown';
             const file = cleanFileName(rawFile);
@@ -18360,7 +18560,7 @@ async function generateBusinessDocumentation(fileList, query) {
 }
 
 /**
- * Generate Technical Documentation (original behavior)
+ * Generate Technical Documentation (enhanced with Summary, Entry Points, Data Structures, Call Graph)
  */
 async function generateTechnicalDocumentation(fileList, query) {
     
@@ -18371,79 +18571,247 @@ async function generateTechnicalDocumentation(fileList, query) {
     
     log('Project name:', projectName, '| Output file:', fileName);
     
+    // Filter out build files for analysis (but keep them in fileList for reference)
+    const BUILD_FILES_PATTERN = /^(makefile|gnumakefile|meson\.build|cmakelists\.txt|readme|readme\.md|changelog|license|configure\.ac)$/i;
+    const codeFiles = fileList.filter(f => !BUILD_FILES_PATTERN.test(f.name.toLowerCase()));
+    
     // Start building the documentation
     let documentation = `# ${projectName} Documentation
 
 > Generated by AstraCode
 > Date: ${new Date().toLocaleDateString()}
-> Files analyzed: ${fileList.length}
+> Files analyzed: ${fileList.length} (${codeFiles.length} code files)
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [Module Reference](#module-reference)
-${fileList.map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()})`).join('\n')}
-4. [Data Flow](#data-flow)
-5. [Dependencies](#dependencies)
+1. [Executive Summary](#executive-summary)
+2. [Entry Points](#entry-points)
+3. [Key Data Structures](#key-data-structures)
+4. [Call Graph](#call-graph)
+5. [Architecture](#architecture)
+6. [Module Reference](#module-reference)
+${codeFiles.slice(0, 20).map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-').toLowerCase()})`).join('\n')}
+7. [Data Flow](#data-flow)
+8. [Dependencies](#dependencies)
 
 ---
-
-## Overview
 
 `;
 
     // Show progress
     chatWebviewView?.webview.postMessage({ 
         type: 'appendResponse', 
-        text: `📄 **Generating Documentation**\n\nProject: **${projectName}**\nFiles: ${fileList.length}\n\n---\n\n`
+        text: `📄 **Generating Documentation**\n\nProject: **${projectName}**\nFiles: ${fileList.length} (${codeFiles.length} code files)\n\n---\n\n`
     });
 
-    // Generate overview first
+    // ================================================================
+    // SECTION 1: EXECUTIVE SUMMARY
+    // ================================================================
     chatWebviewView?.webview.postMessage({ 
         type: 'appendResponse', 
-        text: `⏳ Generating project overview...\n\n`
+        text: `⏳ Generating executive summary...\n\n`
     });
 
-    const overviewPrompt = buildOverviewPrompt(fileList);
-    const overview = await callLanguageModelForDoc(overviewPrompt);
-    if (overview.error) {
-        log('Overview generation failed:', overview.error);
-        // Fallback: Generate overview from code index
-        chatWebviewView?.webview.postMessage({ 
-            type: 'appendResponse', 
-            text: `⚠️ LLM unavailable, generating from code index...\n\n`
-        });
-        documentation += generateIndexBasedOverview(fileList) + '\n\n---\n\n';
-    } else {
-        documentation += overview.text + '\n\n---\n\n';
-    }
+    documentation += `## Executive Summary\n\n`;
+    
+    const summaryPrompt = `Analyze these code files and provide an EXECUTIVE SUMMARY for developers.
 
-    // Generate architecture section
+FILES:
+${codeFiles.slice(0, 15).map(f => `- ${f.name}`).join('\n')}
+
+CODE INDEX (functions found):
+${Array.from(codeIndex.symbols.entries())
+    .filter(([k, s]) => k.includes('@') && codeFiles.some(f => s.file?.includes(f.name)))
+    .slice(0, 50)
+    .map(([k, s]) => `- ${s.name} (${s.type}) in ${pathUtils.getFileName(s.file)}:${s.line}`)
+    .join('\n')}
+
+Write a 3-5 paragraph technical summary that covers:
+1. **Purpose**: What does this code do? What problem does it solve?
+2. **Core Mechanism**: How does it work at a high level? What's the main algorithm or approach?
+3. **Key Components**: What are the main modules/files and their responsibilities?
+4. **Data Flow**: How does data move through the system?
+5. **Developer Notes**: What should a developer understand before modifying this code?
+
+Be specific and technical. Reference actual function names and file names from the code.`;
+
+    const summary = await callLanguageModelForDoc(summaryPrompt);
+    if (summary.error) {
+        documentation += generateIndexBasedOverview(fileList) + '\n\n';
+    } else {
+        documentation += summary.text + '\n\n';
+    }
+    documentation += `---\n\n`;
+
+    // ================================================================
+    // SECTION 2: ENTRY POINTS
+    // ================================================================
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Identifying entry points...\n\n`
+    });
+
+    documentation += `## Entry Points\n\n`;
+    documentation += `These are the main functions where execution begins or external calls enter the module:\n\n`;
+    documentation += `| Function | File | Line | Purpose |\n`;
+    documentation += `|:---------|:-----|:-----|:--------|\n`;
+
+    // Find entry points from code index - functions that are called but don't call others much,
+    // or have names suggesting entry points
+    const entryPointPatterns = /^(main|init|start|create|transform|parse|handle|process|execute|run)/i;
+    const entryPoints = [];
+    
+    for (const [key, symbol] of codeIndex.symbols) {
+        if (!key.includes('@')) continue;
+        if (!codeFiles.some(f => symbol.file?.includes(f.name))) continue;
+        if (!['function', 'procedure', 'method'].includes(symbol.type)) continue;
+        
+        const callers = codeIndex.reverseCallGraph.get(symbol.name);
+        const callees = codeIndex.callGraph.get(symbol.name);
+        const callerCount = callers?.size || 0;
+        const calleeCount = callees?.size || 0;
+        
+        // Entry point heuristics: called by others but also calls many others (orchestrator)
+        // OR has entry-point-like name
+        if ((callerCount > 0 && calleeCount >= 3) || entryPointPatterns.test(symbol.name)) {
+            entryPoints.push({
+                name: symbol.name,
+                file: pathUtils.getFileName(symbol.file),
+                line: symbol.line,
+                callers: callerCount,
+                callees: calleeCount
+            });
+        }
+    }
+    
+    // Sort by callees (most connected first) and take top 10
+    entryPoints.sort((a, b) => b.callees - a.callees);
+    
+    if (entryPoints.length > 0) {
+        for (const ep of entryPoints.slice(0, 10)) {
+            documentation += `| \`${ep.name}()\` | ${ep.file} | ${ep.line} | Called by ${ep.callers}, calls ${ep.callees} functions |\n`;
+        }
+    } else {
+        documentation += `| - | No clear entry points identified | - | - |\n`;
+    }
+    documentation += `\n---\n\n`;
+
+    // ================================================================
+    // SECTION 3: KEY DATA STRUCTURES
+    // ================================================================
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Extracting key data structures...\n\n`
+    });
+
+    documentation += `## Key Data Structures\n\n`;
+    documentation += `| Structure | File | Line | Type |\n`;
+    documentation += `|:----------|:-----|:-----|:-----|\n`;
+
+    const dataStructures = [];
+    for (const [key, symbol] of codeIndex.symbols) {
+        if (!key.includes('@')) continue;
+        if (!codeFiles.some(f => symbol.file?.includes(f.name))) continue;
+        if (!['struct', 'class', 'type', 'typedef', 'enum'].includes(symbol.type)) continue;
+        
+        dataStructures.push({
+            name: symbol.name,
+            file: pathUtils.getFileName(symbol.file),
+            line: symbol.line,
+            type: symbol.type
+        });
+    }
+    
+    if (dataStructures.length > 0) {
+        for (const ds of dataStructures.slice(0, 15)) {
+            documentation += `| \`${ds.name}\` | ${ds.file} | ${ds.line} | ${ds.type} |\n`;
+        }
+    } else {
+        documentation += `| - | No structures found in code index | - | - |\n`;
+    }
+    documentation += `\n---\n\n`;
+
+    // ================================================================
+    // SECTION 4: CALL GRAPH (2 levels)
+    // ================================================================
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `⏳ Building call graph (2 levels)...\n\n`
+    });
+
+    documentation += `## Call Graph\n\n`;
+    documentation += `This shows the call relationships between functions (2 levels deep):\n\n`;
+    documentation += `\`\`\`\n`;
+
+    // Build call graph for top entry points
+    const graphEntries = entryPoints.slice(0, 5);
+    if (graphEntries.length > 0) {
+        for (const ep of graphEntries) {
+            documentation += `${ep.name}()\n`;
+            const callees = codeIndex.callGraph.get(ep.name);
+            if (callees && callees.size > 0) {
+                const calleeArray = Array.from(callees).slice(0, 8);
+                calleeArray.forEach((callee, idx) => {
+                    const isLast = idx === calleeArray.length - 1;
+                    const prefix = isLast ? '└──' : '├──';
+                    documentation += `  ${prefix} ${callee}()\n`;
+                    
+                    // Level 2: What does this callee call?
+                    const level2Callees = codeIndex.callGraph.get(callee);
+                    if (level2Callees && level2Callees.size > 0) {
+                        const l2Array = Array.from(level2Callees).slice(0, 4);
+                        l2Array.forEach((l2, l2idx) => {
+                            const l2IsLast = l2idx === l2Array.length - 1;
+                            const l2Prefix = isLast ? '    ' : '│   ';
+                            const l2Arrow = l2IsLast ? '└──' : '├──';
+                            documentation += `  ${l2Prefix}${l2Arrow} ${l2}()\n`;
+                        });
+                        if (level2Callees.size > 4) {
+                            const l2Prefix = isLast ? '    ' : '│   ';
+                            documentation += `  ${l2Prefix}    ... +${level2Callees.size - 4} more\n`;
+                        }
+                    }
+                });
+                if (callees.size > 8) {
+                    documentation += `  ... +${callees.size - 8} more callees\n`;
+                }
+            }
+            documentation += `\n`;
+        }
+    } else {
+        documentation += `No call graph data available. Rebuild index to generate call relationships.\n`;
+    }
+    documentation += `\`\`\`\n\n---\n\n`;
+
+    // ================================================================
+    // SECTION 5: ARCHITECTURE (LLM-generated)
+    // ================================================================
     chatWebviewView?.webview.postMessage({ 
         type: 'appendResponse', 
         text: `⏳ Analyzing architecture...\n\n`
     });
 
-    const archPrompt = buildArchitecturePrompt(fileList);
+    const archPrompt = buildArchitecturePrompt(codeFiles);
     const architecture = await callLanguageModelForDoc(archPrompt);
     if (architecture.error) {
-        // Fallback: Generate architecture from code index
         documentation += generateIndexBasedArchitecture(fileList) + '\n\n---\n\n';
     } else {
         documentation += `## Architecture\n\n${architecture.text}\n\n---\n\n`;
     }
 
-    // Generate documentation for each file
+    // ================================================================
+    // SECTION 6: MODULE REFERENCE (file-by-file)
+    // ================================================================
     documentation += `## Module Reference\n\n`;
     
-    for (let i = 0; i < fileList.length; i++) {
-        const file = fileList[i];
+    // Only document code files, not build files
+    for (let i = 0; i < codeFiles.length; i++) {
+        const file = codeFiles[i];
         const fileContent = contextFiles.get(file.path)?.content || '';
         
-        log(`Documenting file ${i + 1}/${fileList.length}: ${file.name} (${fileContent.length} chars)`);
+        log(`Documenting file ${i + 1}/${codeFiles.length}: ${file.name} (${fileContent.length} chars)`);
         
         if (fileContent.length === 0) {
             log('WARNING: Empty content for file:', file.path);
@@ -18453,7 +18821,7 @@ ${fileList.map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-')
         
         chatWebviewView?.webview.postMessage({ 
             type: 'appendResponse', 
-            text: `⏳ Documenting ${file.name} (${i + 1}/${fileList.length})...\n`
+            text: `⏳ Documenting ${file.name} (${i + 1}/${codeFiles.length})...\n`
         });
 
         const filePrompt = buildFileDocPrompt(file.name, fileContent);
@@ -18464,7 +18832,6 @@ ${fileList.map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-')
         documentation += `### ${file.name}\n\n`;
         if (fileDoc.error) {
             log('File doc error:', fileDoc.error, '- using fallback');
-            // Fallback: Generate file doc from code index
             documentation += generateIndexBasedFileDoc(file.path, file.name) + '\n\n---\n\n';
         } else {
             log('File doc success, length:', fileDoc.text?.length || 0);
@@ -18472,31 +18839,33 @@ ${fileList.map((f, i) => `   - [${f.name}](#${f.name.replace(/[^a-z0-9]/gi, '-')
         }
     }
 
-    // Generate data flow section
+    // ================================================================
+    // SECTION 7: DATA FLOW
+    // ================================================================
     chatWebviewView?.webview.postMessage({ 
         type: 'appendResponse', 
         text: `⏳ Analyzing data flow...\n\n`
     });
 
-    const dataFlowPrompt = buildDataFlowPrompt(fileList);
+    const dataFlowPrompt = buildDataFlowPrompt(codeFiles);
     const dataFlow = await callLanguageModelForDoc(dataFlowPrompt);
     if (dataFlow.error) {
-        // Fallback: Generate data flow from code index
         documentation += generateIndexBasedDataFlow(fileList) + '\n\n---\n\n';
     } else {
         documentation += `## Data Flow\n\n${dataFlow.text}\n\n---\n\n`;
     }
 
-    // Generate dependencies section
+    // ================================================================
+    // SECTION 8: DEPENDENCIES
+    // ================================================================
     chatWebviewView?.webview.postMessage({ 
         type: 'appendResponse', 
         text: `⏳ Mapping dependencies...\n\n`
     });
 
-    const depsPrompt = buildDependenciesPrompt(fileList);
+    const depsPrompt = buildDependenciesPrompt(codeFiles);
     const dependencies = await callLanguageModelForDoc(depsPrompt);
     if (dependencies.error) {
-        // Fallback: Generate dependencies from code index
         documentation += generateIndexBasedDependencies(fileList) + '\n\n';
     } else {
         documentation += `## Dependencies\n\n${dependencies.text}\n\n`;
@@ -21257,6 +21626,8 @@ function updateChatStatusUI() {
     
     // Include index stats in status (compact format)
     let indexInfo = '';
+    let indexReady = false;
+    
     if (codeIndex.symbols.size > 0) {
         const callableCount = codeIndex.callGraph.size;
         const summaryCount = codeIndex.summaries.size;
@@ -21274,13 +21645,20 @@ function updateChatStatusUI() {
         if (summaryCount > 0) {
             indexInfo += ` • ${summaryCount} sum`;
         }
+        
+        // Index is ready when we have symbols AND trigrams
+        indexReady = codeIndex.symbols.size > 0 && trigramCount > 0;
     }
+    
+    // Add light bulb when index is ready 💡
+    const statusIndicator = indexReady ? '💡 ' : '';
     
     chatWebviewView?.webview.postMessage({
         type: 'updateStatus',
         mode: currentMode,
-        text: modeText[currentMode] + (fileCount > 0 ? ` • ${fileCount} files${indexInfo}` : ''),
-        files: files
+        text: statusIndicator + modeText[currentMode] + (fileCount > 0 ? ` • ${fileCount} files${indexInfo}` : ''),
+        files: files,
+        indexReady: indexReady
     });
 }
 
@@ -21741,7 +22119,10 @@ let contextTreeProvider;
 
 function activate(context) {
     outputChannel = vscode.window.createOutputChannel('AstraCode');
-    log('AstraCode v4.9.80 activating...');
+    log('AstraCode v5.0.0 activating...');
+    
+    // Initialize search module
+    initializeSearchModule();
     
     // Create status bar item for summary progress
     summaryStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
@@ -21877,6 +22258,9 @@ function activate(context) {
             
             // Clear vector index
             await clearVectorIndex();
+            
+            // Clear search indexes
+            searchModule.clearSearchIndexes();
             
             updateChatStatusUI();
             vscode.window.showInformationMessage('All indexes cleared (symbol + vector + domain)');
@@ -22247,6 +22631,9 @@ function deactivate() {
     codeIndex.fileSummaries.clear();
     codeIndex.overallSummary = null;
     chatHistory = [];
+    
+    // Clear search indexes
+    searchModule.clearSearchIndexes();
     
     log('AstraCode deactivated');
 }
