@@ -1,6 +1,6 @@
 /**
- * AstraCode Search Module v5.0
- * Modular search with Overview/Detailed modes and O(1) indexes
+ * AstraCode Search Module v5.1
+ * Modular search with Overview/Detailed modes, O(1) indexes, and optional vector (semantic) search
  */
 
 // All callable types across languages (matches generateCodeSummaries in extension.js)
@@ -274,6 +274,39 @@ function findModulesByPattern(pattern, options = {}) {
     return results;
 }
 
+// New: Vector-based symbol search
+function cosineSimilarity(vecA, vecB) {
+    if (vecA.length !== vecB.length) return 0;
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < vecA.length; i++) {
+        dot += vecA[i] * vecB[i];
+        normA += vecA[i] * vecA[i];
+        normB += vecB[i] * vecB[i];
+    }
+    if (normA === 0 || normB === 0) return 0;
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+function findSymbolsByVector(queryVector, options = {}) {
+    const { maxResults = 50, minSimilarity = 0.35 } = options;
+    if (!vectorIndex || vectorIndex.size === 0 || !Array.isArray(queryVector) || queryVector.length === 0) return [];
+
+    const results = [];
+    for (const [key, vec] of vectorIndex) {
+        if (!Array.isArray(vec)) continue;
+        const symbol = lookupSymbolByKey(key);
+        if (!symbol || !key.includes('@')) continue;
+
+        const similarity = cosineSimilarity(queryVector, vec);
+        if (similarity >= minSimilarity) {
+            results.push({ ...symbol, key, matchScore: Math.round(similarity * 100) });
+        }
+    }
+
+    results.sort((a, b) => b.matchScore - a.matchScore);
+    return results.slice(0, maxResults);
+}
+
 // Layer 3: Get Functions
 function getCodeLines(filePath, startLine, endLine) {
     const file = contextFiles.get(filePath);
@@ -411,7 +444,7 @@ function searchModuleOverview(moduleName) {
 }
 
 // Layer 6: Orchestrators
-function executeOverviewSearch(query) {
+function executeOverviewSearch(query, options = {}) {
     const terms = extractSearchTerms(query);
     const results = { type: 'overview', modules: [], files: [], functions: [], callFlows: [] };
     
@@ -433,6 +466,22 @@ function executeOverviewSearch(query) {
     }
     results.functions = results.functions.slice(0, 30);
     
+    // Add semantically similar functions if queryVector provided
+    if (options.queryVector) {
+        const vectorSyms = findSymbolsByVector(options.queryVector, { maxResults: 40, minSimilarity: 0.35 });
+        const existingNames = new Set(results.functions.map(f => f.name));
+        for (const vsym of vectorSyms) {
+            if (CALLABLE_TYPES.has(vsym.type)) {
+                const info = codeIndex.summaries.get(vsym.key);
+                if (info && !existingNames.has(info.name)) {
+                    results.functions.push(info);
+                    existingNames.add(info.name);
+                }
+            }
+        }
+        results.functions = results.functions.slice(0, 30); // re-cap
+    }
+    
     for (const fn of results.functions.slice(0, 5)) {
         const callers = lookupCallers(fn.name), callees = lookupCallees(fn.name);
         if (callers.length || callees.length) results.callFlows.push({ name: fn.name, callers, callees });
@@ -441,7 +490,7 @@ function executeOverviewSearch(query) {
     return { ...results, context: formatOverviewResults(results) };
 }
 
-function executeDetailedSearch(query) {
+function executeDetailedSearch(query, options = {}) {
     const terms = extractSearchTerms(query);
     const results = { type: 'detailed', symbols: [], codeBlocks: [], callTraces: [] };
     
@@ -458,6 +507,27 @@ function executeDetailedSearch(query) {
             }
         }
     }
+    
+    // Merge with vector results and sort by relevance
+    const symMap = new Map();
+    for (const sym of results.symbols) {
+        const score = sym.matchScore || 80;
+        symMap.set(sym.key, { ...sym, matchScore: score });
+    }
+    
+    if (options.queryVector) {
+        const vectorSyms = findSymbolsByVector(options.queryVector, { maxResults: 60, minSimilarity: 0.35 });
+        for (const vsym of vectorSyms) {
+            const existing = symMap.get(vsym.key);
+            const newScore = vsym.matchScore;
+            if (!existing || newScore > (existing.matchScore || 0)) {
+                symMap.set(vsym.key, vsym);
+            }
+        }
+    }
+    
+    results.symbols = Array.from(symMap.values())
+        .sort((a, b) => (b.matchScore || 80) - (a.matchScore || 80));
     
     const seen = new Set();
     for (const sym of results.symbols.slice(0, 20)) {
@@ -481,7 +551,7 @@ function executeDetailedSearch(query) {
 async function executeSearch(query, options = {}) {
     const mode = options.mode || searchMode;
     const start = Date.now();
-    const results = mode === 'overview' ? executeOverviewSearch(query) : executeDetailedSearch(query);
+    const results = mode === 'overview' ? executeOverviewSearch(query, options) : executeDetailedSearch(query, options);
     results.elapsed = Date.now() - start;
     results.mode = mode;
     return results;
@@ -593,6 +663,7 @@ module.exports = {
     lookupSymbolByKey, lookupSymbolsByName, lookupFilesByName, lookupFilesByExtension,
     lookupFilesInDirectory, lookupCallers, lookupCallees, lookupFunctionSummary, lookupFileSummary, lookupModuleSummary,
     findSymbolsByPattern, findSymbolsByType, findFilesByPattern, findTextInCode, findModulesByPattern,
+    findSymbolsByVector,
     getCodeLines, getCodeBlockForSymbol, getCodeBlockForMatch, getSymbolsInFile,
     traceCallersOf, traceCalleesOf,
     searchWhereIsDefined, searchWhoCallsFunction, searchWhatFunctionCalls, searchTextInCode, searchModuleOverview,
