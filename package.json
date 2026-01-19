@@ -2,59 +2,303 @@
   "name": "astracode",
   "displayName": "AstraCode",
   "description": "AI-powered code analysis for legacy system modernization",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "publisher": "astracode",
-  "engines": { "vscode": "^1.80.0" },
-  "categories": ["Programming Languages", "Machine Learning"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning"
+  ],
+  "activationEvents": [
+    "onView:astra.chatView",
+    "onView:astra.contextView",
+    "onCommand:astra.addToContext"
+  ],
   "main": "./extension.js",
   "contributes": {
     "viewsContainers": {
-      "activitybar": [{ "id": "astra-sidebar", "title": "AstraCode", "icon": "$(star-full)" }]
+      "activitybar": [
+        {
+          "id": "astra-sidebar",
+          "title": "AstraCode",
+          "icon": "$(star-full)"
+        }
+      ]
     },
     "views": {
       "astra-sidebar": [
-        { "type": "webview", "id": "astra.chatView", "name": "Chat" },
-        { "id": "astra.contextView", "name": "Context Files" }
+        {
+          "type": "webview",
+          "id": "astra.chatView",
+          "name": "Chat"
+        },
+        {
+          "id": "astra.contextView",
+          "name": "Context Files"
+        }
       ]
     },
     "commands": [
-      { "command": "astra.addToContext", "title": "Add to AstraCode Context" },
-      { "command": "astra.clearContext", "title": "Clear AstraCode Context" },
-      { "command": "astra.showCallGraph", "title": "AstraCode: Show Call Graph" },
-      { "command": "astra.showIndexStats", "title": "AstraCode: Show Index Statistics" },
-      { "command": "astra.clearIndex", "title": "AstraCode: Clear All Indexes" },
-      { "command": "astra.rebuildIndex", "title": "AstraCode: Rebuild All Indexes" },
-      { "command": "astra.semanticSearch", "title": "AstraCode: Semantic Search" }
+      {
+        "command": "astra.addToContext",
+        "title": "Add to AstraCode Context"
+      },
+      {
+        "command": "astra.clearContext",
+        "title": "Clear AstraCode Context"
+      },
+      {
+        "command": "astra.showCallGraph",
+        "title": "AstraCode: Show Call Graph"
+      },
+      {
+        "command": "astra.showIndexStats",
+        "title": "AstraCode: Show Index Statistics"
+      },
+      {
+        "command": "astra.clearIndex",
+        "title": "AstraCode: Clear All Indexes"
+      },
+      {
+        "command": "astra.rebuildIndex",
+        "title": "AstraCode: Rebuild All Indexes"
+      },
+      {
+        "command": "astra.semanticSearch",
+        "title": "AstraCode: Semantic Search"
+      },
+      {
+        "command": "astra.toggleVerbose",
+        "title": "AstraCode: Toggle Verbose Search"
+      },
+      {
+        "command": "astra.toggleMode",
+        "title": "AstraCode: Toggle Mode (Auto/Local/API)"
+      },
+      {
+        "command": "astra.exportState",
+        "title": "AstraCode: Export State"
+      },
+      {
+        "command": "astra.showConfig",
+        "title": "AstraCode: Show Configuration"
+      }
     ],
     "menus": {
-      "explorer/context": [{ "command": "astra.addToContext", "group": "navigation" }],
-      "editor/context": [{ "command": "astra.addToContext", "group": "navigation" }]
+      "explorer/context": [
+        {
+          "command": "astra.addToContext",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "astra.addToContext",
+          "group": "navigation"
+        }
+      ]
     },
     "configuration": {
       "title": "AstraCode",
       "properties": {
         "astra.mode": {
-          "type": "string", "default": "auto",
-          "enum": ["auto", "local", "api"],
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "local",
+            "api"
+          ],
+          "enumDescriptions": [
+            "Automatically select best available provider",
+            "Use local/Copilot models only",
+            "Use direct API access only"
+          ],
           "description": "Model selection mode"
         },
         "astra.searchMode": {
-          "type": "string", "default": "detailed",
-          "enum": ["overview", "detailed"],
-          "enumDescriptions": ["Search summaries only", "Search source code"],
+          "type": "string",
+          "default": "detailed",
+          "enum": [
+            "overview",
+            "detailed"
+          ],
+          "enumDescriptions": [
+            "Search summaries only (faster, high-level)",
+            "Search source code (thorough, slower)"
+          ],
           "description": "Default search mode"
         },
-        "astra.copilotModel": { "type": "string", "default": "", "description": "Preferred Copilot model ID" },
-        "astra.apiProvider": { "type": "string", "default": "anthropic", "enum": ["anthropic", "openai"] },
-        "astra.apiKey": { "type": "string", "default": "" },
-        "astra.apiModel": { "type": "string", "default": "claude-sonnet-4-20250514" },
-        "astra.systemPrompt": { "type": "string", "default": "", "editPresentation": "multilineText" },
-        "astra.debugMode": { "type": "boolean", "default": false },
-        "astra.indexing.enableAutoSummary": { "type": "boolean", "default": true },
-        "astra.agent.enableJudge": { "type": "boolean", "default": true },
-        "astra.agent.maxIterations": { "type": "number", "default": 10, "minimum": 1, "maximum": 25 }
+        "astra.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "description": "Custom system prompt (leave empty for default)"
+        },
+        "astra.debugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug logging in chat panel"
+        },
+        "astra.agent.enableJudge": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable judge LLM to validate answers"
+        },
+        "astra.agent.maxIterations": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 25,
+          "description": "Maximum agent iterations per query"
+        },
+        "astra.agent.verboseSearch": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show detailed search progress in chat"
+        },
+        "astra.agent.maxChunks": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum code chunks to analyze per query"
+        },
+        "astra.agent.maxBatchSize": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Batch size for hierarchical merge"
+        },
+        "astra.indexing.enableAutoSummary": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-generate function summaries during indexing"
+        },
+        "astra.indexing.batchSize": {
+          "type": "number",
+          "default": 50,
+          "minimum": 10,
+          "maximum": 200,
+          "description": "Files per indexing batch"
+        },
+        "astra.indexing.maxFilesForFullIndex": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 100,
+          "maximum": 10000,
+          "description": "Above this, use lightweight indexing"
+        },
+        "astra.summary.contextWindowLimit": {
+          "type": "number",
+          "default": 18000,
+          "minimum": 5000,
+          "maximum": 100000,
+          "description": "Maximum context size for LLM queries (chars)"
+        },
+        "astra.summary.chunkSizeForQuery": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 2000,
+          "maximum": 50000,
+          "description": "Chunk size for detailed queries (chars)"
+        },
+        "astra.vector.similarityThreshold": {
+          "type": "number",
+          "default": 0.3,
+          "minimum": 0.1,
+          "maximum": 0.9,
+          "description": "Minimum similarity score for vector search results"
+        },
+        "astra.vector.topKResults": {
+          "type": "number",
+          "default": 10,
+          "minimum": 5,
+          "maximum": 50,
+          "description": "Number of results from vector search"
+        },
+        "astra.llm.defaultModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "description": "Default model for all tasks"
+        },
+        "astra.llm.codingModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for code generation (empty = use default)"
+        },
+        "astra.llm.analysisModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for code analysis (empty = use default)"
+        },
+        "astra.llm.summaryModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for summaries (empty = use default)"
+        },
+        "astra.llm.classificationModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for classification (empty = use default)"
+        },
+        "astra.llm.providerPriority": {
+          "type": "array",
+          "default": [
+            "copilot",
+            "openai",
+            "anthropic"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "copilot",
+              "openai",
+              "anthropic"
+            ]
+          },
+          "description": "Order of LLM providers to try"
+        },
+        "astra.llm.openaiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI API key (for direct API access)"
+        },
+        "astra.llm.anthropicApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API key (for direct API access)"
+        },
+        "astra.llm.modelDisplayNames": {
+          "type": "object",
+          "default": {
+            "gpt-4o-mini": "GPT-4o Mini",
+            "gpt-4o": "GPT-4o",
+            "gpt-4": "GPT-4",
+            "claude-sonnet-4": "Claude Sonnet 4",
+            "claude-3.5-sonnet": "Claude 3.5 Sonnet"
+          },
+          "description": "Custom display names for models"
+        },
+        "astra.persistence.autoSaveInterval": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 1000,
+          "maximum": 60000,
+          "description": "Auto-save interval in milliseconds"
+        },
+        "astra.persistence.maxChatHistory": {
+          "type": "number",
+          "default": 100,
+          "minimum": 10,
+          "maximum": 500,
+          "description": "Maximum chat messages to persist"
+        }
       }
     }
-  }
+  },
+  "icon": "icon.png"
 }
