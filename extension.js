@@ -1,7 +1,7 @@
 /**
  * AstraCode v5.1.3 - Agentic Code Assistant
  * 
- * FIX v5.1.3: Content Loading for Large Legacy Codebase Analysis
+ * FIX v4.9.81: Content Loading for Large Codebase Analysis
  * - handleDetailedQuery now loads actual source code content before analysis
  * - Previously, search results had content: null, causing LLM to only see metadata
  * - Now extracts 40 lines of context around each search result
@@ -11,7 +11,7 @@
  * ============================================
  * 
  * ┌─────────────────────────────────────────────────────────┐
- * │                     SEARCH QUERY                        │
+ * │                     SEARCH QUERY                         │
  * └─────────────────────────────────────────────────────────┘
  *                            │
  *        ┌───────────────────┼───────────────────┐
@@ -40,6 +40,7 @@ const vscode = require('vscode');
 const path = require('path');
 const pathUtils = require('./pathUtils');
 const searchModule = require('./search-module');
+
 const { PersistenceManager } = require('./persistence');
 const { PromptLibrary, GROUNDING_RULES, ALGORITHM_GUIDANCE } = require('./prompts');
 const { 
@@ -60,6 +61,18 @@ const {
     SearchStrategies
 } = require('./query-classifier');
 
+const {
+    CobolQueryClassifier,
+    extractCobolParagraphs,
+    extractCobolDataItems,
+    extractCobolSql,
+    extractCobolCopybooks,
+    extractCobolTables,
+    extractSqlTables,
+    handleTableQuery,
+} = require('./cobol-query-classifier');
+
+
 // Global persistence manager instance
 let persistenceManager = null;
 
@@ -71,6 +84,8 @@ let sessionMemory = null;
 
 // Global query classifier instance (learns domain knowledge from codebase)
 let queryClassifier = null;
+
+let cobolClassifier = null;
 
 // ============================================================
 // INDEXING STATE - Block queries until ready
@@ -1048,7 +1063,6 @@ async function buildCodeIndex(options = {}) {
                     }
                     
                     // Track variables (with limit in lightweight mode)
-                    // Check: is this a variable-type symbol OR does it have a dataType?
                     const hasVarType = variableTypes.has(symbol.type);
                     const hasDataType = symbol.dataType && symbol.dataType.length > 0;
                     const isVariable = hasVarType || hasDataType;
@@ -1210,20 +1224,30 @@ async function buildCodeIndex(options = {}) {
         log('Trigram indexing error (non-fatal):', err.message);
     }
     
-    // Build fast search indexes (including inverted index)
+    // ================================================================
+    // FIX 1: Build fast search indexes
+    // If auto-summary is enabled, skip inverted index here
+    // It will be built ONCE after summaries complete (prevents double build)
+    // ================================================================
+    const summaryConfigForSearch = getSummaryConfig();
+    const skipInverted = summaryConfigForSearch.ENABLE_AUTO_SUMMARY;
+    
     IndexingState.setPhase('search', 85);
     if (showProgress && chatWebviewView) {
         chatWebviewView.webview.postMessage({
             type: 'indexProgress',
             progress: 85,
-            message: `🔎 Building search indexes...`
+            message: skipInverted 
+                ? `🔎 Building search indexes (inverted index deferred)...`
+                : `🔎 Building search indexes...`
         });
     }
     
     try {
-        const searchStats = searchModule.buildSearchIndexes();
+        // Pass skipInvertedIndex option - inverted index built after summaries complete
+        const searchStats = searchModule.buildSearchIndexes({ skipInvertedIndex: skipInverted });
         IndexingState.invertedTerms = searchStats.invertedTerms || 0;
-        log('Search indexes built:', JSON.stringify(searchStats));
+        log('Search indexes built:', JSON.stringify(searchStats), skipInverted ? '(inverted index deferred)' : '');
     } catch (err) {
         log('Search index error (non-fatal):', err.message);
     }
@@ -1242,6 +1266,24 @@ async function buildCodeIndex(options = {}) {
         log('Query classifier learning error (non-fatal):', err.message);
     }
     
+    try {
+        // Check if we have COBOL files
+        const hasCobolFiles = Array.from(contextFiles.keys()).some(path => 
+            /\.(cbl|cob|cobol|cpy)$/i.test(path)
+        );
+        
+        if (hasCobolFiles) {
+            if (!cobolClassifier) {
+                cobolClassifier = new CobolQueryClassifier({ log });
+            }
+            const cobolStats = cobolClassifier.learnFromCodebase(contextFiles, codeIndex);
+            log('COBOL classifier learned:', JSON.stringify(cobolStats));
+        } else {
+            log('No COBOL files detected, skipping COBOL classifier');
+        }
+    } catch (err) {
+        log('COBOL classifier learning error (non-fatal):', err.message);
+    }
     // ================================================================
     // MARK BASIC INDEXING COMPLETE - Queries can proceed
     // ================================================================
@@ -1660,6 +1702,9 @@ async function generateCodeSummaries(maxFunctions = null) {
         text: `\n📝 **Generating summaries for ${toProcess.length} functions...**\n\n`
     });
     
+    // ================================================================
+    // FIX 2: Batch processing loop with proper error handling
+    // ================================================================
     for (let i = 0; i < toProcess.length; i += batchSize) {
         if (taskController.isCancelled) {
             log('Summary generation cancelled');
@@ -1715,29 +1760,40 @@ async function generateCodeSummaries(maxFunctions = null) {
                 text: `⚠️ Batch ${batchNum} error: ${error.message.substring(0, 50)}...\n`
             });
             
-            // If too many consecutive failures, switch to name-based summaries
+            // FIX: If too many consecutive failures, STOP and use name-based summaries
             if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                log('generateCodeSummaries: Too many failures (' + consecutiveFailures + '), stopping LLM attempts');
+                
                 chatWebviewView?.webview.postMessage({ 
                     type: 'appendResponse', 
-                    text: `\n⚠️ LLM rate limited. Switching to name-based summaries for remaining ${toProcess.length - summarized} functions...\n`
+                    text: `\n⚠️ Too many errors (${consecutiveFailures}). Using name-based summaries for remaining ${toProcess.length - summarized} functions...\n`
                 });
                 
-                // Generate name-based summaries for remaining functions
-                for (let j = i + batchSize; j < toProcess.length; j++) {
+                // FIX: Generate name-based summaries for ALL remaining functions
+                // Starting from current batch index (j=i), not next batch (j=i+batchSize)
+                // This ensures the current failed batch also gets summaries
+                for (let j = i; j < toProcess.length; j++) {
                     const func = toProcess[j];
-                    const summary = generateSummaryFromName(func.name);
-                    codeIndex.summaries.set(func.key, {
-                        name: func.name,
-                        type: func.type,
-                        file: func.file,
-                        line: func.line,
-                        summary: summary
-                    });
+                    // Only add if not already summarized
+                    if (!codeIndex.summaries.has(func.key)) {
+                        const summary = generateSummaryFromName(func.name);
+                        codeIndex.summaries.set(func.key, {
+                            name: func.name,
+                            type: func.type,
+                            file: func.file,
+                            line: func.line,
+                            summary: summary
+                        });
+                    }
                 }
                 summarized = toProcess.length;
                 IndexingState.summariesGenerated = codeIndex.summaries.size;
-                break;
+                break;  // EXIT THE LOOP
             }
+            
+            // FIX: Add delay before retry to avoid hammering a failing service
+            log('generateCodeSummaries: Waiting 2s before retry...');
+            await new Promise(r => setTimeout(r, 2000));
         }
         
         // Small delay between batches to avoid rate limits
@@ -1824,6 +1880,16 @@ async function generateCodeSummaries(maxFunctions = null) {
         }
     } catch (err) {
         log('generateCodeSummaries: Query classifier re-learning error:', err.message);
+    }
+
+    try {
+        if (cobolClassifier) {
+            log('generateCodeSummaries: Re-learning COBOL classifier with summaries...');
+            const cobolStats = cobolClassifier.learnFromCodebase(contextFiles, codeIndex);
+            log('generateCodeSummaries: COBOL classifier re-learned:', JSON.stringify(cobolStats));
+        }
+    } catch (err) {
+        log('generateCodeSummaries: COBOL classifier re-learning error:', err.message);
     }
     
     // ================================================================
@@ -3115,10 +3181,31 @@ async function comprehensiveSearch(query) {
     // ================================================================
     let queryType = 'general';
     let qc = null;
+    let cobolContext = null;
     
+    // Standard query classification
     if (queryClassifier) {
         qc = queryClassifier.classify(query);
         queryType = qc?.type || 'general';
+    }
+    
+    // COBOL-specific classification (if COBOL codebase)
+    if (cobolClassifier && cobolClassifier.initialized) {
+        try {
+            cobolContext = cobolClassifier.classify(query);
+            
+            if (cobolContext.confidence > 0.6) {
+                log('COBOL query classified:', JSON.stringify({
+                    intent: cobolContext.intent,
+                    division: cobolContext.division,
+                    names: cobolContext.extractedNames,
+                    expandedTerms: cobolContext.expandedTerms.slice(0, 5),
+                    confidence: cobolContext.confidence
+                }));
+            }
+        } catch (err) {
+            log('COBOL classification error (non-fatal):', err.message);
+        }
     }
     
     // Score boosts by query type (higher = more important for this query)
@@ -3163,6 +3250,102 @@ async function comprehensiveSearch(query) {
         }
         return SKIP_FILE_PATTERNS.some(p => p.test(filePath));
     };
+
+    if (cobolClassifier && cobolClassifier.initialized) {
+        const cobolQuery = cobolClassifier.classify(query);
+        
+        if (cobolQuery.intent === 'LIST_TABLES_IN_MODULE' && cobolQuery.extractedNames.length > 0) {
+            log('COBOL: Handling table query for module:', cobolQuery.extractedNames[0]);
+            
+            const tableResult = handleTableQuery(
+                cobolQuery.extractedNames[0], 
+                contextFiles,
+                { log }
+            );
+            
+            // Add table results as search results
+            for (const table of tableResult.cobolTables) {
+                const key = `${table.file}:${table.line}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: table.file,
+                        line: table.line,
+                        name: table.name,
+                        type: 'cobol-table',
+                        score: 3.0,  // High score for direct matches
+                        source: 'cobol-table-search',
+                        content: `OCCURS ${table.maxOccurs} TIMES${table.indexes.length > 0 ? ' INDEXED BY ' + table.indexes.join(', ') : ''}`
+                    });
+                }
+            }
+            
+            for (const table of tableResult.sqlTables) {
+                // Find a file that references this table
+                const key = `${table.file}:${table.lines[0] || 1}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: table.file,
+                        line: table.lines[0] || 1,
+                        name: table.name,
+                        type: 'sql-table',
+                        score: 2.8,
+                        source: 'cobol-sql-table-search',
+                        content: `SQL Table - Operations: ${table.operations.join(', ')}`
+                    });
+                }
+            }
+            
+            log('COBOL: Added', tableResult.cobolTables.length, 'COBOL tables and', 
+                tableResult.sqlTables.length, 'SQL tables to results');
+        }
+        
+        // Handle LIST_ALL_TABLES intent
+        if (cobolQuery.intent === 'LIST_ALL_TABLES' || cobolQuery.intent === 'LIST_SQL_TABLES') {
+            log('COBOL: Handling list all tables query');
+            
+            // Search all COBOL files for tables
+            for (const [filePath, file] of contextFiles) {
+                if (!/\.(cbl|cob|cobol|cpy)$/i.test(filePath)) continue;
+                
+                const content = file.content || '';
+                
+                if (cobolQuery.intent === 'LIST_ALL_TABLES') {
+                    const tables = extractCobolTables(content);
+                    for (const table of tables) {
+                        const key = `${filePath}:${table.line}`;
+                        if (!results.has(key)) {
+                            results.set(key, {
+                                file: filePath,
+                                line: table.line,
+                                name: table.name,
+                                type: 'cobol-table',
+                                score: 2.5,
+                                source: 'cobol-table-scan',
+                                content: `OCCURS ${table.maxOccurs} TIMES`
+                            });
+                        }
+                    }
+                }
+                
+                // SQL tables
+                const sqlTables = extractSqlTables(content);
+                for (const table of sqlTables) {
+                    const key = `${filePath}:sql:${table.name}`;
+                    if (!results.has(key)) {
+                        results.set(key, {
+                            file: filePath,
+                            line: table.lines[0] || 1,
+                            name: table.name,
+                            type: 'sql-table',
+                            score: 2.3,
+                            source: 'cobol-sql-scan',
+                            content: `SQL: ${table.operations.join(', ')}`
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     // ================================================================
     // PHASE 0: INVERTED INDEX / CONCEPT SEARCH (Highest Priority)
@@ -3256,6 +3439,17 @@ async function comprehensiveSearch(query) {
         for (const term of queryClassification.expandedTerms || []) {
             expandedKeywords.add(term.toLowerCase());
         }
+        // Add COBOL-specific expanded terms
+        if (cobolContext && cobolContext.expandedTerms) {
+            for (const term of cobolContext.expandedTerms) {
+                expandedKeywords.add(term.toLowerCase());
+            }
+            // Also add COBOL boost terms
+            for (const term of cobolContext.searchBoost || []) {
+                expandedKeywords.add(term.toLowerCase());
+            }
+        }
+
         
         // Also add original keywords
         for (const kw of keywords) {
@@ -3348,6 +3542,16 @@ async function comprehensiveSearch(query) {
                                 content: null
                             });
                             addedFromFile++;
+                        }
+                    }
+
+                    if (cobolContext && cobolContext.extractedNames.length > 0) {
+                        const symbolUpper = symbol.name.toUpperCase();
+                        for (const cobolName of cobolContext.extractedNames) {
+                            if (symbolUpper === cobolName || symbolUpper.includes(cobolName)) {
+                                score *= 1.5;  // Boost exact COBOL name matches
+                                break;
+                            }
                         }
                     }
                 }
