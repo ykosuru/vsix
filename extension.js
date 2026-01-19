@@ -3191,20 +3191,99 @@ async function comprehensiveSearch(query) {
     
     // COBOL-specific classification (if COBOL codebase)
     if (cobolClassifier && cobolClassifier.initialized) {
-        try {
-            cobolContext = cobolClassifier.classify(query);
+        const cobolQuery = cobolClassifier.classify(query);
+        
+        // Handle LIST_TABLES_IN_MODULE - instant lookup from index
+        if (cobolQuery.intent === 'LIST_TABLES_IN_MODULE' && cobolQuery.extractedNames.length > 0) {
+            const moduleName = cobolQuery.extractedNames[0];
+            log('COBOL: Getting tables for module:', moduleName, '(from pre-built index)');
             
-            if (cobolContext.confidence > 0.6) {
-                log('COBOL query classified:', JSON.stringify({
-                    intent: cobolContext.intent,
-                    division: cobolContext.division,
-                    names: cobolContext.extractedNames,
-                    expandedTerms: cobolContext.expandedTerms.slice(0, 5),
-                    confidence: cobolContext.confidence
-                }));
+            // Instant lookup - NO FILE SCANNING
+            const tableResult = cobolClassifier.getTablesInModule(moduleName);
+            
+            log('COBOL: Found', tableResult.cobolTables.length, 'COBOL tables,', 
+                tableResult.sqlTables.length, 'SQL tables in', tableResult.matchedFiles.length, 'files');
+            
+            // Add COBOL tables to results
+            for (const table of tableResult.cobolTables) {
+                const key = `${table.file}:${table.line}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: table.file,
+                        line: table.line,
+                        name: table.name,
+                        type: 'cobol-table',
+                        score: 3.0,
+                        source: 'cobol-table-index',
+                        content: `OCCURS ${table.maxOccurs} TIMES${table.indexes.length > 0 ? ' INDEXED BY ' + table.indexes.join(', ') : ''}`
+                    });
+                }
             }
-        } catch (err) {
-            log('COBOL classification error (non-fatal):', err.message);
+            
+            // Add SQL tables to results
+            for (const table of tableResult.sqlTables) {
+                const key = `${table.file}:sql:${table.name}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: table.file,
+                        line: table.line,
+                        name: table.name,
+                        type: 'sql-table',
+                        score: 2.8,
+                        source: 'cobol-sql-index',
+                        content: `SQL Table - Operations: ${table.operations.join(', ')}`
+                    });
+                }
+            }
+        }
+        
+        // Handle LIST_ALL_TABLES - instant lookup from index
+        if (cobolQuery.intent === 'LIST_ALL_TABLES') {
+            log('COBOL: Getting ALL tables (from pre-built index)');
+            
+            // Instant lookup - NO FILE SCANNING
+            const allTables = cobolClassifier.getAllTables();
+            
+            log('COBOL: Found', allTables.summary.cobolTableCount, 'COBOL tables,',
+                allTables.summary.sqlTableCount, 'SQL tables total');
+            
+            for (const table of allTables.cobolTables) {
+                const key = `${table.file}:${table.line}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: table.file,
+                        line: table.line,
+                        name: table.name,
+                        type: 'cobol-table',
+                        score: 2.5,
+                        source: 'cobol-table-index',
+                        content: `OCCURS ${table.maxOccurs} TIMES`
+                    });
+                }
+            }
+        }
+        
+        // Handle LIST_SQL_TABLES - instant lookup from index
+        if (cobolQuery.intent === 'LIST_SQL_TABLES') {
+            log('COBOL: Getting SQL tables (from pre-built index)');
+            
+            // Instant lookup - NO FILE SCANNING
+            const allTables = cobolClassifier.getAllTables();
+            
+            for (const table of allTables.sqlTables) {
+                const key = `${table.file}:sql:${table.name}`;
+                if (!results.has(key)) {
+                    results.set(key, {
+                        file: table.file,
+                        line: table.line,
+                        name: table.name,
+                        type: 'sql-table',
+                        score: 2.3,
+                        source: 'cobol-sql-index',
+                        content: `SQL: ${table.operations.join(', ')}`
+                    });
+                }
+            }
         }
     }
     
