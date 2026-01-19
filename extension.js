@@ -1,11 +1,17 @@
 /**
- * AstraCode v4.9.80 - Agentic Code Assistant
+ * AstraCode v5.1.3 - Agentic Code Assistant
+ * 
+ * FIX v5.1.3: Content Loading for Large Legacy Codebase Analysis
+ * - handleDetailedQuery now loads actual source code content before analysis
+ * - Previously, search results had content: null, causing LLM to only see metadata
+ * - Now extracts 40 lines of context around each search result
+ * - analyzeChunk prompt improved to emphasize analyzing actual code
  * 
  * CLEAN 3-LAYER SEARCH ARCHITECTURE (v4.9.80)
  * ============================================
  * 
  * ┌─────────────────────────────────────────────────────────┐
- * │                     SEARCH QUERY                         │
+ * │                     SEARCH QUERY                        │
  * └─────────────────────────────────────────────────────────┘
  *                            │
  *        ┌───────────────────┼───────────────────┐
@@ -34,6 +40,172 @@ const vscode = require('vscode');
 const path = require('path');
 const pathUtils = require('./pathUtils');
 const searchModule = require('./search-module');
+const { PersistenceManager } = require('./persistence');
+const { PromptLibrary, GROUNDING_RULES, ALGORITHM_GUIDANCE } = require('./prompts');
+const { 
+    CodeIndex, 
+    detectLanguage: detectLangModule, 
+    isBinaryFile: isBinaryModule,
+    parseFile: parseFileModule
+} = require('./index-module');
+const { 
+    SessionMemory, 
+    parseSessionCommand, 
+    executeSessionCommand,
+    SESSION_MEMORY_HELP 
+} = require('./session-memory');
+const {
+    QueryClassifier,
+    QueryTypes,
+    SearchStrategies
+} = require('./query-classifier');
+
+// Global persistence manager instance
+let persistenceManager = null;
+
+// Global code index instance (new modular approach)
+let codeIndexManager = null;
+
+// Global session memory instance
+let sessionMemory = null;
+
+// Global query classifier instance (learns domain knowledge from codebase)
+let queryClassifier = null;
+
+// ============================================================
+// INDEXING STATE - Block queries until ready
+// ============================================================
+
+/**
+ * Global indexing state tracker
+ * Queries are blocked until all indexes are built
+ */
+const IndexingState = {
+    // Current state
+    isIndexing: false,
+    isSummarizing: false,
+    isReady: false,
+    
+    // Phase tracking
+    currentPhase: 'idle',  // 'idle' | 'parsing' | 'symbols' | 'trigrams' | 'search' | 'summaries' | 'inverted' | 'ready'
+    progress: 0,           // 0-100
+    
+    // Stats
+    filesIndexed: 0,
+    symbolsFound: 0,
+    summariesGenerated: 0,
+    invertedTerms: 0,
+    
+    // Timestamps
+    startTime: null,
+    endTime: null,
+    
+    // Methods
+    start() {
+        this.isIndexing = true;
+        this.isReady = false;
+        this.startTime = Date.now();
+        this.currentPhase = 'parsing';
+        this.progress = 0;
+        this.updateUI();
+    },
+    
+    setPhase(phase, progress = null) {
+        this.currentPhase = phase;
+        if (progress !== null) this.progress = progress;
+        this.updateUI();
+    },
+    
+    complete() {
+        this.isIndexing = false;
+        this.isSummarizing = false;
+        this.isReady = true;
+        this.currentPhase = 'ready';
+        this.progress = 100;
+        this.endTime = Date.now();
+        this.updateUI();
+        log(`Indexing complete in ${this.endTime - this.startTime}ms`);
+    },
+    
+    startSummaries() {
+        this.isSummarizing = true;
+        this.currentPhase = 'summaries';
+        this.updateUI();
+    },
+    
+    completeSummaries() {
+        this.isSummarizing = false;
+        this.currentPhase = 'inverted';
+        this.updateUI();
+    },
+    
+    updateUI() {
+        if (!chatWebviewView) return;
+        
+        const phaseNames = {
+            'idle': 'Idle',
+            'parsing': '📂 Parsing files...',
+            'symbols': '🔍 Extracting symbols...',
+            'trigrams': '📊 Building trigram index...',
+            'search': '🔎 Building search indexes...',
+            'summaries': '🤖 Generating summaries...',
+            'inverted': '📚 Building inverted index...',
+            'ready': '✅ Ready'
+        };
+        
+        const message = {
+            type: 'indexingStatus',
+            isIndexing: this.isIndexing,
+            isSummarizing: this.isSummarizing,
+            isReady: this.isReady,
+            phase: this.currentPhase,
+            phaseName: phaseNames[this.currentPhase] || this.currentPhase,
+            progress: this.progress,
+            stats: {
+                files: this.filesIndexed,
+                symbols: this.symbolsFound,
+                summaries: this.summariesGenerated,
+                terms: this.invertedTerms
+            }
+        };
+        
+        chatWebviewView.webview.postMessage(message);
+        
+        // Also update status bar
+        if (this.isIndexing || this.isSummarizing) {
+            const statusText = `$(sync~spin) ${phaseNames[this.currentPhase]} (${this.progress}%)`;
+            chatWebviewView.webview.postMessage({
+                type: 'appendResponse',
+                text: '' // Just trigger UI update
+            });
+        }
+    },
+    
+    // Check if queries should be blocked
+    shouldBlockQueries() {
+        // Block if indexing basic structure OR if no summaries yet for large codebases
+        return this.isIndexing;
+    },
+    
+    getBlockingMessage() {
+        if (this.isIndexing) {
+            return `⏳ **Indexing in progress...**\n\n${this.getStatusLine()}\n\nPlease wait for indexing to complete before asking questions.`;
+        }
+        if (this.isSummarizing) {
+            return `⏳ **Generating summaries...**\n\n${this.getStatusLine()}\n\nYou can ask questions now, but results will improve after summaries are complete.`;
+        }
+        return null;
+    },
+    
+    getStatusLine() {
+        const parts = [];
+        if (this.filesIndexed > 0) parts.push(`${this.filesIndexed} files`);
+        if (this.symbolsFound > 0) parts.push(`${this.symbolsFound} symbols`);
+        if (this.summariesGenerated > 0) parts.push(`${this.summariesGenerated} summaries`);
+        if (this.invertedTerms > 0) parts.push(`${this.invertedTerms} search terms`);
+        return parts.length > 0 ? `📊 ${parts.join(' | ')}` : 'Starting...';
+    }
+};
 
 // ============================================================
 // State Management
@@ -68,6 +240,198 @@ let lastCopilotModelSetting = null;
 
 /** @type {{query: string, plan: Object} | null} */
 let pendingPlan = null;
+
+// ============================================================
+// CENTRALIZED LLM CONFIGURATION
+// ============================================================
+
+/**
+ * LLM Configuration Manager
+ * Single source of truth for all model selection and provider settings
+ * All settings are read from VS Code configuration (astra.llm.*)
+ */
+const LLMConfig = {
+    // Task types for model selection
+    TASKS: {
+        CODING: 'coding',           // Code generation, translation
+        ANALYSIS: 'analysis',       // Code analysis, Q&A
+        SUMMARY: 'summary',         // Summaries, documentation
+        CLASSIFICATION: 'classification', // Quick classification tasks
+        DEFAULT: 'default'          // General fallback
+    },
+
+    /**
+     * Get the configured model for a specific task
+     * @param {string} task - One of TASKS values
+     * @returns {string} Model identifier
+     */
+    getModelForTask(task) {
+        const config = vscode.workspace.getConfiguration('astra');
+        
+        switch (task) {
+            case this.TASKS.CODING:
+                return config.get('llm.codingModel') || this.getDefaultModel();
+            case this.TASKS.ANALYSIS:
+                return config.get('llm.analysisModel') || this.getDefaultModel();
+            case this.TASKS.SUMMARY:
+                return config.get('llm.summaryModel') || this.getDefaultModel();
+            case this.TASKS.CLASSIFICATION:
+                return config.get('llm.classificationModel') || this.getDefaultModel();
+            default:
+                return this.getDefaultModel();
+        }
+    },
+
+    /**
+     * Get the default model (fallback for all tasks)
+     * @returns {string} Default model identifier
+     */
+    getDefaultModel() {
+        const config = vscode.workspace.getConfiguration('astra');
+        return config.get('llm.defaultModel') || 'gpt-5o-mini';
+    },
+
+    /**
+     * Get provider priority order
+     * @returns {string[]} Array of provider names in priority order
+     */
+    getProviderPriority() {
+        const config = vscode.workspace.getConfiguration('astra');
+        return config.get('llm.providerPriority') || ['copilot', 'openai', 'anthropic'];
+    },
+
+    /**
+     * Get API key for a provider
+     * @param {string} provider - 'openai' or 'anthropic'
+     * @returns {string|null} API key or null
+     */
+    getApiKey(provider) {
+        const config = vscode.workspace.getConfiguration('astra');
+        switch (provider) {
+            case 'openai':
+                return config.get('llm.openaiApiKey') || null;
+            case 'anthropic':
+                return config.get('llm.anthropicApiKey') || null;
+            default:
+                return null;
+        }
+    },
+
+    /**
+     * Get display name for a model
+     * @param {string} modelId - Model identifier
+     * @returns {string} Human-friendly display name
+     */
+    getDisplayName(modelId) {
+        if (!modelId) return 'Unknown';
+        
+        const config = vscode.workspace.getConfiguration('astra');
+        const customNames = config.get('llm.modelDisplayNames') || {};
+        
+        // Check custom names first
+        if (customNames[modelId]) {
+            return customNames[modelId];
+        }
+        
+        // Built-in display names
+        const builtInNames = {
+            'gpt-5o-mini': 'GPT-5o Mini',
+            'gpt-5o': 'GPT-5o',
+            'gpt-4o-mini': 'GPT-4o Mini',
+            'gpt-4o': 'GPT-4o',
+            'gpt-4-turbo': 'GPT-4 Turbo',
+            'gpt-4': 'GPT-4',
+            'gpt-3.5-turbo': 'GPT-3.5',
+            'claude-sonnet-4-5-20250514': 'Claude Sonnet 4.5',
+            'claude-sonnet-4': 'Claude Sonnet 4',
+            'claude-3-5-sonnet-20241022': 'Claude 3.5 Sonnet',
+            'claude-3.5-sonnet': 'Claude 3.5 Sonnet',
+            'claude-3-opus-20240229': 'Claude 3 Opus',
+            'claude-3-haiku-20240307': 'Claude 3 Haiku',
+            'o1': 'o1',
+            'o1-mini': 'o1 Mini'
+        };
+        
+        if (builtInNames[modelId]) {
+            return builtInNames[modelId];
+        }
+        
+        // Try to extract a friendly name from the model ID
+        const modelLower = modelId.toLowerCase();
+        if (modelLower.includes('gpt-5o-mini')) return 'GPT-5o Mini';
+        if (modelLower.includes('gpt-5o')) return 'GPT-5o';
+        if (modelLower.includes('gpt-4o-mini')) return 'GPT-4o Mini';
+        if (modelLower.includes('gpt-4o')) return 'GPT-4o';
+        if (modelLower.includes('gpt-4')) return 'GPT-4';
+        if (modelLower.includes('claude-sonnet-4')) return 'Claude Sonnet 4';
+        if (modelLower.includes('claude-3.5') || modelLower.includes('claude-3-5')) return 'Claude 3.5 Sonnet';
+        if (modelLower.includes('claude')) return 'Claude';
+        if (modelLower.includes('o1-mini')) return 'o1 Mini';
+        if (modelLower.includes('o1')) return 'o1';
+        
+        return modelId;
+    },
+
+    /**
+     * Get model search patterns for Copilot model selection
+     * Returns functions to match models in priority order
+     * @param {string} preferredModel - The preferred model ID
+     * @returns {Function[]} Array of matcher functions
+     */
+    getModelSearchOrder(preferredModel) {
+        const preferred = (preferredModel || this.getDefaultModel()).toLowerCase();
+        
+        return [
+            // First: exact match for preferred model
+            m => (m.name?.toLowerCase().includes(preferred) || 
+                  m.id?.toLowerCase().includes(preferred) ||
+                  m.family?.toLowerCase().includes(preferred)),
+            // GPT-5o-mini
+            m => (m.family?.toLowerCase().includes('gpt-5o-mini') || 
+                  m.name?.toLowerCase().includes('gpt-5o-mini') ||
+                  m.id?.toLowerCase().includes('gpt-5o-mini')),
+            // GPT-5o
+            m => (m.family?.toLowerCase().includes('gpt-5o') ||
+                  m.name?.toLowerCase().includes('gpt-5o') ||
+                  m.id?.toLowerCase().includes('gpt-5o')),
+            // GPT-4o-mini
+            m => (m.family?.toLowerCase().includes('gpt-4o-mini') ||
+                  m.name?.toLowerCase().includes('gpt-4o-mini')),
+            // GPT-4o
+            m => (m.family?.toLowerCase().includes('gpt-4o') ||
+                  m.name?.toLowerCase().includes('gpt-4o')),
+            // GPT-4
+            m => (m.family?.toLowerCase().includes('gpt-4') ||
+                  m.name?.toLowerCase().includes('gpt-4')),
+            // Any mini model
+            m => (m.name?.toLowerCase().includes('mini') ||
+                  m.id?.toLowerCase().includes('mini')),
+            // Claude (fallback)
+            m => (m.family?.toLowerCase().includes('claude') ||
+                  m.name?.toLowerCase().includes('claude')),
+        ];
+    },
+
+    /**
+     * Log current configuration (for debugging)
+     */
+    logConfig() {
+        log('LLM Config:', {
+            defaultModel: this.getDefaultModel(),
+            codingModel: this.getModelForTask(this.TASKS.CODING),
+            analysisModel: this.getModelForTask(this.TASKS.ANALYSIS),
+            summaryModel: this.getModelForTask(this.TASKS.SUMMARY),
+            classificationModel: this.getModelForTask(this.TASKS.CLASSIFICATION),
+            providerPriority: this.getProviderPriority(),
+            hasOpenAIKey: !!this.getApiKey('openai'),
+            hasAnthropicKey: !!this.getApiKey('anthropic')
+        });
+    }
+};
+
+// ============================================================
+// END CENTRALIZED LLM CONFIGURATION
+// ============================================================
 
 /** 
  * Task cancellation support
@@ -157,32 +521,9 @@ function isCodeFile(filePath) {
 
 /**
  * Default System Prompt for AstraCode
- * This is prepended to every user query to guide the LLM's behavior
+ * Now uses the centralized PromptLibrary
  */
-const DEFAULT_SYSTEM_PROMPT = `You are AstraCode, an expert code analysis assistant specializing in legacy system modernization and reverse engineering.
-
-## Your Expertise
-- Deep understanding of legacy languages: COBOL, TAL, PL/I, and mainframe systems
-- Modern languages: Java, Python, JavaScript/TypeScript, C/C++, Go, Rust
-- Payment systems, banking, and financial services domain knowledge
-- Code architecture analysis and documentation
-
-## Your Approach
-1. **Be Precise**: Reference specific file names, line numbers, and function names when discussing code
-2. **Be Practical**: Provide actionable insights, not just descriptions
-3. **Be Thorough**: Consider edge cases, error handling, and data flow
-4. **Be Clear**: Use business-friendly language when explaining technical concepts
-
-## Response Guidelines
-- When analyzing code, identify the WHAT (functionality), HOW (implementation), and WHY (business purpose)
-- For questions about specific functions, trace the data flow and dependencies
-- When asked to document, focus on accuracy over comprehensiveness
-- If uncertain, say so rather than guessing
-
-## Context Awareness
-- You have access to the user's code context (files they've added)
-- Reference the code index when available for accurate symbol information
-- Consider cross-file dependencies and call relationships`;
+const DEFAULT_SYSTEM_PROMPT = PromptLibrary.system.default();
 
 /**
  * Get the current system prompt (user-edited or default)
@@ -526,10 +867,108 @@ const INDEX_CONFIG = {
  * Handles large repositories by batching and yielding to UI
  */
 async function buildCodeIndex(options = {}) {
-    const { showProgress = true, lightweight = false } = options;
+    const { showProgress = true, lightweight = false, forceRebuild = false } = options;
     const totalFiles = contextFiles.size;
     
     log('Building code index for', totalFiles, 'files...');
+    
+    // ================================================================
+    // TRY TO RESTORE FROM CACHE (skip expensive rebuilding)
+    // ================================================================
+    if (!forceRebuild && persistenceManager) {
+        try {
+            const cached = await persistenceManager.restoreCodeIndex();
+            if (cached && cached.symbols.size > 0) {
+                log(`Restoring cached index: ${cached.symbols.size} symbols, ${cached.summaries.size} summaries`);
+                
+                // Show progress
+                if (showProgress && chatWebviewView) {
+                    chatWebviewView.webview.postMessage({
+                        type: 'indexProgress',
+                        progress: 50,
+                        message: `⚡ Restoring cached index: ${cached.symbols.size} symbols...`
+                    });
+                    chatWebviewView.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `\n⚡ **Restoring cached index...**\n- ${cached.symbols.size} symbols\n- ${cached.summaries.size} summaries\n`
+                    });
+                }
+                
+                // Restore to codeIndex
+                codeIndex.symbols = cached.symbols;
+                codeIndex.callGraph = cached.callGraph;
+                codeIndex.reverseCallGraph = cached.reverseCallGraph;
+                codeIndex.summaries = cached.summaries;
+                codeIndex.fileSummaries = cached.fileSummaries;
+                codeIndex.lastUpdated = new Date(cached.metadata.savedAt);
+                
+                // Still need to rebuild file index and trigrams (fast operations)
+                for (const [path, file] of contextFiles) {
+                    codeIndex.files.set(path, { path, language: file.language, lineCount: file.content.split('\n').length });
+                }
+                
+                // Build trigram index
+                if (showProgress && chatWebviewView) {
+                    chatWebviewView.webview.postMessage({
+                        type: 'indexProgress',
+                        progress: 70,
+                        message: `📊 Building trigram index...`
+                    });
+                }
+                await buildTrigramIndexLightweight({ showProgressUI: false, maxFilesToIndex: 500, maxFileSize: 50000 });
+                
+                // Build search indexes (including inverted index with summaries)
+                if (showProgress && chatWebviewView) {
+                    chatWebviewView.webview.postMessage({
+                        type: 'indexProgress',
+                        progress: 85,
+                        message: `🔎 Building search indexes with ${cached.summaries.size} summaries...`
+                    });
+                }
+                const searchStats = searchModule.buildSearchIndexes();
+                
+                // Update IndexingState
+                IndexingState.filesIndexed = totalFiles;
+                IndexingState.symbolsFound = cached.symbols.size;
+                IndexingState.summariesGenerated = cached.summaries.size;
+                IndexingState.invertedTerms = searchStats.invertedTerms || 0;
+                IndexingState.complete();
+                
+                // Show completion
+                if (showProgress && chatWebviewView) {
+                    chatWebviewView.webview.postMessage({
+                        type: 'indexProgress',
+                        progress: 100,
+                        message: `✅ Restored: ${cached.symbols.size} symbols | ${cached.summaries.size} summaries | ${searchStats.invertedTerms} terms`
+                    });
+                    chatWebviewView.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `✅ **Index restored from cache in < 1s!**\n- ${searchStats.invertedTerms} search terms\n\n**Ready for queries!**\n\n`
+                    });
+                    chatWebviewView.webview.postMessage({ type: 'finalizeResponse' });
+                }
+                
+                updateChatStatusUI();
+                
+                return {
+                    files: totalFiles,
+                    symbols: cached.symbols.size,
+                    functions: cached.callGraph.size,
+                    summaries: cached.summaries.size,
+                    restored: true
+                };
+            }
+        } catch (err) {
+            log('Cache restore failed, will rebuild:', err.message);
+        }
+    }
+    
+    // ================================================================
+    // START INDEXING STATE (no cache or cache invalid)
+    // ================================================================
+    IndexingState.start();
+    IndexingState.filesIndexed = 0;
+    IndexingState.symbolsFound = 0;
     
     // Determine indexing mode
     const useLightweight = lightweight || totalFiles > INDEX_CONFIG.MAX_FILES_FOR_FULL_INDEX;
@@ -684,6 +1123,11 @@ async function buildCodeIndex(options = {}) {
             
             processedFiles++;
             
+            // Update IndexingState
+            IndexingState.filesIndexed = processedFiles;
+            IndexingState.symbolsFound = totalSymbols;
+            IndexingState.setPhase('symbols', Math.round((processedFiles / totalFiles) * 70)); // 0-70% for file parsing
+            
             // Update progress after each file (for small repos) or every 10 files (for large)
             const updateFrequency = totalFiles <= 50 ? 1 : 10;
             if (showProgress && chatWebviewView && (processedFiles % updateFrequency === 0 || processedFiles === totalFiles)) {
@@ -691,7 +1135,7 @@ async function buildCodeIndex(options = {}) {
                 chatWebviewView.webview.postMessage({
                     type: 'indexProgress',
                     progress: percent,
-                    message: `Indexing: ${processedFiles}/${totalFiles} files (${percent}%)`
+                    message: `📂 Parsing: ${processedFiles}/${totalFiles} files | ${totalSymbols} symbols`
                 });
                 // Yield to UI
                 await new Promise(resolve => setTimeout(resolve, 5));
@@ -743,11 +1187,12 @@ async function buildCodeIndex(options = {}) {
     log('codeIndex.variables.size:', codeIndex.variables.size);
     
     // Build trigram index for fast text search (lightweight version for initial load)
+    IndexingState.setPhase('trigrams', 75);
     if (showProgress && chatWebviewView) {
         chatWebviewView.webview.postMessage({
             type: 'indexProgress',
-            progress: 90,
-            message: `Building trigram index...`
+            progress: 75,
+            message: `📊 Building trigram index...`
         });
     }
     
@@ -765,13 +1210,44 @@ async function buildCodeIndex(options = {}) {
         log('Trigram indexing error (non-fatal):', err.message);
     }
     
-    // Build fast search indexes
+    // Build fast search indexes (including inverted index)
+    IndexingState.setPhase('search', 85);
+    if (showProgress && chatWebviewView) {
+        chatWebviewView.webview.postMessage({
+            type: 'indexProgress',
+            progress: 85,
+            message: `🔎 Building search indexes...`
+        });
+    }
+    
     try {
         const searchStats = searchModule.buildSearchIndexes();
+        IndexingState.invertedTerms = searchStats.invertedTerms || 0;
         log('Search indexes built:', JSON.stringify(searchStats));
     } catch (err) {
         log('Search index error (non-fatal):', err.message);
     }
+    
+    // ================================================================
+    // LEARN QUERY CLASSIFIER DOMAIN KNOWLEDGE
+    // Discovers module mappings, file patterns, and term clusters
+    // ================================================================
+    try {
+        if (!queryClassifier) {
+            queryClassifier = new QueryClassifier({ log });
+        }
+        const classifierStats = queryClassifier.learnFromCodebase(contextFiles, codeIndex);
+        log('Query classifier learned:', JSON.stringify(classifierStats));
+    } catch (err) {
+        log('Query classifier learning error (non-fatal):', err.message);
+    }
+    
+    // ================================================================
+    // MARK BASIC INDEXING COMPLETE - Queries can proceed
+    // ================================================================
+    IndexingState.setPhase('ready', 100);
+    IndexingState.isIndexing = false;
+    IndexingState.isReady = true;
     
     // Final progress update
     const trigramMsg = stats.trigrams > 0 ? `, ${stats.trigrams} trigrams` : '';
@@ -779,7 +1255,7 @@ async function buildCodeIndex(options = {}) {
         chatWebviewView.webview.postMessage({
             type: 'indexProgress',
             progress: 100,
-            message: `💡 Index complete: ${stats.files} files, ${stats.symbols} symbols${trigramMsg}`
+            message: `✅ Index ready: ${stats.files} files, ${stats.symbols} symbols${trigramMsg}`
         });
     }
     
@@ -790,10 +1266,17 @@ async function buildCodeIndex(options = {}) {
     // Summaries are essential for answering high-level queries efficiently
     const summaryConfig = getSummaryConfig();
     if (summaryConfig.ENABLE_AUTO_SUMMARY) {
+        // Mark that summaries are generating (queries allowed but warned)
+        IndexingState.startSummaries();
+        
         // Start summary generation in background - generate ALL functions
         generateCodeSummaries().catch(err => {
             log('Background summary generation failed:', err.message);
+            IndexingState.isSummarizing = false;
         });
+    } else {
+        // No summaries to generate, mark fully complete
+        IndexingState.complete();
     }
     
     return stats;
@@ -1084,49 +1567,195 @@ async function generateCodeSummaries(maxFunctions = null) {
     // Show progress in status bar AND VS Code status bar
     updateSummaryStatus(0, `📚 Summarizing ${toProcess.length} functions${limitMsg}...`);
     
+    // Check if LLM is available first
+    let llmAvailable = true;
+    try {
+        if (!vscode.lm || !vscode.lm.selectChatModels) {
+            llmAvailable = false;
+        } else {
+            const models = await vscode.lm.selectChatModels({});
+            llmAvailable = models.length > 0;
+        }
+    } catch (e) {
+        llmAvailable = false;
+    }
+    
+    // If LLM not available, generate name-based summaries immediately
+    if (!llmAvailable) {
+        log('generateCodeSummaries: LLM not available, generating name-based summaries for all functions');
+        updateSummaryStatus(10, `📝 LLM unavailable - generating ${toProcess.length} name-based summaries...`);
+        
+        let generated = 0;
+        for (const func of toProcess) {
+            const summary = generateSummaryFromName(func.name);
+            codeIndex.summaries.set(func.key, {
+                name: func.name,
+                type: func.type,
+                file: func.file,
+                line: func.line,
+                summary: summary
+            });
+            generated++;
+            
+            // Update progress every 100 functions
+            if (generated % 100 === 0 || generated === toProcess.length) {
+                const percent = Math.round((generated / toProcess.length) * 80);
+                IndexingState.summariesGenerated = codeIndex.summaries.size;
+                IndexingState.setPhase('summaries', percent);
+                updateSummaryStatus(percent, `📝 Generated ${generated}/${toProcess.length} summaries`);
+            }
+        }
+        
+        log(`generateCodeSummaries: Generated ${generated} name-based summaries`);
+        
+        // Skip to file summaries
+        updateSummaryStatus(85, '📁 Building file summaries...');
+        await generateFileSummaries();
+        updateSummaryStatus(90, '🔍 Creating codebase overview...');
+        await generateOverallSummary();
+        
+        // Rebuild inverted index and complete
+        IndexingState.setPhase('inverted', 95);
+        IndexingState.summariesGenerated = codeIndex.summaries.size;
+        
+        if (typeof searchModule.buildSearchIndexes === 'function') {
+            try {
+                log('generateCodeSummaries: Rebuilding inverted index with name-based summaries...');
+                const searchStats = searchModule.buildSearchIndexes();
+                IndexingState.invertedTerms = searchStats.invertedTerms || 0;
+                log('generateCodeSummaries: Inverted index rebuilt:', JSON.stringify(searchStats));
+            } catch (err) {
+                log('generateCodeSummaries: Inverted index rebuild error:', err.message);
+            }
+        }
+        
+        IndexingState.complete();
+        updateSummaryStatus(100, `✓ ${codeIndex.summaries.size} summaries (name-based)`, codeIndex.summaries.size);
+        
+        if (chatWebviewView) {
+            chatWebviewView.webview.postMessage({
+                type: 'indexProgress',
+                progress: 100,
+                message: `✅ Ready: ${codeIndex.symbols.size} symbols | ${codeIndex.summaries.size} summaries (name-based) | ${IndexingState.invertedTerms} terms`
+            });
+        }
+        
+        return;
+    }
+    
+    // LLM is available - proceed with batch processing
+    log('generateCodeSummaries: LLM available, proceeding with LLM-based summaries');
+    
     // Process in batches
     const batchSize = SUMMARY_CONFIG.SUMMARY_BATCH_SIZE;
     let summarized = 0;
     let actualSummaries = 0;
     let skippedFunctions = 0;
+    let consecutiveFailures = 0;
+    const MAX_CONSECUTIVE_FAILURES = 5;
+    
+    // Show initial progress in chat
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `\n📝 **Generating summaries for ${toProcess.length} functions...**\n\n`
+    });
     
     for (let i = 0; i < toProcess.length; i += batchSize) {
         if (taskController.isCancelled) {
             log('Summary generation cancelled');
             updateSummaryStatus(-1, 'Cancelled');
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `\n⚠️ Summary generation cancelled.\n`
+            });
             break;
         }
         
         const batch = toProcess.slice(i, i + batchSize);
         const beforeCount = codeIndex.summaries.size;
+        const batchNum = Math.floor(i / batchSize) + 1;
+        const totalBatches = Math.ceil(toProcess.length / batchSize);
         
         try {
             await summarizeFunctionBatch(batch);
             summarized += batch.length;
             const addedThisBatch = codeIndex.summaries.size - beforeCount;
             actualSummaries += addedThisBatch;
+            consecutiveFailures = 0; // Reset on success
             
             if (addedThisBatch < batch.length) {
                 skippedFunctions += (batch.length - addedThisBatch);
             }
             
-            // Progress update every few batches
+            // Progress update every few batches - show in chat window
             const updateFrequency = toProcess.length > 500 ? 50 : 20;
             if (summarized % updateFrequency === 0 || summarized === toProcess.length) {
                 const percent = Math.round((summarized / toProcess.length) * 100);
+                IndexingState.summariesGenerated = codeIndex.summaries.size;
+                IndexingState.setPhase('summaries', percent);
                 updateSummaryStatus(percent, `📝 ${codeIndex.summaries.size}/${toProcess.length} (${percent}%)`);
+                
+                // Log progress to chat window every 100 functions
+                if (summarized % 100 === 0 || summarized === toProcess.length) {
+                    const sampleFuncs = batch.slice(0, 3).map(f => f.name).join(', ');
+                    chatWebviewView?.webview.postMessage({ 
+                        type: 'appendResponse', 
+                        text: `✓ Batch ${batchNum}/${totalBatches}: ${codeIndex.summaries.size} summaries (${percent}%) - ${sampleFuncs}...\n`
+                    });
+                }
             }
         } catch (error) {
             log('generateCodeSummaries: Batch error:', error.message);
             skippedFunctions += batch.length;
+            consecutiveFailures++;
+            
+            // Log error to chat
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: `⚠️ Batch ${batchNum} error: ${error.message.substring(0, 50)}...\n`
+            });
+            
+            // If too many consecutive failures, switch to name-based summaries
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n⚠️ LLM rate limited. Switching to name-based summaries for remaining ${toProcess.length - summarized} functions...\n`
+                });
+                
+                // Generate name-based summaries for remaining functions
+                for (let j = i + batchSize; j < toProcess.length; j++) {
+                    const func = toProcess[j];
+                    const summary = generateSummaryFromName(func.name);
+                    codeIndex.summaries.set(func.key, {
+                        name: func.name,
+                        type: func.type,
+                        file: func.file,
+                        line: func.line,
+                        summary: summary
+                    });
+                }
+                summarized = toProcess.length;
+                IndexingState.summariesGenerated = codeIndex.summaries.size;
+                break;
+            }
         }
         
         // Small delay between batches to avoid rate limits
         await new Promise(r => setTimeout(r, 100));
     }
     
+    // Log completion to chat
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `\n✅ **Summary generation complete: ${codeIndex.summaries.size} summaries**\n`
+    });
+    
     // Update status for file summaries phase
     updateSummaryStatus(90, '📁 Building file summaries...');
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `📁 Building file summaries...\n`
+    });
     
     // Generate file-level summaries
     await generateFileSummaries();
@@ -1139,8 +1768,106 @@ async function generateCodeSummaries(maxFunctions = null) {
     
     log(`generateCodeSummaries: Complete. ${codeIndex.summaries.size} function summaries, ${codeIndex.fileSummaries.size} file summaries (${skippedFunctions} skipped)`);
     
+    // ================================================================
+    // REBUILD INVERTED INDEX with summaries now available
+    // ================================================================
+    IndexingState.setPhase('inverted', 95);
+    IndexingState.summariesGenerated = codeIndex.summaries.size;
+    
+    if (typeof searchModule.buildSearchIndexes === 'function') {
+        try {
+            log('generateCodeSummaries: Rebuilding inverted index with summaries...');
+            
+            if (chatWebviewView) {
+                chatWebviewView.webview.postMessage({
+                    type: 'indexProgress',
+                    progress: 95,
+                    message: `📚 Building inverted index with ${codeIndex.summaries.size} summaries...`
+                });
+                chatWebviewView.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `\n📚 **Rebuilding inverted index with ${codeIndex.summaries.size} summaries...**\n`
+                });
+            }
+            
+            const searchStats = searchModule.buildSearchIndexes();
+            IndexingState.invertedTerms = searchStats.invertedTerms || 0;
+            log('generateCodeSummaries: Inverted index rebuilt:', JSON.stringify(searchStats));
+            
+            // Log success to chat
+            if (chatWebviewView) {
+                chatWebviewView.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `✅ Inverted index rebuilt: ${IndexingState.invertedTerms} search terms\n`
+                });
+            }
+        } catch (err) {
+            log('generateCodeSummaries: Inverted index rebuild error:', err.message);
+            if (chatWebviewView) {
+                chatWebviewView.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `⚠️ Inverted index error: ${err.message}\n`
+                });
+            }
+        }
+    }
+    
+    // ================================================================
+    // RE-LEARN QUERY CLASSIFIER with summaries now available
+    // Summaries provide richer term clusters for domain knowledge
+    // ================================================================
+    try {
+        if (queryClassifier) {
+            log('generateCodeSummaries: Re-learning query classifier with summaries...');
+            const classifierStats = queryClassifier.learnFromCodebase(contextFiles, codeIndex);
+            log('generateCodeSummaries: Query classifier re-learned:', JSON.stringify(classifierStats));
+        }
+    } catch (err) {
+        log('generateCodeSummaries: Query classifier re-learning error:', err.message);
+    }
+    
+    // ================================================================
+    // MARK FULLY COMPLETE
+    // ================================================================
+    IndexingState.complete();
+    
     // Show completion in both status bar and webview
     updateSummaryStatus(100, '✓ Summaries complete', codeIndex.summaries.size);
+    
+    if (chatWebviewView) {
+        chatWebviewView.webview.postMessage({
+            type: 'indexProgress',
+            progress: 100,
+            message: `✅ Ready: ${codeIndex.symbols.size} symbols | ${codeIndex.summaries.size} summaries | ${IndexingState.invertedTerms} search terms`
+        });
+        
+        // Final success message in chat
+        chatWebviewView.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `\n🎉 **Indexing complete!**\n- ${codeIndex.symbols.size} symbols\n- ${codeIndex.summaries.size} summaries\n- ${IndexingState.invertedTerms} search terms\n\n**Ready for queries!**\n\n`
+        });
+        chatWebviewView.webview.postMessage({ type: 'finalizeResponse' });
+    }
+    
+    // ================================================================
+    // PERSIST CODE INDEX (saves summaries for next session)
+    // ================================================================
+    if (persistenceManager) {
+        try {
+            log('Persisting code index to storage...');
+            await persistenceManager.saveCodeIndex(codeIndex);
+            log('Code index persisted successfully');
+            
+            if (chatWebviewView) {
+                chatWebviewView.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `💾 Index saved - will load instantly next time\n\n`
+                });
+            }
+        } catch (err) {
+            log('Failed to persist code index:', err.message);
+        }
+    }
     
     // Log if many were skipped
     if (skippedFunctions > toProcess.length * 0.2) {
@@ -1483,6 +2210,7 @@ async function generateFileSummaries() {
     
     log(`generateFileSummaries: Processing ${files.length} files`);
     
+    let processed = 0;
     for (const [filePath, file] of files) {
         if (taskController.isCancelled) break;
         
@@ -1509,8 +2237,16 @@ async function generateFileSummaries() {
             fileSummary = `File ${fileName}: ${lines} lines of ${file.language} code`;
         }
         
-        codeIndex.fileSummaries.set(path, fileSummary);
+        codeIndex.fileSummaries.set(filePath, fileSummary);
+        processed++;
+        
+        // Log progress every 20 files
+        if (processed % 20 === 0 || processed === files.length) {
+            log(`generateFileSummaries: ${processed}/${files.length} files processed`);
+        }
     }
+    
+    log(`generateFileSummaries: Complete. ${codeIndex.fileSummaries.size} file summaries created`);
 }
 
 /**
@@ -2145,6 +2881,7 @@ function isLlmErrorResponse(response) {
 }
 
 async function handleDetailedQuery(query) {
+    
     debugLog('SEARCH', `handleDetailedQuery started`, {
         query: query.substring(0, 100),
         totalFiles: contextFiles.size
@@ -2166,13 +2903,15 @@ async function handleDetailedQuery(query) {
     // Step 1: Search for relevant code using all available methods
     const searchResults = await comprehensiveSearch(query);
     
+    
     debugLog('SEARCH', `comprehensiveSearch completed`, {
         resultsFound: searchResults.length,
         topResults: searchResults.slice(0, 5).map(r => ({
             name: r.name,
             file: pathUtils.getFileName(r.file),
             score: r.score?.toFixed(2),
-            source: r.source
+            source: r.source,
+            hasContent: !!r.content
         }))
     });
     
@@ -2181,16 +2920,104 @@ async function handleDetailedQuery(query) {
         return `No relevant code found for: "${query}". Try rephrasing or check if the functionality exists in the attached files.`;
     }
     
+    // ================================================================
+    // Step 1.5: LOAD ACTUAL SOURCE CODE CONTENT (CRITICAL FIX)
+    // Search results often have content: null - we must load actual code
+    // before analysis, otherwise LLM only sees metadata (file names, line numbers)
+    // ================================================================
+    
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `📂 *Loading source code for ${searchResults.length} matches...*\n`
+    });
+    
+    let contentLoadedCount = 0;
+    let contentAlreadyHadCount = 0;
+    let contentFailedCount = 0;
+    
+    // Group results by file to avoid loading same file multiple times
+    const resultsByFile = new Map();
+    for (const result of searchResults) {
+        if (!result.file) continue;
+        if (!resultsByFile.has(result.file)) {
+            resultsByFile.set(result.file, []);
+        }
+        resultsByFile.get(result.file).push(result);
+    }
+    
+    debugLog('SEARCH', `Loading content for ${resultsByFile.size} unique files`);
+    
+    for (const [filePath, fileResults] of resultsByFile) {
+        // Get the file content from contextFiles
+        let fileContent = null;
+        const file = contextFiles.get(filePath);
+        
+        if (file?.content) {
+            fileContent = file.content;
+        } else {
+            // Try to find by filename match (in case paths differ slightly)
+            const fileName = pathUtils.getFileName(filePath);
+            for (const [ctxPath, ctxFile] of contextFiles) {
+                if (pathUtils.getFileName(ctxPath) === fileName) {
+                    fileContent = ctxFile.content;
+                    break;
+                }
+            }
+        }
+        
+        if (!fileContent) {
+            contentFailedCount += fileResults.length;
+            debugLog('SEARCH', `Could not find content for: ${pathUtils.getFileName(filePath)}`);
+            continue;
+        }
+        
+        // Load content for each result in this file
+        for (const result of fileResults) {
+            if (!result.content) {
+                // Extract context around the result's line
+                // Use larger context (40 lines) to capture function bodies
+                result.content = extractCodeContext(fileContent, result.line || 1, 40);
+                contentLoadedCount++;
+            } else {
+                contentAlreadyHadCount++;
+            }
+        }
+    }
+    
+    debugLog('SEARCH', `Content loading complete`, {
+        loaded: contentLoadedCount,
+        alreadyHad: contentAlreadyHadCount,
+        failed: contentFailedCount,
+        total: searchResults.length
+    });
+    
+    
+    // Filter out results that still have no content
+    const resultsWithContent = searchResults.filter(r => r.content && r.content.length > 0);
+    
+    
+    if (resultsWithContent.length === 0) {
+        debugLog('SEARCH', 'No results with content after loading');
+        return `Found ${searchResults.length} code references but couldn't load their content. Please ensure files are properly added to context.`;
+    }
+    
+    chatWebviewView?.webview.postMessage({ 
+        type: 'appendResponse', 
+        text: `✓ Loaded content for ${contentLoadedCount} code sections\n`
+    });
+    
+    // ================================================================
     // Extract high-priority files (filename matches get score >= 1.4)
+    // ================================================================
     const highPriorityFiles = [...new Set(
-        searchResults
+        resultsWithContent
             .filter(r => r.score >= 1.4 && r.source?.includes('filename'))
             .map(r => pathUtils.getFileName(r.file))
             .filter(Boolean)
     )];
     
     // Extract all analyzed files (deduped)
-    const allFilesAnalyzed = [...new Set(searchResults.map(r => pathUtils.getFileName(r.file)).filter(Boolean))];
+    const allFilesAnalyzed = [...new Set(resultsWithContent.map(r => pathUtils.getFileName(r.file)).filter(Boolean))];
     
     debugLog('SEARCH', `File analysis`, {
         highPriorityFiles,
@@ -2200,19 +3027,22 @@ async function handleDetailedQuery(query) {
     
     chatWebviewView?.webview.postMessage({ 
         type: 'appendResponse', 
-        text: `Found ${searchResults.length} relevant code sections...\n`
+        text: `Found ${resultsWithContent.length} relevant code sections in ${allFilesAnalyzed.length} files...\n`
     });
     
+    // ================================================================
     // Step 2: Chunk the results to fit context window
-    const chunks = chunkSearchResults(searchResults, SUMMARY_CONFIG.CHUNK_SIZE_FOR_QUERY);
+    // ================================================================
+    const chunks = chunkSearchResults(resultsWithContent, SUMMARY_CONFIG.CHUNK_SIZE_FOR_QUERY);
     
     debugLog('SEARCH', `Chunking results`, {
         totalChunks: chunks.length,
-        chunkSizes: chunks.map(c => c.length)
+        chunkSizes: chunks.map(c => c.length),
+        totalContentSize: resultsWithContent.reduce((sum, r) => sum + (r.content?.length || 0), 0)
     });
     
     // Limit chunks to prevent overwhelming the system
-    const MAX_CHUNKS = 8;  // Process at most 8 chunks (reduced to prevent API limits)
+    const MAX_CHUNKS = AGENT_CONFIG.maxChunks || 8;
     const chunksToProcess = chunks.slice(0, MAX_CHUNKS);
     
     if (chunks.length > MAX_CHUNKS) {
@@ -2223,7 +3053,9 @@ async function handleDetailedQuery(query) {
         });
     }
     
+    // ================================================================
     // Step 3: Analyze each chunk
+    // ================================================================
     const chunkAnalyses = [];
     
     for (let i = 0; i < chunksToProcess.length; i++) {
@@ -2231,9 +3063,12 @@ async function handleDetailedQuery(query) {
             throw new Error('Query cancelled by user');
         }
         
+        // Show what files are in this chunk
+        const chunkFiles = [...new Set(chunksToProcess[i].map(r => pathUtils.getFileName(r.file)))];
+        
         chatWebviewView?.webview.postMessage({ 
             type: 'appendResponse', 
-            text: `\n📖 *Analyzing chunk ${i + 1}/${chunksToProcess.length}...*\n`
+            text: `\n📖 *Analyzing chunk ${i + 1}/${chunksToProcess.length} (${chunkFiles.slice(0, 3).join(', ')}${chunkFiles.length > 3 ? '...' : ''})...*\n`
         });
         
         const analysis = await analyzeChunk(query, chunksToProcess[i], i + 1, chunksToProcess.length);
@@ -2247,7 +3082,9 @@ async function handleDetailedQuery(query) {
         chunksProcessed: chunksToProcess.length
     });
     
+    // ================================================================
     // Step 4: Synthesize final answer
+    // ================================================================
     if (chunkAnalyses.length === 0) {
         return `Found code but couldn't analyze it. The code may be too complex or the LLM is unavailable.`;
     }
@@ -2255,7 +3092,7 @@ async function handleDetailedQuery(query) {
     // Always synthesize to get structured format, even for single chunk
     chatWebviewView?.webview.postMessage({ 
         type: 'appendResponse', 
-        text: `\n🧩 *Synthesizing results...*\n`
+        text: `\n🧩 *Synthesizing results from ${chunkAnalyses.length} analyses...*\n`
     });
     
     return await synthesizeChunkAnalyses(query, chunkAnalyses, highPriorityFiles, allFilesAnalyzed);
@@ -2264,6 +3101,8 @@ async function handleDetailedQuery(query) {
 /**
  * Comprehensive search using all available methods
  * Priority: 1) File name matches, 2) Symbol name matches, 3) Grep, 4) Vector
+ * 
+ * v5.2: Query-type-based score boosting
  */
 async function comprehensiveSearch(query) {
     const results = new Map(); // Use map to dedupe by file:line
@@ -2271,34 +3110,229 @@ async function comprehensiveSearch(query) {
     // Extract keywords for search
     const keywords = extractSearchKeywords(query);
     
+    // ================================================================
+    // QUERY TYPE CLASSIFICATION & SCORE BOOSTS (v5.2)
+    // ================================================================
+    let queryType = 'general';
+    let qc = null;
+    
+    if (queryClassifier) {
+        qc = queryClassifier.classify(query);
+        queryType = qc?.type || 'general';
+    }
+    
+    // Score boosts by query type (higher = more important for this query)
+    const BOOSTS = {
+        'concept':       { sum: 2.5, sym: 1.2, tri: 0.5, file: 1.0 },
+        'structure':     { sum: 0.5, sym: 3.0, tri: 1.5, file: 0.8 },
+        'call_graph':    { sum: 0.8, sym: 2.5, tri: 0.8, file: 0.5 },
+        'implementation':{ sum: 2.0, sym: 2.5, tri: 1.5, file: 1.2 },
+        'flow':          { sum: 2.0, sym: 1.5, tri: 0.8, file: 1.0 },
+        'files_trace':   { sum: 1.5, sym: 1.0, tri: 0.8, file: 3.0 },
+        'cross_module':  { sum: 1.0, sym: 2.0, tri: 0.5, file: 1.5 },
+        'general':       { sum: 1.5, sym: 1.2, tri: 1.5, file: 1.0 }
+    };
+    
+    const b = BOOSTS[queryType] || BOOSTS['general'];
+    
     debugLog('SEARCH', 'comprehensiveSearch starting', {
         query: query.substring(0, 80),
         keywords,
+        queryType,
+        boosts: b,
         totalFiles: contextFiles.size,
         indexedSymbols: codeIndex.symbols.size
     });
     
+    // File filter - skip non-code files
+    const SKIP_FILE_PATTERNS = [
+        /\.po$/i, /\.pot$/i,           // Translation files
+        /\.md$/i, /\.txt$/i,           // Documentation
+        /README/i, /LICENSE/i,         // Meta files
+        /\.json$/i, /\.yaml$/i, /\.yml$/i,  // Config (unless specifically asked)
+        /Makefile$/i, /CMakeLists/i,   // Build files
+        /\.css$/i, /\.scss$/i,         // Stylesheets
+    ];
+    
+    const shouldSkipFile = (filePath) => {
+        if (!filePath) return true;
+        // Don't skip if keyword matches filename
+        const fileName = pathUtils.getFileName(filePath).toLowerCase();
+        for (const kw of keywords) {
+            if (fileName.includes(kw.toLowerCase())) return false;
+        }
+        return SKIP_FILE_PATTERNS.some(p => p.test(filePath));
+    };
+
     // ================================================================
-    // 0. FILE NAME MATCHING (HIGHEST PRIORITY)
-    // For "show me X that implements Y", find files with Y in the name
+    // PHASE 0: INVERTED INDEX / CONCEPT SEARCH (Highest Priority)
+    // Best for concept queries like "nested loops", "payment validation"
+    // BOOSTED for: concept (2.5x), flow (2.0x), implementation (2.0x)
+    // ================================================================
+    const invertedBefore = results.size;
+    if (typeof searchModule.searchConcept === 'function') {
+        try {
+            // Search summaries and content for concepts
+            const conceptResults = searchModule.searchConcept(query, { maxResults: 30 });
+            for (const r of conceptResults) {
+                const file = r.file || r.path;
+                if (!file || shouldSkipFile(file)) continue;
+                
+                const key = `${file}:${r.line || 1}`;
+                if (!results.has(key)) {
+                    const baseScore = 2.0 + (r.score || 0) * 0.3;
+                    results.set(key, {
+                        file: file,
+                        line: r.line || 1,
+                        name: r.name || pathUtils.getFileName(file),
+                        type: r.type || 'concept',
+                        score: baseScore * b.sum,  // Apply summary boost
+                        source: 'inverted-concept',
+                        matchedTerms: r.matchedTerms,
+                        content: null
+                    });
+                }
+            }
+            
+            // Also try keyword search on content
+            const keywordResults = searchModule.searchByKeyword ? 
+                searchModule.searchByKeyword(query, { maxResults: 20 }) : [];
+            for (const r of keywordResults) {
+                const file = r.path || r.file;
+                if (!file || shouldSkipFile(file)) continue;
+                
+                const key = `${file}:${r.line || 1}`;
+                if (!results.has(key)) {
+                    const baseScore = 1.8 + (r.score || 0) * 0.2;
+                    results.set(key, {
+                        file: file,
+                        line: r.line || 1,
+                        name: r.name || pathUtils.getFileName(file),
+                        type: 'keyword',
+                        score: baseScore * b.sum * 0.9,  // Apply summary boost
+                        source: 'inverted-keyword',
+                        matchedTerms: r.matchedTerms,
+                        content: null
+                    });
+                }
+            }
+            
+            debugLog('SEARCH', `Phase 0: Inverted index complete`, {
+                summaryBoost: b.sum,
+                newMatches: results.size - invertedBefore,
+                resultsAfterPhase0: results.size
+            });
+        } catch (e) {
+            log('comprehensiveSearch: Inverted index error:', e.message);
+        }
+    }
+
+    // ================================================================
+    // PHASE 1: FILE NAME AND DIRECTORY MATCHING (High Priority)
+    // For "show files related to X", directory matches are most important
+    // Uses QueryClassifier for dynamic term expansion (no hardcoding!)
+    // BOOSTED for: files_trace (3.0x)
     // ================================================================
     let filenameMatches = 0;
-    for (const keyword of keywords) {
-        if (keyword.length < 3) continue;
+    const filenameBefore = results.size;
+    
+    // Use query classifier for intelligent term expansion
+    // This dynamically learns module mappings from the codebase structure
+    let queryClassification = qc;  // Use qc from above
+    const expandedKeywords = new Set();
+    
+    if (queryClassifier && queryClassifier.isLearned) {
+        // Classify the query to get expanded terms and module hints
+        queryClassification = queryClassifier.classify(query);
+        
+        debugLog('SEARCH', 'Query classified', {
+            type: queryClassification.type,
+            entities: queryClassification.entities,
+            expandedTerms: queryClassification.expandedTerms?.slice(0, 5),
+            moduleHints: queryClassification.moduleHints
+        });
+        
+        // Use expanded terms from classifier (includes learned synonyms)
+        for (const term of queryClassification.expandedTerms || []) {
+            expandedKeywords.add(term.toLowerCase());
+        }
+        
+        // Also add original keywords
+        for (const kw of keywords) {
+            expandedKeywords.add(kw.toLowerCase());
+        }
+        
+        // For FILES_TRACE queries, prioritize getting related files directly
+        if (queryClassification.type === QueryTypes.FILES_TRACE && queryClassification.entities.length > 0) {
+            for (const entity of queryClassification.entities) {
+                const relatedFiles = queryClassifier.getRelatedFiles(entity, contextFiles);
+                for (const rf of relatedFiles) {
+                    const key = `${rf.path}:1`;
+                    if (!results.has(key)) {
+                        results.set(key, {
+                            file: rf.path,
+                            line: 1,
+                            name: pathUtils.getFileName(rf.path),
+                            type: 'module-file',
+                            score: (rf.score + 1.5) * b.file,  // Apply file boost
+                            source: `classifier-${rf.reason}`,
+                            content: null
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback: just use original keywords
+        for (const kw of keywords) {
+            expandedKeywords.add(kw.toLowerCase());
+        }
+    }
+    
+    for (const keyword of expandedKeywords) {
+        if (keyword.length < 2) continue;
         const keywordLower = keyword.toLowerCase();
         
         for (const [filePath, file] of contextFiles) {
+            if (shouldSkipFile(filePath)) continue;
+            
             const fileName = pathUtils.getFileName(filePath).toLowerCase();
             const fileNameNoExt = fileName.replace(/\.[^.]+$/, '');
+            const filePathLower = filePath.toLowerCase();
             
-            // Check if filename matches keyword (multiple strategies)
+            // Check for directory/module match (HIGHEST priority)
+            // e.g., "btree" matches files in "/nbtree/" or "/btree/" directories
+            const dirParts = filePathLower.split('/');
+            const isInMatchingDir = dirParts.some(part => 
+                part.includes(keywordLower) || 
+                (part.length >= 3 && keywordLower.includes(part)) ||
+                // Also match "nbtree" for "btree" search
+                (keywordLower.length >= 3 && part.includes(keywordLower.substring(0, keywordLower.length - 1)))
+            );
+            
+            // Check filename match
             const keywordInFile = fileNameNoExt.includes(keywordLower) || fileName.includes(keywordLower);
             const fileInKeyword = keywordLower.length >= 4 && keywordLower.includes(fileNameNoExt.substring(0, Math.min(4, fileNameNoExt.length)));
             const commonPrefix = fileNameNoExt.length >= 4 && keywordLower.length >= 4 && 
-                                fileNameNoExt.substring(0, 4) === keywordLower.substring(0, 4); // e.g., "part" == "part"
+                                fileNameNoExt.substring(0, 4) === keywordLower.substring(0, 4);
             
-            if (keywordInFile || fileInKeyword || commonPrefix) {
-                // This file's name matches - add all its top-level symbols
+            // Score based on match type - apply file boost
+            let matchScore = 0;
+            let matchSource = 'filename-match';
+            
+            if (isInMatchingDir) {
+                // Directory match - HIGHEST priority
+                matchScore = (keywordInFile ? 1.8 : 1.6) * b.file;
+                matchSource = 'directory-match';
+            } else if (keywordInFile) {
+                // Exact filename match
+                matchScore = 1.5 * b.file;
+            } else if (fileInKeyword || commonPrefix) {
+                // Partial filename match
+                matchScore = 1.4 * b.file;
+            }
+            
+            if (matchScore > 0) {
                 let addedFromFile = 0;
                 for (const [symKey, symbol] of codeIndex.symbols) {
                     if (symbol.file === filePath && !symKey.includes('@')) {
@@ -2309,8 +3343,8 @@ async function comprehensiveSearch(query) {
                                 line: symbol.line,
                                 name: symbol.name,
                                 type: symbol.type,
-                                score: 1.5, // HIGHEST score for file name matches
-                                source: 'filename-match',
+                                score: matchScore,
+                                source: matchSource,
                                 content: null
                             });
                             addedFromFile++;
@@ -2318,8 +3352,8 @@ async function comprehensiveSearch(query) {
                     }
                 }
                 
-                // If no symbols found, add the file header
-                if (addedFromFile === 0) {
+                // Also add the file itself as a result
+                if (addedFromFile === 0 || matchScore >= 1.6) {
                     const key = `${filePath}:1`;
                     if (!results.has(key)) {
                         results.set(key, {
@@ -2327,95 +3361,87 @@ async function comprehensiveSearch(query) {
                             line: 1,
                             name: fileName,
                             type: 'file',
-                            score: 1.4,
-                            source: 'filename-match',
+                            score: matchScore - 0.1,  // Slightly lower than symbols
+                            source: matchSource,
                             content: extractCodeContext(file.content, 1, 50)
                         });
                     }
                 }
                 
                 filenameMatches++;
-                log(`comprehensiveSearch: File name match: ${fileName} for keyword "${keyword}" (keywordInFile=${keywordInFile}, fileInKeyword=${fileInKeyword}, commonPrefix=${commonPrefix})`);
             }
         }
     }
     
-    debugLog('SEARCH', `Phase 0: Filename matching complete`, {
+    debugLog('SEARCH', `Phase 1: Filename/directory matching complete`, {
         filenameMatches,
-        resultsAfterPhase0: results.size
+        newMatches: results.size - filenameBefore,
+        resultsAfterPhase1: results.size
     });
-    
+
     // ================================================================
-    // 1. SYMBOL NAME SEARCH (exact matches get higher score)
+    // PHASE 2: SYMBOL NAME SEARCH (Exact and Partial only - NO FUZZY)
+    // BOOSTED for: structure (3.0x), call_graph (2.5x), implementation (2.5x)
     // ================================================================
     const symbolMatchesBefore = results.size;
     for (const keyword of keywords) {
         const keywordLower = keyword.toLowerCase();
         
-        // First: exact symbol name matches
         for (const [symKey, symbol] of codeIndex.symbols) {
             if (symKey.includes('@')) continue;
+            if (shouldSkipFile(symbol.file)) continue;
             
             const symNameLower = symbol.name.toLowerCase();
             const key = `${symbol.file}:${symbol.line}`;
             
-            if (results.has(key)) continue; // Already have from file match
+            if (results.has(key)) continue;
             
-            // Exact match or contains
+            // Exact match - apply symbol boost
             if (symNameLower === keywordLower) {
                 results.set(key, {
                     file: symbol.file,
                     line: symbol.line,
                     name: symbol.name,
                     type: symbol.type,
-                    score: 1.3, // High score for exact name match
+                    score: 1.3 * b.sym,
                     source: 'symbol-exact',
                     content: null
                 });
-            } else if (symNameLower.includes(keywordLower)) {
+            } 
+            // Partial match (keyword in symbol name) - apply symbol boost
+            else if (symNameLower.includes(keywordLower) && keywordLower.length >= 3) {
                 results.set(key, {
                     file: symbol.file,
                     line: symbol.line,
                     name: symbol.name,
                     type: symbol.type,
-                    score: 1.0, // Good score for partial name match
+                    score: 1.0 * b.sym,
                     source: 'symbol-partial',
-                    content: null
-                });
-            }
-        }
-        
-        // Then fuzzy search for remaining
-        const symbolResults = fuzzySearchSymbols(keyword, null, 20);
-        for (const symbol of symbolResults) {
-            const key = `${symbol.file}:${symbol.line}`;
-            if (!results.has(key)) {
-                results.set(key, {
-                    file: symbol.file,
-                    line: symbol.line,
-                    name: symbol.name,
-                    type: symbol.type,
-                    score: symbol.matchScore || 0.5,
-                    source: 'symbol-fuzzy',
                     content: null
                 });
             }
         }
     }
     
-    debugLog('SEARCH', `Phase 1: Symbol search complete`, {
+    debugLog('SEARCH', `Phase 2: Symbol exact/partial complete`, {
+        symbolBoost: b.sym,
         newMatches: results.size - symbolMatchesBefore,
-        resultsAfterPhase1: results.size
+        resultsAfterPhase2: results.size
     });
-    
-    // 2. TRIGRAM SEARCH (fast partial/exact text matching)
+
+    // ================================================================
+    // PHASE 3: TRIGRAM SEARCH
+    // BOOSTED for: structure (1.5x), implementation (1.5x), general (1.5x)
+    // ================================================================
     const trigramMatchesBefore = results.size;
-    if (trigramIndex.index.size > 0) {
+    if (trigramIndex && trigramIndex.index && trigramIndex.index.size > 0) {
         for (const keyword of keywords.slice(0, 3)) {
             if (keyword.length < 3) continue;
             try {
                 const trigramResults = searchTrigramIndex(keyword, { maxResults: 15 });
                 for (const tr of trigramResults) {
+                    if (shouldSkipFile(tr.file)) continue;
+                    
                     const key = `${tr.file}:${tr.line}`;
                     if (!results.has(key)) {
                         results.set(key, {
@@ -2423,7 +3449,7 @@ async function comprehensiveSearch(query) {
                             line: tr.line,
                             name: tr.context?.split('\n')[0]?.substring(0, 50) || keyword,
                             type: 'trigram',
-                            score: 0.8,  // Between symbol (1.0) and grep (0.6)
+                            score: 0.8 * b.tri,
                             source: 'trigram',
                             content: tr.context
                         });
@@ -2435,15 +3461,18 @@ async function comprehensiveSearch(query) {
         }
     }
     
-    debugLog('SEARCH', `Phase 2: Trigram search complete`, {
-        trigramIndexSize: trigramIndex.index.size,
+    debugLog('SEARCH', `Phase 3: Trigram search complete`, {
+        trigramBoost: b.tri,
+        trigramIndexSize: trigramIndex?.index?.size || 0,
         newMatches: results.size - trigramMatchesBefore,
-        resultsAfterPhase2: results.size
+        resultsAfterPhase3: results.size
     });
-    
-    // 3. Grep search (for things symbol parser might miss)
+
+    // ================================================================
+    // PHASE 4: GREP SEARCH (fallback text search)
+    // ================================================================
     const grepMatchesBefore = results.size;
-    for (const keyword of keywords.slice(0, 3)) { // Limit grep keywords
+    for (const keyword of keywords.slice(0, 3)) {
         try {
             const grepResults = await AGENT_TOOLS.grep_context.execute({ 
                 pattern: keyword, 
@@ -2453,7 +3482,7 @@ async function comprehensiveSearch(query) {
             if (grepResults.success && grepResults.data?.results) {
                 for (const match of grepResults.data.results) {
                     const file = findFileByName(match.fileName);
-                    if (file) {
+                    if (file && !shouldSkipFile(file.path)) {
                         const key = `${file.path}:${match.startLine}`;
                         if (!results.has(key)) {
                             results.set(key, {
@@ -2474,17 +3503,21 @@ async function comprehensiveSearch(query) {
         }
     }
     
-    debugLog('SEARCH', `Phase 3: Grep search complete`, {
+    debugLog('SEARCH', `Phase 4: Grep search complete`, {
         newMatches: results.size - grepMatchesBefore,
-        resultsAfterPhase3: results.size
+        resultsAfterPhase4: results.size
     });
-    
-    // 3. Vector search (if available)
+
+    // ================================================================
+    // PHASE 5: VECTOR SEARCH (semantic similarity)
+    // ================================================================
     const vectorMatchesBefore = results.size;
-    if (vectorIndex.chunks.length > 0) {
+    if (vectorIndex && vectorIndex.chunks && vectorIndex.chunks.length > 0) {
         try {
             const vectorResults = await hybridSearch(query, { maxResults: 20 });
             for (const vr of vectorResults) {
+                if (shouldSkipFile(vr.file)) continue;
+                
                 const key = `${vr.file}:${vr.line}`;
                 if (!results.has(key)) {
                     results.set(key, {
@@ -2503,22 +3536,24 @@ async function comprehensiveSearch(query) {
         }
     }
     
-    debugLog('SEARCH', `Phase 4: Vector search complete`, {
-        vectorIndexSize: vectorIndex.chunks.length,
+    debugLog('SEARCH', `Phase 5: Vector search complete`, {
+        vectorIndexSize: vectorIndex?.chunks?.length || 0,
         newMatches: results.size - vectorMatchesBefore,
-        resultsAfterPhase4: results.size
+        resultsAfterPhase5: results.size
     });
-    
-    // 4. Call graph traversal for tracing queries
+
+    // ================================================================
+    // PHASE 6: CALL GRAPH TRAVERSAL (for trace queries)
+    // ================================================================
     if (/trace|flow|call|calls|calling|invokes?/i.test(query)) {
+        const callGraphBefore = results.size;
         for (const keyword of keywords) {
             const symbol = codeIndex.symbols.get(keyword);
             if (symbol && codeIndex.callGraph.has(keyword)) {
-                // Add called functions
                 const calls = codeIndex.callGraph.get(keyword);
                 for (const called of calls) {
                     const calledSymbol = codeIndex.symbols.get(called);
-                    if (calledSymbol) {
+                    if (calledSymbol && !shouldSkipFile(calledSymbol.file)) {
                         const key = `${calledSymbol.file}:${calledSymbol.line}`;
                         if (!results.has(key)) {
                             results.set(key, {
@@ -2534,12 +3569,11 @@ async function comprehensiveSearch(query) {
                     }
                 }
                 
-                // Add callers
                 const callers = codeIndex.reverseCallGraph.get(keyword);
                 if (callers) {
                     for (const caller of callers) {
                         const callerSymbol = codeIndex.symbols.get(caller);
-                        if (callerSymbol) {
+                        if (callerSymbol && !shouldSkipFile(callerSymbol.file)) {
                             const key = `${callerSymbol.file}:${callerSymbol.line}`;
                             if (!results.has(key)) {
                                 results.set(key, {
@@ -2557,79 +3591,94 @@ async function comprehensiveSearch(query) {
                 }
             }
         }
-    }
-    
-    // Convert to array and fill in content
-    const resultsArray = Array.from(results.values());
-    
-    for (const result of resultsArray) {
-        if (!result.content && result.file) {
-            const file = contextFiles.get(result.file);
-            if (file) {
-                result.content = extractCodeContext(file.content, result.line, 30);
-            }
-        }
-    }
-    
-    // Sort by score
-    resultsArray.sort((a, b) => b.score - a.score);
-    
-    // VERBOSE: Show comprehensive search results
-    if (AGENT_CONFIG.verboseSearch && resultsArray.length > 0) {
-        let verboseOutput = '\n**🔎 comprehensiveSearch Results:**\n\n';
-        verboseOutput += `**Keywords:** \`${keywords.slice(0, 10).join('`, `')}\`\n\n`;
-        
-        // Group by source
-        const bySource = {};
-        for (const r of resultsArray) {
-            const src = r.source || 'unknown';
-            if (!bySource[src]) bySource[src] = [];
-            bySource[src].push(r);
-        }
-        
-        verboseOutput += `| Source | Count | Top Matches |\n`;
-        verboseOutput += `|:-------|:------|:------------|\n`;
-        for (const [src, items] of Object.entries(bySource)) {
-            const topNames = items.slice(0, 5).map(i => i.name).join(', ');
-            verboseOutput += `| ${src} | ${items.length} | ${topNames.substring(0, 60)}... |\n`;
-        }
-        
-        verboseOutput += `\n**Top 10 Results:**\n`;
-        for (const r of resultsArray.slice(0, 10)) {
-            const fileName = pathUtils.getFileName(r.file) || 'unknown';
-            verboseOutput += `- \`${r.name}\` (${r.type}) in ${fileName}:${r.line} [score=${r.score.toFixed(2)}, src=${r.source}]\n`;
-        }
-        verboseOutput += '\n---\n\n';
-        
-        chatWebviewView?.webview.postMessage({ 
-            type: 'appendResponse', 
-            text: verboseOutput
+        debugLog('SEARCH', `Phase 6: Call graph complete`, {
+            newMatches: results.size - callGraphBefore
         });
     }
+
+    // ================================================================
+    // PHASE 7: FUZZY SEARCH (LAST RESORT - only if < 5 results)
+    // ================================================================
+    const MIN_RESULTS_BEFORE_FUZZY = 5;
     
-    // Final summary by source
-    const bySourceSummary = {};
-    for (const r of resultsArray) {
-        bySourceSummary[r.source] = (bySourceSummary[r.source] || 0) + 1;
+    if (results.size < MIN_RESULTS_BEFORE_FUZZY) {
+        debugLog('SEARCH', `Phase 7: Running fuzzy search (only ${results.size} results so far)`);
+        
+        const fuzzyMatchesBefore = results.size;
+        for (const keyword of keywords) {
+            if (keyword.length < 3) continue;
+            
+            const symbolResults = fuzzySearchSymbols(keyword, null, 50, 20);  // minScore=50
+            for (const symbol of symbolResults) {
+                if (shouldSkipFile(symbol.file)) continue;
+                
+                const key = `${symbol.file}:${symbol.line}`;
+                if (!results.has(key)) {
+                    // NORMALIZE SCORE: divide by 100 and cap at 0.4
+                    const normalizedScore = Math.min((symbol.matchScore || 50) / 100 * 0.5, 0.4);
+                    
+                    results.set(key, {
+                        file: symbol.file,
+                        line: symbol.line,
+                        name: symbol.name,
+                        type: symbol.type,
+                        score: normalizedScore,  // 0.0 - 0.4 range
+                        source: 'symbol-fuzzy',
+                        content: null
+                    });
+                }
+            }
+            
+            // Stop fuzzy if we have enough results now
+            if (results.size >= 20) break;
+        }
+        
+        debugLog('SEARCH', `Phase 7: Fuzzy search complete`, {
+            newMatches: results.size - fuzzyMatchesBefore,
+            resultsAfterPhase7: results.size
+        });
+    } else {
+        debugLog('SEARCH', `Phase 7: Skipping fuzzy search (have ${results.size} good results)`);
+    }
+
+    // ================================================================
+    // FINAL: Sort by score and return
+    // ================================================================
+    const sortedResults = Array.from(results.values())
+        .sort((a, b) => b.score - a.score);
+    
+    // Debug output
+    if (Config?.general?.verboseDebug) {
+        let verboseOutput = '\n**🔎 comprehensiveSearch Results:**\n\n';
+        verboseOutput += `Keywords: ${keywords.join(', ')}\n\n`;
+        verboseOutput += '| Source | Count | Top Matches |\n|:-------|:------|:------------|\n';
+        
+        const bySrc = {};
+        for (const r of sortedResults) {
+            if (!bySrc[r.source]) bySrc[r.source] = [];
+            bySrc[r.source].push(r.name);
+        }
+        for (const [src, names] of Object.entries(bySrc)) {
+            verboseOutput += `| ${src} | ${names.length} | ${names.slice(0, 5).join(', ')}... |\n`;
+        }
+        
+        verboseOutput += '\nTop 10 Results:\n';
+        for (const r of sortedResults.slice(0, 10)) {
+            verboseOutput += `- ${r.name} (${r.type}) in ${pathUtils.getFileName(r.file)}:${r.line} [score=${r.score.toFixed(2)}, src=${r.source}]\n`;
+        }
+        
+        chatWebviewView?.webview.postMessage({ type: 'appendResponse', text: verboseOutput });
     }
     
     debugLog('SEARCH', 'comprehensiveSearch complete', {
-        totalResults: resultsArray.length,
-        bySource: bySourceSummary,
-        topScores: resultsArray.slice(0, 5).map(r => ({
-            name: r.name,
-            score: r.score?.toFixed(2),
-            source: r.source
-        }))
+        totalResults: sortedResults.length,
+        topScore: sortedResults[0]?.score,
+        topSource: sortedResults[0]?.source
     });
     
-    return resultsArray.slice(0, 50); // Limit results
+    return sortedResults;
 }
 
-/**
- * Extract search keywords from query
- * Also extracts specific file names mentioned
- */
 function extractSearchKeywords(query) {
     // Remove common words AND task words (words that describe what to do, not what to search for)
     const stopWords = new Set([
@@ -2690,7 +3739,93 @@ function extractSearchKeywords(query) {
     // Combine and dedupe
     const allTerms = [...new Set([...words, ...extraTerms])];
     
-    return allTerms.slice(0, 10); // Limit keywords
+    // ================================================================
+    // QUERY EXPANSION: Add executor/implementation file hints
+    // When asking "how X is implemented", add executor file patterns
+    // ================================================================
+    const queryLower = query.toLowerCase();
+    const isImplementationQuery = queryLower.match(/\b(how|implement|execution|execute|perform|process|algorithm)\b/);
+    
+    if (isImplementationQuery) {
+        // Add "node" prefix for executor files in PostgreSQL (e.g., nodeHashjoin, nodeSeqscan)
+        for (const term of allTerms.slice(0, 5)) {
+            const termLower = term.toLowerCase();
+            // Add executor file patterns
+            if (!termLower.startsWith('node')) {
+                extraTerms.push('node' + term);      // nodeHashjoin
+                extraTerms.push('Node' + term);      // NodeHashjoin
+            }
+            // Add "Exec" prefix for execution functions
+            if (!termLower.startsWith('exec')) {
+                extraTerms.push('Exec' + term);      // ExecHashJoin
+                extraTerms.push('exec' + term);      // execHashjoin
+            }
+        }
+        
+        // Common PostgreSQL executor patterns
+        if (queryLower.includes('hash') && queryLower.includes('join')) {
+            extraTerms.push('nodeHashjoin', 'ExecHashJoin', 'HashJoinState', 'hashtable');
+        }
+        if (queryLower.includes('seq') || queryLower.includes('scan')) {
+            extraTerms.push('nodeSeqscan', 'ExecSeqScan', 'SeqScanState');
+        }
+        if (queryLower.includes('index')) {
+            extraTerms.push('nodeIndexscan', 'ExecIndexScan', 'IndexScanState');
+        }
+        if (queryLower.includes('sort')) {
+            extraTerms.push('nodeSort', 'ExecSort', 'SortState', 'tuplesort');
+        }
+        if (queryLower.includes('aggregate') || queryLower.includes('group')) {
+            extraTerms.push('nodeAgg', 'ExecAgg', 'AggState');
+        }
+        
+        // Query execution pipeline questions
+        if (queryLower.includes('query') && (queryLower.includes('parsing') || queryLower.includes('execution') || queryLower.includes('pipeline') || queryLower.includes('flow'))) {
+            extraTerms.push(
+                'postgres', 'postmaster',           // Entry points
+                'exec_simple_query', 'PostgresMain', // Main query handler
+                'pg_parse_query', 'raw_parser',     // Parser
+                'parse_analyze', 'transformStmt',   // Analyzer
+                'pg_rewrite_query', 'QueryRewrite', // Rewriter
+                'pg_plan_query', 'planner',         // Planner
+                'ExecutorStart', 'ExecutorRun', 'ExecutorEnd', // Executor
+                'PortalRun', 'ProcessQuery'         // Portal/Query processing
+            );
+        }
+    }
+    
+    // ================================================================
+    // MODULE/DIRECTORY EXPANSION: Map topic names to PostgreSQL modules
+    // ================================================================
+    const moduleExpansions = {
+        'btree': ['nbtree', 'nbtinsert', 'nbtsearch', 'nbtpage', 'nbtsort', 'nbtutils', 'nbtxlog', 'btree'],
+        'hash': ['hash', 'hashinsert', 'hashsearch', 'hashpage', 'hashutil', 'hashfunc'],
+        'gist': ['gist', 'gistutil', 'gistbuild', 'gistscan', 'gistget', 'gistproc'],
+        'gin': ['gin', 'ginutil', 'gininsert', 'ginscan', 'ginget', 'ginfast', 'ginlogic'],
+        'brin': ['brin', 'brin_inclusion', 'brin_minmax', 'brin_bloom', 'brin_tuple'],
+        'heap': ['heapam', 'hio', 'pruneheap', 'vacuumlazy', 'visibilitymap', 'syncscan'],
+        'vacuum': ['vacuum', 'vacuumlazy', 'analyze', 'autovacuum'],
+        'wal': ['xlog', 'xloginsert', 'xlogreader', 'xlogrecovery', 'xlogutils'],
+        'lock': ['lock', 'lmgr', 'lwlock', 'predicate', 'deadlock'],
+        'buffer': ['bufmgr', 'freelist', 'localbuf', 'bufpage'],
+        'storage': ['smgr', 'md', 'fd', 'buffile', 'copydir'],
+        'catalog': ['pg_class', 'pg_type', 'pg_attribute', 'pg_index', 'syscache', 'catcache'],
+        'executor': ['execMain', 'execProcnode', 'execScan', 'execTuples', 'execUtils'],
+        'planner': ['planner', 'planmain', 'subselect', 'setrefs', 'pathnode', 'costsize'],
+        'parser': ['parser', 'analyze', 'gram', 'scan', 'parse_clause', 'parse_expr'],
+        'rewriter': ['rewriteHandler', 'rewriteManip', 'rewriteDefine', 'rewriteSupport'],
+    };
+    
+    for (const [topic, expansions] of Object.entries(moduleExpansions)) {
+        if (queryLower.includes(topic)) {
+            extraTerms.push(...expansions);
+        }
+    }
+    
+    // Re-dedupe after expansion
+    const finalTerms = [...new Set([...allTerms, ...extraTerms.filter(t => t.length > 2)])];
+    
+    return finalTerms.slice(0, 25); // Limit keywords (increased for expanded terms)
 }
 
 /**
@@ -2775,54 +3910,115 @@ function chunkSearchResults(results, maxChunkSize) {
  * Analyze a chunk of search results
  */
 async function analyzeChunk(query, chunk, chunkNum, totalChunks) {
-    // Build context from chunk
+    
+    // Build context from chunk - now with actual source code content
     let context = '';
+    let filesInChunk = new Set();
+    let hasActualContent = false;
+    
     for (const result of chunk) {
-        context += `\n### ${result.name} (${result.type} in ${result.file?.split('/').pop()}:${result.line})\n`;
-        context += `Source: ${result.source}, Score: ${(result.score * 100).toFixed(0)}%\n`;
-        if (result.content) {
-            context += `\`\`\`\n${result.content}\n\`\`\`\n`;
+        const fileName = result.file?.split('/').pop() || 'unknown';
+        filesInChunk.add(fileName);
+        
+        context += `\n### ${result.name} (${result.type} in ${fileName}:${result.line})\n`;
+        
+        if (result.content && result.content.length > 0) {
+            hasActualContent = true;
+            // Determine language for syntax highlighting
+            const ext = fileName.split('.').pop()?.toLowerCase() || '';
+            const langMap = {
+                'c': 'c', 'h': 'c', 'cpp': 'cpp', 'hpp': 'cpp', 'cc': 'cpp',
+                'java': 'java', 'py': 'python', 'js': 'javascript', 'ts': 'typescript',
+                'go': 'go', 'rs': 'rust', 'rb': 'ruby', 'php': 'php',
+                'sql': 'sql', 'sh': 'bash', 'yaml': 'yaml', 'json': 'json',
+                'tal': 'c', 'cob': 'cobol', 'cbl': 'cobol'
+            };
+            const lang = langMap[ext] || '';
+            context += `\`\`\`${lang}\n${result.content}\n\`\`\`\n`;
+        } else {
+            context += `[No source content available - metadata only]\n`;
         }
     }
     
+    
+    // Warn if no actual content
+    if (!hasActualContent) {
+        log(`analyzeChunk: WARNING - Chunk ${chunkNum} has no actual source code content!`);
+        debugLog('SEARCH', `Chunk ${chunkNum} has no content`, {
+            results: chunk.length,
+            files: Array.from(filesInChunk)
+        });
+    }
+    
     // IMPORTANT: Limit context size to prevent "prompt too large" errors
-    // API limit is 25000 chars, leave room for instructions (~500 chars)
-    const MAX_CONTEXT_SIZE = 8000;  // Conservative limit
+    const MAX_CONTEXT_SIZE = 12000;  // Increased since we now have actual code
     if (context.length > MAX_CONTEXT_SIZE) {
         log(`analyzeChunk: Truncating context from ${context.length} to ${MAX_CONTEXT_SIZE} chars`);
         context = context.substring(0, MAX_CONTEXT_SIZE) + '\n\n[... context truncated for size ...]';
     }
     
-    const prompt = `Analyze this code to answer the user's question.
+    // Detect if this is a "how" or "explain" question that needs structured analysis
+    const isHowExplainQuery = /\b(how|explain|describe|what happens|walk.?through|detail|mechanism|process|algorithm|implementation|parsed|parsing|works)\b/i.test(query);
+    
+    
+    // Build the appropriate prompt based on query type
+    let prompt;
+    
+    if (isHowExplainQuery) {
+        // Use ALGORITHM_GUIDANCE structure for how/explain questions
+        prompt = `Analyze the following SOURCE CODE to answer the user's question.
 
-## Code Context (Chunk ${chunkNum}/${totalChunks})
+## Source Code (Chunk ${chunkNum}/${totalChunks})
+Files: ${Array.from(filesInChunk).join(', ')}
+
+${context}
+
+## User Question
+${query}
+
+${ALGORITHM_GUIDANCE}
+
+## CRITICAL RULES FOR THIS CHUNK
+1. **ANALYZE ONLY THE CODE SHOWN ABOVE** - don't use general knowledge about similar systems
+2. Show ACTUAL code snippets from the chunk above in your steps
+3. Cite file:line for every claim
+4. If a section has no findings in THIS chunk, write "Not visible in this chunk"
+5. **SKIP** Makefile, meson.build, README - focus on implementation files (.c, .h, .java, .py, .js)
+6. This is chunk ${chunkNum} of ${totalChunks} - other chunks may have additional details
+
+Your structured analysis based on the source code above:`;
+    } else {
+        // Standard analysis for non-how/explain questions
+        prompt = `Analyze the following SOURCE CODE to answer the user's question.
+
+## Source Code (Chunk ${chunkNum}/${totalChunks})
+Files: ${Array.from(filesInChunk).join(', ')}
+
 ${context}
 
 ## User Question
 ${query}
 
 ## Instructions
-1. Focus on answering the specific question using SOURCE CODE that IMPLEMENTS or DEFINES the functionality
-2. PRIORITIZE: Files that contain actual content or implementation:
-   - Code: .c, .h, .java, .py, .js, .ts, .go, .rs, .cpp, .hpp, .cs, .rb, .php, .swift, .kt, .scala
-   - Data: .csv, .tsv, .xls, .xlsx, .json, .xml
-   - Documents: .pdf, .txt, .doc, .docx
-   - Config with logic: .sql, .sh, .bash, .ps1, .yaml, .yml
-3. **SKIP THESE FILES ENTIRELY** - Do NOT include them in your analysis:
-   - Makefile, GNUmakefile, meson.build, CMakeLists.txt, configure.ac
-   - README, README.md, CHANGELOG, LICENSE
-   - These files only LIST or REFERENCE source files - they contain NO implementation code
-   - Example: If Makefile says "partbounds.o", the implementation is in partbounds.c - analyze partbounds.c, ignore Makefile
-4. If a Makefile mentions "freelist.o", the IMPLEMENTATION is in freelist.c - focus on the .c file
-5. Reference specific functions, line numbers, and code patterns from implementation files
-6. If this chunk doesn't fully answer the question, note what's found and what might be missing
-7. Keep your analysis under 1500 words - focus on key insights
-8. Be concise but thorough
+1. **ANALYZE THE ACTUAL CODE** shown above - don't use general knowledge about similar systems
+2. Extract specific insights from the code:
+   - Function names, signatures, and their purposes
+   - Data structures and their fields
+   - Control flow and logic patterns
+   - Key algorithms and operations
+3. Quote specific code snippets or line numbers to support your analysis
+4. Explain what the code does based on what you see, not what you assume
+5. If the code is incomplete or truncated, note what's visible and what might be in other chunks
+6. **SKIP** analysis of Makefile, meson.build, README - these don't contain implementation
+7. Focus on .c, .h, .java, .py, .js files that have actual implementation code
 
-Your analysis:`;
+Your analysis based on the source code:`;
+    }
+
 
     try {
         let analysis = await callLanguageModel(prompt);
+        
         
         // Check if the response is actually an error message
         if (isLlmErrorResponse(analysis)) {
@@ -2831,7 +4027,7 @@ Your analysis:`;
         }
         
         // Truncate overly long analyses to prevent prompt explosion
-        const MAX_ANALYSIS_LENGTH = 8000;  // ~2000 words
+        const MAX_ANALYSIS_LENGTH = 10000;  // ~2500 words
         if (analysis && analysis.length > MAX_ANALYSIS_LENGTH) {
             log(`analyzeChunk: Truncating analysis from ${analysis.length} to ${MAX_ANALYSIS_LENGTH} chars`);
             analysis = analysis.substring(0, MAX_ANALYSIS_LENGTH) + '\n\n[... truncated for brevity ...]';
@@ -2848,6 +4044,7 @@ Your analysis:`;
  * Synthesize multiple chunk analyses into final answer
  */
 async function synthesizeChunkAnalyses(query, analyses, priorityFiles = [], allFilesAnalyzed = []) {
+    
     // ================================================================
     // HIERARCHICAL MAP/REDUCE SYNTHESIS
     // If we have many analyses, merge them in batches to avoid token limits
@@ -2861,6 +4058,7 @@ async function synthesizeChunkAnalyses(query, analyses, priorityFiles = [], allF
     
     // Check if we need hierarchical merging
     let combinedAnalyses = analyses.map((a, i) => `### Part ${i + 1}\n${a}`).join('\n\n');
+    
     
     if (combinedAnalyses.length > MAX_COMBINED_SIZE && analyses.length > MAX_BATCH_SIZE) {
         log(`synthesizeChunkAnalyses: Content too large (${Math.round(combinedAnalyses.length/1024)}KB), using hierarchical merge`);
@@ -2910,11 +4108,19 @@ ${batchContent}
 1. PRESERVE all specific code references (function names, file names, line numbers)
 2. PRESERVE technical patterns and implementation details
 3. PRESERVE the "how it works" explanations with concrete examples
-4. Remove only true duplicates where the exact same point is made twice
-5. Organize by topic (e.g., "Parent/Child Relationships", "Catalog Storage", "Key Functions")
-6. Keep technical depth - this is for developers, not executives
-7. Target 2500-3000 words - detail is more important than brevity
-8. **OMIT any analysis of Makefile, meson.build, CMakeLists.txt, README** - these are build files, not implementation
+4. PRESERVE code snippets that demonstrate key logic
+5. Remove only true duplicates where the exact same point is made twice
+6. For HOW/EXPLAIN questions, maintain this structure:
+   - High-Level Summary
+   - Key Inputs and Outputs  
+   - Core Algorithm Steps (with code snippets)
+   - Key Data Structures
+   - Key Functions
+   - Process Flow
+   - Error Handling
+7. Keep technical depth - this is for developers, not executives
+8. Target 2500-3000 words - detail is more important than brevity
+9. **OMIT any analysis of Makefile, meson.build, CMakeLists.txt, README** - these are build files, not implementation
 
 Merged technical summary:`;
 
@@ -2991,6 +4197,7 @@ ${topPriorityFiles.map(f => `- ${f}`).join('\n')}
     // Use the two-stage synthesis approach for consistent formatting
     const subQuestions = decomposeQuestion(query);
     
+    
     // Route through the two-stage synthesis function
     const result = await synthesizeFindingsWithReferences(
         query,
@@ -3003,13 +4210,40 @@ ${topPriorityFiles.map(f => `- ${f}`).join('\n')}
         []  // functionsFound
     );
     
+    
     if (result.success && result.data?.answer) {
         return result.data.answer;
     }
     
     // Fallback if two-stage fails
     log('synthesizeChunkAnalyses: Two-stage failed, falling back to direct synthesis');
-    const prompt = `Synthesize these partial analyses into a complete answer.
+    
+    // Detect if this is a "how" or "explain" question
+    const isHowExplainQuery = /\b(how|explain|describe|what happens|walk.?through|detail|mechanism|process|algorithm|implementation|parsed|parsing|works)\b/i.test(query);
+    
+    let prompt;
+    if (isHowExplainQuery) {
+        prompt = `Synthesize these partial analyses into a complete, structured answer.
+
+## Original Question
+${query}
+
+## Analyses from Different Code Sections
+${combinedAnalyses}
+
+${ALGORITHM_GUIDANCE}
+
+## Additional Instructions
+1. Combine the insights from all analyses into the structured format above
+2. Resolve any contradictions between sections
+3. Include specific code references (function names, file:line)
+4. Show actual code snippets for key steps
+5. **NEVER mention or summarize**: Makefile, meson.build, CMakeLists.txt, README files
+6. If a section has no findings, write "Not found in analyzed code"
+
+Final synthesized answer:`;
+    } else {
+        prompt = `Synthesize these partial analyses into a complete answer.
 
 ## Original Question
 ${query}
@@ -3023,12 +4257,11 @@ ${combinedAnalyses}
 3. Provide a coherent, complete answer
 4. Include specific code references (function names, line numbers)
 5. Structure the answer logically (overview first, then details)
-6. FOCUS ON FILES that contain actual content - code (.c, .h, .java, .py, .js, etc.), data (.csv, .xls, .pdf), documents (.txt, .doc), scripts (.sql, .sh)
+6. FOCUS ON FILES that contain actual content - code (.c, .h, .java, .py, .js, etc.)
 7. **NEVER mention or summarize**: Makefile, meson.build, CMakeLists.txt, README files
-   - These are build configuration files that only LIST source files
-   - They contain ZERO implementation code - skip them entirely in your response
 
 Final synthesized answer:`;
+    }
 
     const fallbackResult = await callLanguageModel(prompt);
     
@@ -6542,6 +7775,7 @@ async function classifyQueryWithLLM(query, fileCount) {
         fileCount
     });
     
+    // Use prompt library for classification - extended version with more categories
     const classificationPrompt = `You are a query classifier for a code assistant. The user has ${fileCount} files attached.
 
 Classify this query into ONE of these categories:
@@ -6606,7 +7840,7 @@ Respond with ONLY the category name (overview, domain, specific, or general), no
 
 /**
  * Quick LLM call for classification (shorter response, no streaming)
- * Uses the configured lightweight model (astra.llm.classificationModel)
+ * Uses the configured lightweight model via LLMConfig
  * to save tokens/cost on simple classification tasks
  */
 async function callLanguageModelQuick(prompt) {
@@ -6616,9 +7850,8 @@ async function callLanguageModelQuick(prompt) {
             return null;
         }
         
-        // Get the configured classification model (default: gpt-4o-mini)
-        const config = vscode.workspace.getConfiguration('astra');
-        const preferredModel = config.get('llm.classificationModel') || 'gpt-4o-mini';
+        // Get the classification model from centralized config
+        const preferredModel = LLMConfig.getModelForTask(LLMConfig.TASKS.CLASSIFICATION);
         log('callLanguageModelQuick: Preferred classification model:', preferredModel);
         
         // Get available models
@@ -6634,46 +7867,23 @@ async function callLanguageModelQuick(prompt) {
         
         log('callLanguageModelQuick: Available models:', models.map(m => m.name || m.id).join(', '));
         
-        // Try to find the preferred lightweight model
+        // Use centralized model search order from LLMConfig
         let model = null;
-        const preferredLower = preferredModel.toLowerCase();
-        
-        // Search order for lightweight models (prioritize mini/haiku variants)
-        const lightweightSearchOrder = [
-            // Exact match for configured model
-            m => (m.name?.toLowerCase().includes(preferredLower) || 
-                  m.id?.toLowerCase().includes(preferredLower) ||
-                  m.family?.toLowerCase().includes(preferredLower)),
-            // GPT-4o-mini variants
-            m => (m.name?.toLowerCase().includes('gpt-4o-mini') || 
-                  m.id?.toLowerCase().includes('gpt-4o-mini') ||
-                  m.family?.toLowerCase().includes('gpt-4o-mini')),
-            // GPT-3.5 variants
-            m => (m.name?.toLowerCase().includes('gpt-3.5') || 
-                  m.id?.toLowerCase().includes('gpt-3.5') ||
-                  m.family?.toLowerCase().includes('gpt-3.5')),
-            // Claude Haiku variants
-            m => (m.name?.toLowerCase().includes('haiku') || 
-                  m.id?.toLowerCase().includes('haiku') ||
-                  m.family?.toLowerCase().includes('haiku')),
-            // Any mini model
-            m => (m.name?.toLowerCase().includes('mini') || 
-                  m.id?.toLowerCase().includes('mini')),
-        ];
+        const modelSearchOrder = LLMConfig.getModelSearchOrder(preferredModel);
         
         // Try each search pattern
-        for (const searchFn of lightweightSearchOrder) {
+        for (const searchFn of modelSearchOrder) {
             model = models.find(searchFn);
             if (model) {
-                log('callLanguageModelQuick: Found lightweight model:', model.name || model.id);
+                log('callLanguageModelQuick: Found model:', model.name || model.id);
                 break;
             }
         }
         
-        // Fallback to first available model if no lightweight model found
+        // Fallback to first available model if no match found
         if (!model) {
             model = models[0];
-            log('callLanguageModelQuick: No lightweight model found, using fallback:', model.name || model.id);
+            log('callLanguageModelQuick: Using fallback model:', model.name || model.id);
         }
         
         log('callLanguageModelQuick: Using model:', model.name || model.id, '(preferred was:', preferredModel + ')');
@@ -6780,13 +7990,12 @@ function classifyQueryFallback(text) {
 async function callLanguageModelForSummary(prompt, maxLength = 2000) {
     try {
         if (!vscode.lm || !vscode.lm.selectChatModels) {
-            log('callLanguageModelForSummary: VS Code LM API not available');
+            log('callLanguageModelForSummary: VS Code LM API not available - will use name-based summaries');
             return null;
         }
         
-        // Get the configured documentation model (lightweight, good for summaries)
-        const config = vscode.workspace.getConfiguration('astra');
-        const preferredModel = config.get('llm.documentationModel') || config.get('llm.classificationModel') || 'gpt-4o-mini';
+        // Get the summary model from centralized config
+        const preferredModel = LLMConfig.getModelForTask(LLMConfig.TASKS.SUMMARY);
         log('callLanguageModelForSummary: Preferred model:', preferredModel);
         
         // Get available models
@@ -6796,25 +8005,24 @@ async function callLanguageModelForSummary(prompt, maxLength = 2000) {
         }
         
         if (models.length === 0) {
-            log('callLanguageModelForSummary: No models available');
+            log('callLanguageModelForSummary: No models available - will use name-based summaries');
             return null;
         }
         
-        // Try to find the configured model first
-        const preferredLower = preferredModel.toLowerCase();
-        let model = models.find(m => 
-            m.name?.toLowerCase().includes(preferredLower) ||
-            m.id?.toLowerCase().includes(preferredLower) ||
-            m.family?.toLowerCase().includes(preferredLower)
-        );
+        // Use centralized model search order from LLMConfig
+        let model = null;
+        const modelSearchOrder = LLMConfig.getModelSearchOrder(preferredModel);
         
-        // Fallback to any lightweight model
+        for (const searchFn of modelSearchOrder) {
+            model = models.find(searchFn);
+            if (model) {
+                break;
+            }
+        }
+        
+        // Fallback to first available
         if (!model) {
-            model = models.find(m => 
-                m.name?.toLowerCase().includes('mini') ||
-                m.name?.toLowerCase().includes('haiku') ||
-                m.id?.toLowerCase().includes('mini')
-            ) || models[0];
+            model = models[0];
         }
         
         log('callLanguageModelForSummary: Using model:', model.name || model.id);
@@ -6846,6 +8054,14 @@ async function callLanguageModelForSummary(prompt, maxLength = 2000) {
         
     } catch (error) {
         log('callLanguageModelForSummary: Error:', error.message);
+        // Update status to show LLM issues
+        if (chatWebviewView) {
+            chatWebviewView.webview.postMessage({
+                type: 'indexProgress',
+                progress: IndexingState.progress,
+                message: `⚠️ LLM error: ${error.message.substring(0, 50)}... Using fallback summaries`
+            });
+        }
         return null;
     }
 }
@@ -9241,8 +10457,9 @@ class ContextFilesProvider {
 // ============================================================
 
 class ChatViewProvider {
-    constructor(extensionUri) {
+    constructor(extensionUri, context) {
         this.extensionUri = extensionUri;
+        this.context = context;
     }
 
     resolveWebviewView(webviewView) {
@@ -9250,10 +10467,34 @@ class ChatViewProvider {
         
         webviewView.webview.options = {
             enableScripts: true,
-            localResourceRoots: [this.extensionUri]
+            localResourceRoots: [this.extensionUri],
+            retainContextWhenHidden: true  // CRITICAL: Keep webview alive when hidden
         };
         
         webviewView.webview.html = this.getHtmlContent();
+        
+        // Restore chat history to webview after HTML is set
+        this.restoreChatToWebview();
+        
+        // Handle visibility changes - restore state when becoming visible
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                log('Webview became visible, restoring state...');
+                this.restoreChatToWebview();
+                updateChatStatus();
+                contextTreeProvider?.refresh();
+            }
+        });
+        
+        // Handle webview disposal
+        webviewView.onDidDispose(() => {
+            log('Webview disposed, saving state...');
+            if (persistenceManager) {
+                persistenceManager.saveAll().catch(err => {
+                    log('Error saving state on dispose:', err.message);
+                });
+            }
+        });
         
         // Handle messages from webview
         webviewView.webview.onDidReceiveMessage(async (message) => {
@@ -9266,10 +10507,18 @@ class ChatViewProvider {
                         currentMode = message.mode;
                         updateChatStatus();
                         log('Mode changed to:', currentMode);
+                        // Save mode change
+                        if (persistenceManager) {
+                            persistenceManager.markDirty();
+                        }
                         break;
                     case 'clearHistory':
                     chatHistory = [];
                     updateChatUI();
+                    // Clear persisted chat history
+                    if (persistenceManager) {
+                        persistenceManager.clearChatHistory();
+                    }
                     break;
                 case 'addFiles':
                     // Open file picker - accept files OR folders
@@ -9288,11 +10537,19 @@ class ChatViewProvider {
                     break;
                 case 'clearContext':
                     clearContext();
+                    // Clear persisted context files
+                    if (persistenceManager) {
+                        persistenceManager.clearContextFiles();
+                    }
                     log('Context cleared from UI');
                     break;
                 case 'removeFile':
                     if (message.path) {
                         removeFileFromContext(message.path);
+                        // Remove from persistence
+                        if (persistenceManager) {
+                            persistenceManager.removeContextFile(message.path);
+                        }
                         log('Removed file from UI:', message.path);
                     }
                     break;
@@ -9558,6 +10815,91 @@ class ChatViewProvider {
             flex-direction: column;
             height: 100vh;
             padding: 8px;
+        }
+        
+        /* Indexing Banner */
+        .indexing-banner {
+            background: var(--vscode-inputValidation-infoBackground, #063b49);
+            border: 1px solid var(--vscode-inputValidation-infoBorder, #007acc);
+            border-radius: 4px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            display: none;
+        }
+        .indexing-banner.show {
+            display: block;
+        }
+        .indexing-banner .banner-title {
+            font-weight: bold;
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .indexing-banner .banner-title .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid var(--vscode-foreground);
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .indexing-banner .banner-phase {
+            font-size: 12px;
+            color: var(--vscode-descriptionForeground);
+            margin-bottom: 4px;
+        }
+        .indexing-banner .banner-stats {
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .indexing-banner .banner-progress {
+            height: 4px;
+            background: var(--vscode-progressBar-background, #0e639c);
+            border-radius: 2px;
+            margin-top: 8px;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        .indexing-banner.complete {
+            background: var(--vscode-inputValidation-infoBackground, #063b49);
+            border-color: #4ec9b0;
+        }
+        .indexing-banner.complete .banner-title {
+            color: #4ec9b0;
+        }
+        
+        /* Disabled input state */
+        .input-container.disabled textarea {
+            opacity: 0.5;
+            cursor: not-allowed;
+            background: var(--vscode-input-background);
+        }
+        .input-container.disabled button {
+            opacity: 0.5;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+        .input-container.disabled .input-hint {
+            display: none;
+        }
+        .input-disabled-overlay {
+            display: none;
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: transparent;
+            cursor: not-allowed;
+            z-index: 10;
+        }
+        .input-container.disabled .input-disabled-overlay {
+            display: block;
         }
         
         .header {
@@ -10463,6 +11805,17 @@ Example:
         </div>
     </div>
     
+    <!-- Indexing Status Banner -->
+    <div id="indexingBanner" class="indexing-banner">
+        <div class="banner-title">
+            <span class="spinner"></span>
+            <span id="bannerTitle">Indexing in progress...</span>
+        </div>
+        <div id="bannerPhase" class="banner-phase">📂 Parsing files...</div>
+        <div id="bannerStats" class="banner-stats">0 files | 0 symbols</div>
+        <div id="bannerProgress" class="banner-progress"></div>
+    </div>
+    
     <div id="contextBar" class="context-bar" style="display: none;">
         <div id="contextFilesList" class="context-files-list"></div>
         <div class="context-actions">
@@ -10487,7 +11840,8 @@ Example:
         </div>
     </div>
     
-    <div class="input-container">
+    <div class="input-container" id="inputContainer">
+        <div class="input-disabled-overlay" id="inputDisabledOverlay"></div>
         <div id="quickActionsBar" class="quick-actions-bar">
             <button class="quick-action-btn" data-prompt="Find bugs and issues">🐛 Debug</button>
             <button class="quick-action-btn graph-btn" data-command="openCallGraphInBrowser">⬡ Graph</button>
@@ -10760,6 +12114,9 @@ Example:
                 case 'indexProgress':
                     showIndexProgress(message.progress, message.message);
                     break;
+                case 'indexingStatus':
+                    updateIndexingBanner(message);
+                    break;
                 case 'summaryProgress':
                     showSummaryProgress(message.progress, message.message, message.count);
                     break;
@@ -10790,6 +12147,13 @@ Example:
                     const modeRadio = document.querySelector(\`input[name="searchMode"][value="\${message.mode}"]\`);
                     if (modeRadio) modeRadio.checked = true;
                     break;
+                case 'restoreHistory':
+                    // Restore chat history from persistence
+                    if (message.history && message.history.length > 0) {
+                        renderChat(message.history);
+                        console.log('Restored', message.history.length, 'messages from persistence');
+                    }
+                    break;
             }
         });
         
@@ -10810,6 +12174,139 @@ Example:
                 setTimeout(() => {
                     progressContainer.style.display = 'none';
                 }, 1500);
+            }
+            
+            // Also update the banner
+            updateIndexingBannerFromProgress(progress, message);
+        }
+        
+        // Update indexing banner from progress messages
+        function updateIndexingBannerFromProgress(progress, message) {
+            const banner = document.getElementById('indexingBanner');
+            const bannerTitle = document.getElementById('bannerTitle');
+            const bannerPhase = document.getElementById('bannerPhase');
+            const bannerStats = document.getElementById('bannerStats');
+            const bannerProgress = document.getElementById('bannerProgress');
+            const inputContainer = document.getElementById('inputContainer');
+            
+            if (!banner) return;
+            
+            if (progress < 100) {
+                // Show banner and disable input
+                banner.classList.add('show');
+                banner.classList.remove('complete');
+                inputContainer?.classList.add('disabled');
+                chatInput.placeholder = '⏳ Please wait for indexing to complete...';
+                chatInput.disabled = true;
+                
+                bannerTitle.textContent = 'Indexing in progress...';
+                bannerPhase.textContent = message || 'Processing...';
+                bannerProgress.style.width = progress + '%';
+                
+                // Extract stats from message
+                const statsMatch = message?.match(/(\d+)\s*files.*?(\d+)\s*symbols/i);
+                if (statsMatch) {
+                    bannerStats.textContent = statsMatch[1] + ' files | ' + statsMatch[2] + ' symbols';
+                }
+            } else {
+                // Complete - show success briefly then hide
+                banner.classList.add('complete');
+                bannerTitle.innerHTML = '✅ Index ready';
+                bannerPhase.textContent = message || 'Ready for queries';
+                bannerProgress.style.width = '100%';
+                
+                // Enable input
+                inputContainer?.classList.remove('disabled');
+                chatInput.placeholder = 'Ask a question... (Ctrl+Enter to send)';
+                chatInput.disabled = false;
+                
+                // Hide banner after delay
+                setTimeout(() => {
+                    banner.classList.remove('show');
+                    banner.classList.remove('complete');
+                }, 3000);
+            }
+        }
+        
+        // Update indexing banner from IndexingState
+        function updateIndexingBanner(state) {
+            const banner = document.getElementById('indexingBanner');
+            const bannerTitle = document.getElementById('bannerTitle');
+            const bannerPhase = document.getElementById('bannerPhase');
+            const bannerStats = document.getElementById('bannerStats');
+            const bannerProgress = document.getElementById('bannerProgress');
+            const inputContainer = document.getElementById('inputContainer');
+            
+            if (!banner) return;
+            
+            const phaseMessages = {
+                'idle': '',
+                'parsing': '📂 Parsing files...',
+                'symbols': '🔍 Extracting symbols...',
+                'trigrams': '📊 Building trigram index...',
+                'search': '🔎 Building search indexes...',
+                'summaries': '🤖 Generating summaries...',
+                'inverted': '📚 Adding summaries to inverted index...',
+                'ready': '✅ Ready'
+            };
+            
+            if (state.isIndexing || state.isSummarizing) {
+                // Show banner and disable input
+                banner.classList.add('show');
+                banner.classList.remove('complete');
+                inputContainer?.classList.add('disabled');
+                chatInput.placeholder = '⏳ Please wait for indexing to complete...';
+                chatInput.disabled = true;
+                
+                if (state.isSummarizing && !state.isIndexing) {
+                    bannerTitle.textContent = 'Generating summaries...';
+                } else {
+                    bannerTitle.textContent = 'Indexing in progress...';
+                }
+                
+                bannerPhase.textContent = phaseMessages[state.phase] || state.phaseName || 'Processing...';
+                bannerProgress.style.width = state.progress + '%';
+                
+                // Build stats line
+                const statsParts = [];
+                if (state.stats?.files > 0) statsParts.push(state.stats.files + ' files');
+                if (state.stats?.symbols > 0) statsParts.push(state.stats.symbols + ' symbols');
+                if (state.stats?.summaries > 0) statsParts.push(state.stats.summaries + ' summaries');
+                if (state.stats?.terms > 0) statsParts.push(state.stats.terms + ' search terms');
+                bannerStats.textContent = statsParts.join(' | ') || 'Starting...';
+                
+            } else if (state.isReady) {
+                // Complete - show success
+                banner.classList.add('show');
+                banner.classList.add('complete');
+                bannerTitle.innerHTML = '✅ Index ready - summaries added to search';
+                bannerPhase.textContent = 'All indexes built. Ready for queries.';
+                bannerProgress.style.width = '100%';
+                
+                // Build final stats
+                const statsParts = [];
+                if (state.stats?.files > 0) statsParts.push(state.stats.files + ' files');
+                if (state.stats?.symbols > 0) statsParts.push(state.stats.symbols + ' symbols');
+                if (state.stats?.summaries > 0) statsParts.push(state.stats.summaries + ' summaries');
+                if (state.stats?.terms > 0) statsParts.push(state.stats.terms + ' search terms');
+                bannerStats.textContent = statsParts.join(' | ');
+                
+                // Enable input
+                inputContainer?.classList.remove('disabled');
+                chatInput.placeholder = 'Ask a question... (Ctrl+Enter to send)';
+                chatInput.disabled = false;
+                
+                // Hide banner after delay
+                setTimeout(() => {
+                    banner.classList.remove('show');
+                    banner.classList.remove('complete');
+                }, 5000);
+            } else {
+                // Not indexing, hide banner
+                banner.classList.remove('show');
+                inputContainer?.classList.remove('disabled');
+                chatInput.placeholder = 'Ask a question... (Ctrl+Enter to send)';
+                chatInput.disabled = false;
             }
         }
         
@@ -11163,6 +12660,38 @@ Example:
     </script>
 </body>
 </html>`;
+    }
+    
+    /**
+     * Restore chat history to the webview
+     * Called when webview becomes visible or is first created
+     */
+    restoreChatToWebview() {
+        if (!chatWebviewView?.webview) {
+            return;
+        }
+        
+        // Send chat history to webview
+        if (chatHistory && chatHistory.length > 0) {
+            log('Restoring', chatHistory.length, 'chat messages to webview');
+            
+            // Format history for the webview
+            const formattedHistory = chatHistory.map(msg => ({
+                role: msg.role,
+                content: msg.content,
+                timestamp: msg.timestamp instanceof Date 
+                    ? msg.timestamp.toISOString() 
+                    : msg.timestamp
+            }));
+            
+            chatWebviewView.webview.postMessage({
+                type: 'restoreHistory',
+                history: formattedHistory
+            });
+        }
+        
+        // Update status with current context file count
+        updateChatStatus();
     }
 }
 
@@ -12040,14 +13569,31 @@ Return ONLY a comma-separated list of 5-10 additional search terms (single words
                 }
                 
                 // Include ALL index results - answer_question will handle chunking
+
                 if (results.indexResults.symbols.length > 0) {
-                    combined += '## Symbols Found (by relevance)\n';
-                    for (const sym of results.indexResults.symbols) {
-                        combined += `- ${sym.name} (${sym.type}) in ${sym.file}:${sym.line}`;
-                        if (sym.matchScore) combined += ` [score:${sym.matchScore}]`;
-                        combined += '\n';
+                    combined += '## Symbols Found (by relevance)\n\n';
+                    
+                    // Limit to top symbols to avoid context explosion (configurable)
+                    const maxSymbolsInContext = AGENT_CONFIG.maxSymbolsInContext || 30;
+                    const codeSnippetLines = AGENT_CONFIG.codeSnippetLines || 25;
+                    const topSymbols = results.indexResults.symbols.slice(0, maxSymbolsInContext);
+                    
+                    for (const sym of topSymbols) {
+                        combined += `### ${sym.name} (${sym.type}) - ${sym.file}:${sym.line}\n`;
+                        
+                        // Get actual code for this symbol
+                        const filePath = sym.file;
+                        const file = contextFiles.get(filePath);
+                        if (file && file.content) {
+                            const lines = file.content.split('\n');
+                            const startLine = Math.max(0, sym.line - 1);
+                            const endLine = Math.min(lines.length, sym.line + codeSnippetLines - 1);
+                            const codeSnippet = lines.slice(startLine, endLine).join('\n');
+                            // Use detected language for syntax highlighting
+                            const lang = file.language || detectLanguage(filePath) || '';
+                            combined += '```' + lang + '\n' + codeSnippet + '\n```\n\n';
+                        }
                     }
-                    combined += '\n';
                 }
                 
                 // Include ALL call graph relationships
@@ -13254,22 +14800,109 @@ Output ONLY the new code:`;
             }
             
             // ================================================================
-            // LARGE CONTEXT HANDLING - USE COMPREHENSIVE SEARCH
-            // For large codebases, use the same search strategy as handleDetailedQuery
-            // which includes filename matching (partition.c for "partitioning" queries)
+            // LARGE CONTEXT HANDLING
+            // Check if context was provided by a previous step (e.g., search_code)
+            // If so, USE IT instead of re-searching from scratch!
             // ================================================================
-            log('answer_question: Large context - using comprehensiveSearch');
+            log('answer_question: Large context - processing provided context');
             log('answer_question: Context size:', context.length, 'chars');
+            
+            // Check if this looks like pre-searched context from search_code
+            // (contains structured search results with symbols, code blocks, etc.)
+            const looksLikeSearchResults = context.includes('### ') && 
+                (context.includes('function') || context.includes('(') || context.includes('{'));
+            
+            if (useProvidedContext || looksLikeSearchResults) {
+                // ================================================================
+                // USE THE PROVIDED CONTEXT - Don't re-search!
+                // This preserves the excellent results from search_code
+                // ================================================================
+                log('answer_question: Using provided context (from previous step)');
+                
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `*Processing ${Math.ceil(context.length / 1000)}KB of search results...*\n\n`
+                });
+                
+                // Smart chunking: prioritize content with more code/symbols
+                const chunks = chunkContext(context, CHUNK_SIZE);
+                log('answer_question: Split provided context into', chunks.length, 'chunks');
+                
+                // Score chunks by relevance to the question
+                const scoredChunks = [];
+                const keywords = extractSearchKeywords(question + ' ' + subQuestions.join(' '));
+                
+                for (let i = 0; i < chunks.length; i++) {
+                    const chunk = chunks[i];
+                    let score = 0;
+                    const chunkLower = chunk.toLowerCase();
+                    
+                    // Score by keyword presence
+                    for (const keyword of keywords) {
+                        const regex = new RegExp(keyword.toLowerCase(), 'gi');
+                        const matches = chunkLower.match(regex);
+                        if (matches) {
+                            score += matches.length * 2;
+                        }
+                    }
+                    
+                    // Bonus for code content (functions, structs, etc.)
+                    if (chunk.includes('function') || chunk.includes('void ') || chunk.includes('int ')) score += 10;
+                    if (chunk.includes('```')) score += 5; // Code blocks
+                    if (chunk.match(/:\d+/)) score += 5; // Line numbers like file.c:123
+                    
+                    scoredChunks.push({ chunk, score, index: i });
+                }
+                
+                // Sort by score and take top chunks
+                scoredChunks.sort((a, b) => b.score - a.score);
+                const topChunks = scoredChunks.slice(0, Math.min(5, scoredChunks.length));
+                
+                log('answer_question: Top chunk scores:', topChunks.map(c => c.score).join(', '));
+                
+                // Combine top chunks for analysis
+                const selectedContext = topChunks
+                    .sort((a, b) => a.index - b.index) // Restore original order
+                    .map(c => c.chunk)
+                    .join('\n\n---\n\n');
+                
+                // Use synthesizeFindingsWithReferences for structured output
+                const result = await synthesizeFindingsWithReferences(
+                    question,
+                    selectedContext,
+                    domain,
+                    domain_notes,
+                    subQuestions,
+                    [], // filesAnalyzed - extract from context if needed
+                    [],
+                    []
+                );
+                
+                if (result.success && result.data?.answer) {
+                    return { success: true, data: { answer: result.data.answer } };
+                }
+                
+                // Fallback to direct processing
+                return await processAnswerDirect(question, selectedContext, domain, domain_notes);
+            }
+            
+            // ================================================================
+            // NO PROVIDED CONTEXT - Use comprehensive search
+            // This path is for when answer_question is called directly without
+            // a previous search step (e.g., simple questions with $context)
+            // ================================================================
+            log('answer_question: No pre-searched context - using comprehensiveSearch');
             
             chatWebviewView?.webview.postMessage({ 
                 type: 'appendResponse', 
-                text: `*Large codebase (${Math.ceil(context.length / 1000)}KB) - using comprehensive search...*\n\n`
+                text: `*Large codebase (${Math.ceil(context.length / 1000)}KB) - searching for relevant code...*\n\n`
             });
             
             // Use handleDetailedQuery's approach - it has filename matching!
             try {
                 const result = await handleDetailedQuery(question);
-                return result;
+                // handleDetailedQuery returns a string, wrap it in proper format
+                return { success: true, data: { answer: result } };
             } catch (err) {
                 log('answer_question: comprehensiveSearch failed, falling back to chunk scoring:', err.message);
             }
@@ -13524,7 +15157,14 @@ Format as:
 // Agent configuration
 const AGENT_CONFIG = {
     enableJudge: true,  // Enable judge LLM to validate answers
-    verboseSearch: true // Log detailed search hits for debugging
+    verboseSearch: true, // Log detailed search hits for debugging
+    // Code extraction settings (configurable)
+    maxSymbolsInContext: 30,  // Max symbols to include in search context
+    codeSnippetLines: 25,     // Lines of code per symbol snippet
+    maxChunks: 8,             // Max chunks for analysis
+    maxBatchSize: 3,          // Batch size for hierarchical merge
+    maxCombinedSize: 15000,   // Trigger hierarchical merge above this size
+    maxAnalysisLength: 10000  // Max length for chunk analysis
 };
 
 /**
@@ -14694,6 +16334,45 @@ function validateExtractedFacts(facts) {
         }
     }
     
+    // Validate data_structures - check they exist in codeIndex
+    if (facts.data_structures && Array.isArray(facts.data_structures)) {
+        const originalCount = facts.data_structures.length;
+        facts.data_structures = facts.data_structures.filter(ds => {
+            if (!ds.name) return false;
+            // Check if struct exists in codeIndex
+            for (const [key, symbol] of codeIndex.symbols) {
+                if (symbol.name === ds.name && 
+                    (symbol.type === 'struct' || symbol.type === 'typedef' || symbol.type === 'class' || symbol.type === 'enum')) {
+                    // Update with verified info
+                    ds.verified_file = symbol.file;
+                    ds.verified_line = symbol.line;
+                    return true;
+                }
+            }
+            // Also check if file exists (struct might be there even if not indexed)
+            if (ds.file && fileExists(ds.file)) return true;
+            // Keep if it has substantial definition (LLM extracted actual code)
+            if (ds.definition && ds.definition.length > 30) return true;
+            log(`validateExtractedFacts: Removing unverified struct "${ds.name}"`);
+            return false;
+        });
+        if (facts.data_structures.length < originalCount) {
+            log(`validateExtractedFacts: Filtered data_structures ${originalCount} -> ${facts.data_structures.length}`);
+        }
+    }
+    
+    // Verify code_flow against actual call graph
+    if (facts.code_flow && Array.isArray(facts.code_flow)) {
+        for (const flow of facts.code_flow) {
+            // Check if this call relationship exists in codeIndex.callGraph
+            const callees = codeIndex.callGraph.get(flow.caller);
+            flow.verified = callees && callees.has(flow.callee);
+            if (!flow.verified) {
+                log(`validateExtractedFacts: Call ${flow.caller} -> ${flow.callee} not in call graph (may still be valid)`);
+            }
+        }
+    }
+    
     return facts;
 }
 
@@ -14868,6 +16547,7 @@ async function synthesizeFindings(question, findingsContext, domain, domain_note
  */
 async function synthesizeFindingsWithReferences(question, findingsContext, domain, domain_notes, subQuestions, filesAnalyzed, relatedFiles, functionsFound) {
     
+    
     // Truncate findings early to prevent prompt overflow
     // API limit is ~25K chars, leave room for JSON template (~5K)
     const maxFindingsSize = 18000;
@@ -14881,6 +16561,7 @@ async function synthesizeFindingsWithReferences(question, findingsContext, domai
     // ================================================================
     // STAGE 1: EXTRACT STRUCTURED FACTS
     // ================================================================
+    
     const extractionPrompt = `# FINDINGS FROM CODE ANALYSIS
 ${truncatedFindings}
 
@@ -14891,54 +16572,72 @@ ${question}
 ${subQuestions.map((sq, idx) => `${idx + 1}. ${sq}`).join('\n')}
 
 # TASK
-Extract structured facts from the findings above. Output ONLY valid JSON with this exact structure:
+Extract structured facts from the findings above. Output ONLY valid JSON.
+
+## EXTRACTION PRIORITY (most important first):
+1. DATA STRUCTURES - Find typedef struct, struct, class, enum definitions
+2. KEY FUNCTIONS - Functions that implement core logic with their signatures
+3. CALL FLOW - Actual caller->callee relationships with line numbers
+4. KEY FILES - Implementation files (.c, .cpp, .h, .java, .py) - NOT build files
 
 {
-  "summary": "2-3 sentences describing what this code does and its main purpose",
-  "entry_point": {
-    "function": "actual_function_name_from_findings",
-    "file": "filename.c",
-    "line": 123
-  },
-  "answers": [
-    {
-      "question": "The sub-question text",
-      "answer": "Detailed answer (2-4 sentences) with specific function names, patterns, and code references",
-      "references": ["file.c:123", "other.c:456"]
-    }
-  ],
-  "key_files": [
-    {
-      "file": "filename.c",
-      "purpose": "Detailed purpose (1-2 sentences) explaining what this file does",
-      "functions": ["func1", "func2", "func3"]
-    }
-  ],
-  "code_flow": [
-    {
-      "caller": "entry_function",
-      "callee": "called_function", 
-      "file": "file.c",
-      "line": 100,
-      "purpose": "Why this call happens"
-    }
-  ],
+  "summary": "2-3 sentences describing what this code does based on ACTUAL CODE in findings",
+  
   "data_structures": [
     {
       "name": "StructName",
       "file": "header.h",
       "line": 50,
-      "purpose": "What data it holds"
+      "definition": "COPY THE ACTUAL STRUCT/TYPEDEF CODE HERE from findings",
+      "purpose": "What data it holds and how it's used",
+      "key_fields": ["field1: type and purpose", "field2: type and purpose"]
     }
   ],
+  
+  "entry_point": {
+    "function": "actual_function_name_from_findings",
+    "file": "filename.c",
+    "line": 123
+  },
+  
   "key_functions": [
     {
       "name": "function_name",
       "file": "file.c",
       "line": 200,
-      "purpose": "What it does"
+      "signature": "ReturnType function_name(Param1 p1, Param2 p2)",
+      "purpose": "What it does",
+      "key_code": "COPY 3-5 LINES of important logic from findings"
     }
   ],
+  
+  "code_flow": [
+    {
+      "caller": "calling_function",
+      "callee": "called_function", 
+      "file": "file.c",
+      "line": 100,
+      "call_code": "THE ACTUAL LINE showing the function call",
+      "purpose": "Why this call happens"
+    }
+  ],
+  
+  "key_files": [
+    {
+      "file": "filename.c",
+      "purpose": "Detailed purpose explaining what this file implements",
+      "functions": ["func1", "func2", "func3"]
+    }
+  ],
+  
+  "answers": [
+    {
+      "question": "The sub-question text",
+      "answer": "Detailed answer with specific function names and code references",
+      "references": ["file.c:123", "other.c:456"]
+    }
+  ],
+  
   "config_options": [
     {
       "param": "parameter_name",
@@ -14946,27 +16645,25 @@ Extract structured facts from the findings above. Output ONLY valid JSON with th
       "effect": "What it controls"
     }
   ],
+  
   "notes": [
     "Any limitations or areas needing more investigation"
   ]
 }
 
 CRITICAL RULES:
-1. Output ONLY valid JSON - no markdown, no explanation, no text before or after the JSON
-2. Start your response with { and end with }
-3. Extract ACTUAL data from the findings - DO NOT invent or hallucinate function names, line numbers, or file names
-4. NEVER fabricate an "entry_point" - only include it if the findings clearly identify a main entry function. If unsure, set entry_point to null
-5. Include at least 3-5 items in key_files, key_functions, and code_flow - but ONLY from data actually present in the findings
-6. For key_files: ONLY include files that IMPLEMENT or DEFINE functionality:
-   - INCLUDE: Files with actual content - code (.c, .cpp, .h, .java, .py, .js, .ts, .go, .rs, .cs, .rb, .php), data (.csv, .tsv, .xls, .xlsx, .json, .xml), documents (.pdf, .txt, .doc, .docx), scripts (.sql, .sh, .bash, .yaml)
-   - **NEVER INCLUDE**: Makefile, meson.build, CMakeLists.txt, README, .md, configure.ac - these only LIST source files, they have NO implementation
-   - If you see "Makefile" in the findings, SKIP IT - do not add it to key_files
-   - If Makefile mentions "freelist.o", the implementation is in freelist.c - include freelist.c, NOT Makefile
-7. For key_files: PRIORITIZE files whose names contain the query topic (e.g., for "partitioning", include partdesc.c, partbounds.c BEFORE generic files)
-8. For key_files: Include BOTH implementation files (.c/.cpp/.java) AND header files (.h/.hpp) when relevant
-9. If a field has no data, use empty array [] or null for entry_point
-10. Do NOT wrap JSON in \`\`\` code fences
-11. For architectural questions about "how X is implemented", there may be MULTIPLE entry points or NO single entry point - this is normal. Don't invent a "main_X_function()" that doesn't exist.
+1. Output ONLY valid JSON - no markdown, no text before or after
+2. Start with { and end with }
+3. EXTRACT ACTUAL CODE from findings - copy struct definitions, function signatures, key logic
+4. For data_structures: MUST include "definition" field with REAL code from findings
+5. For key_functions: Include "signature" and "key_code" with ACTUAL code
+6. For code_flow: Include "call_code" showing the actual function call line
+7. NEVER invent function names, line numbers, or code not in the findings
+8. NEVER include: Makefile, meson.build, CMakeLists.txt, README in key_files
+9. PRIORITIZE files whose names match the query topic
+10. If entry_point unclear, set to null (don't invent one)
+11. If a category has no data, use empty array []
+12. Do NOT wrap JSON in \`\`\` code fences
 
 BEGIN JSON OUTPUT:`;
 
@@ -14987,8 +16684,12 @@ BEGIN JSON OUTPUT:`;
         });
         
         // extractionPrompt already built with truncated findings (truncation done at start)
-        const extractionResult = await callLanguageModel(extractionPrompt);
-        
+        const extractionResult = await callLanguageModel(extractionPrompt, {
+            task: 'analysis',
+            preferStrongerModel: true
+        });
+
+
         // Check if LLM is unavailable
         if (isLlmErrorResponse(extractionResult)) {
             log('synthesizeFindingsWithReferences: LLM unavailable');
@@ -15158,6 +16859,7 @@ function cleanFileName(fileName) {
  * @param {string} originalQuery - Original query for determining which sections to show
  */
 function formatFactsToTemplate(facts, subQuestions, relatedFiles, functionsFound, rawFindings, originalQuery = '') {
+    
     let output = '';
     
     // Determine if this is a "trace/explain" type query that benefits from call graph
@@ -15283,14 +16985,36 @@ function formatFactsToTemplate(facts, subQuestions, relatedFiles, functionsFound
     
     // === Data Structures ===
     output += `## 📦 Data Structures\n\n`;
-    output += `| Structure | Location | Purpose |\n`;
-    output += `|:----------|:---------|:--------|\n`;
     if (facts.data_structures && facts.data_structures.length > 0) {
+        // First show table summary
+        output += `| Structure | Location | Purpose |\n`;
+        output += `|:----------|:---------|:--------|\n`;
         facts.data_structures.slice(0, 8).forEach(ds => {
             const dsFile = cleanFileName(ds.file);
             output += `| \`${ds.name}\` | \`${dsFile}:${ds.line}\` | ${ds.purpose || '-'} |\n`;
         });
+        output += `\n`;
+        
+        // Then show actual definitions for top structures
+        const structsWithDefs = facts.data_structures.filter(ds => ds.definition && ds.definition.length > 20);
+        if (structsWithDefs.length > 0) {
+            output += `### Structure Definitions\n\n`;
+            structsWithDefs.slice(0, 3).forEach(ds => {
+                const dsFile = cleanFileName(ds.file);
+                output += `#### \`${ds.name}\` - \`${dsFile}:${ds.line}\`\n\n`;
+                output += `\`\`\`c\n${ds.definition}\n\`\`\`\n\n`;
+                if (ds.key_fields && ds.key_fields.length > 0) {
+                    output += `**Key Fields:**\n`;
+                    ds.key_fields.forEach(field => {
+                        output += `- ${field}\n`;
+                    });
+                    output += `\n`;
+                }
+            });
+        }
     } else {
+        output += `| Structure | Location | Purpose |\n`;
+        output += `|:----------|:---------|:--------|\n`;
         output += `| - | No structures identified | See code analysis |\n`;
     }
     
@@ -15298,14 +17022,37 @@ function formatFactsToTemplate(facts, subQuestions, relatedFiles, functionsFound
     
     // === Key Functions ===
     output += `## 🔍 Key Functions\n\n`;
-    output += `| Function | Location | Purpose |\n`;
-    output += `|:---------|:---------|:--------|\n`;
     if (facts.key_functions && facts.key_functions.length > 0) {
+        // First show table summary
+        output += `| Function | Location | Purpose |\n`;
+        output += `|:---------|:---------|:--------|\n`;
         facts.key_functions.slice(0, 10).forEach(fn => {
             const fnFile = cleanFileName(fn.file);
             output += `| \`${fn.name}()\` | \`${fnFile}:${fn.line}\` | ${fn.purpose || '-'} |\n`;
         });
+        output += `\n`;
+        
+        // Then show details for top functions with code
+        const funcsWithCode = facts.key_functions.filter(fn => 
+            (fn.signature && fn.signature.length > 5) || (fn.key_code && fn.key_code.length > 10)
+        );
+        if (funcsWithCode.length > 0) {
+            output += `### Function Details\n\n`;
+            funcsWithCode.slice(0, 5).forEach(fn => {
+                const fnFile = cleanFileName(fn.file);
+                output += `#### \`${fn.name}()\` - \`${fnFile}:${fn.line}\`\n\n`;
+                if (fn.signature) {
+                    output += `**Signature:** \`${fn.signature}\`\n\n`;
+                }
+                if (fn.key_code) {
+                    output += `**Key Logic:**\n\`\`\`c\n${fn.key_code}\n\`\`\`\n\n`;
+                }
+                output += `**Purpose:** ${fn.purpose || 'See code for details'}\n\n`;
+            });
+        }
     } else {
+        output += `| Function | Location | Purpose |\n`;
+        output += `|:---------|:---------|:--------|\n`;
         output += `| - | No functions identified | See code analysis |\n`;
     }
     
@@ -15424,13 +17171,26 @@ function formatFactsToTemplate(facts, subQuestions, relatedFiles, functionsFound
     // === Related Topics ===
     output += `## 📚 Related Topics (For Further Exploration)\n\n`;
     
+    // Only show related files if we have specific relevance info, otherwise skip this section
     if (relatedFiles && relatedFiles.length > 0) {
-        output += `**Related Files Not Fully Analyzed:**\n`;
-        relatedFiles.slice(0, 8).forEach(f => {
-            const file = cleanFileName(f);
-            output += `- 📄 \`${file}\` - May contain additional implementation details\n`;
+        // Filter to only show files that are likely relevant based on naming
+        const relevantFiles = relatedFiles.filter(f => {
+            const fileName = cleanFileName(f).toLowerCase();
+            // Only include if filename contains keywords from the query/topic
+            return facts.key_functions?.some(kf => 
+                fileName.includes(kf.name?.toLowerCase()?.substring(0, 5) || '')
+            ) || false;
         });
-        output += `\n`;
+        
+        if (relevantFiles.length > 0) {
+            output += `**Related Files (likely relevant based on naming):**\n`;
+            relevantFiles.slice(0, 5).forEach(f => {
+                const file = cleanFileName(f);
+                output += `- 📄 \`${file}\`\n`;
+            });
+            output += `\n`;
+        }
+        // Don't show "may contain" for files we're not sure about
     }
     
     if (functionsFound && functionsFound.length > 0) {
@@ -15460,9 +17220,9 @@ function formatFactsToTemplate(facts, subQuestions, relatedFiles, functionsFound
             output += `- ${note}\n`;
         });
     } else {
-        output += `- Analysis based on provided code context\n`;
-        output += `- Some implementation details may require deeper investigation\n`;
+        output += `- Analysis based on code files in context\n`;
     }
+    // Remove weak "may require deeper investigation" language
     
     // === Detailed Technical Analysis ===
     // Include the raw analysis for developers who want the full details
@@ -16935,78 +18695,26 @@ Be concise but complete. If steps failed, explain what happened.`;
 
 /**
  * Get a display-friendly model name
+ * Uses centralized LLMConfig for display name resolution
  */
 function getModelDisplayName() {
     // If we tracked the last used model, use it
     if (lastUsedModel) {
         // For Copilot models - use family or name
         if (lastUsedModel.vendor === 'copilot' || lastUsedModel.family) {
-            const family = lastUsedModel.family?.toLowerCase() || '';
-            const name = lastUsedModel.name?.toLowerCase() || '';
-            
-            // Map to friendly names
-            if (family.includes('claude-sonnet-4') || name.includes('claude-sonnet-4')) {
-                return 'Claude Sonnet 4.5';
-            }
-            if (family.includes('claude-3.5-sonnet') || family.includes('claude-3-5-sonnet') || name.includes('claude-3.5')) {
-                return 'Claude 3.5 Sonnet';
-            }
-            if (family.includes('claude')) {
-                return 'Claude';
-            }
-            if (family.includes('gpt-4o') || name.includes('gpt-4o')) {
-                return 'GPT-4o';
-            }
-            if (family.includes('gpt-4') || name.includes('gpt-4')) {
-                return 'GPT-4';
-            }
-            if (family.includes('o1')) {
-                return 'o1';
-            }
-            
-            // Return the family or name as-is
-            return lastUsedModel.family || lastUsedModel.name || 'Copilot';
+            const modelId = lastUsedModel.family || lastUsedModel.name || lastUsedModel.id;
+            return LLMConfig.getDisplayName(modelId);
         }
         
         // For direct API models (anthropic/openai)
         if (lastUsedModel.provider && lastUsedModel.model) {
-            const shortNames = {
-                'claude-sonnet-4-5-20250514': 'Claude Sonnet 4.5',
-                'claude-3-5-sonnet-20241022': 'Claude 3.5 Sonnet',
-                'claude-3-opus-20240229': 'Claude 3 Opus',
-                'claude-3-sonnet-20240229': 'Claude 3 Sonnet',
-                'claude-3-haiku-20240307': 'Claude 3 Haiku',
-                'gpt-4o': 'GPT-4o',
-                'gpt-4o-mini': 'GPT-4o Mini',
-                'gpt-4-turbo': 'GPT-4 Turbo',
-                'gpt-4': 'GPT-4',
-                'gpt-3.5-turbo': 'GPT-3.5'
-            };
-            return shortNames[lastUsedModel.model] || lastUsedModel.model;
+            return LLMConfig.getDisplayName(lastUsedModel.model);
         }
     }
     
-    // Fallback: read from config
-    const config = vscode.workspace.getConfiguration('astra');
-    const provider = config.get('llm.codingProvider') || 'copilot';
-    
-    if (provider === 'copilot') {
-        const model = config.get('llm.copilotModel') || 'claude-sonnet-4';
-        const friendlyNames = {
-            'claude-sonnet-4': 'Claude Sonnet 4.5',
-            'claude-3.5-sonnet': 'Claude 3.5 Sonnet',
-            'gpt-4o': 'GPT-4o',
-            'gpt-4': 'GPT-4'
-        };
-        return friendlyNames[model] || model;
-    } else if (provider === 'anthropic') {
-        const model = config.get('llm.anthropicModel') || 'claude-sonnet-4-5-20250514';
-        return model.includes('sonnet-4') ? 'Claude Sonnet 4.5' : model;
-    } else if (provider === 'openai') {
-        return config.get('llm.openaiModel') || 'GPT-4o';
-    }
-    
-    return 'Copilot';
+    // Fallback: use default model from config
+    const defaultModel = LLMConfig.getDefaultModel();
+    return LLMConfig.getDisplayName(defaultModel);
 }
 
 /**
@@ -17231,6 +18939,27 @@ async function handleChatMessage(text) {
     // Reset model tracking for this request
     lastUsedModel = null;
     
+    // ================================================================
+    // BLOCK QUERIES DURING INDEXING
+    // ================================================================
+    if (IndexingState.shouldBlockQueries()) {
+        const blockMessage = IndexingState.getBlockingMessage();
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: blockMessage + '\n\n'
+        });
+        chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+        return;
+    }
+    
+    // Warn if summaries are still generating (but don't block)
+    if (IndexingState.isSummarizing) {
+        chatWebviewView?.webview.postMessage({ 
+            type: 'appendResponse', 
+            text: `⚠️ *Summaries still generating (${IndexingState.summariesGenerated} done). Results may improve after completion.*\n\n`
+        });
+    }
+    
     // Check if this is a plan control command
     if (pendingPlan && isPlanCommand(text)) {
         // Don't add control commands to visible history
@@ -17279,17 +19008,92 @@ async function handleChatMessage(text) {
     }
     
     // Add user message to history
-    chatHistory.push({
+    const userMessage = {
         role: 'user',
         content: text,
         timestamp: new Date()
-    });
+    };
+    chatHistory.push(userMessage);
+    
+    // Persist the user message
+    if (persistenceManager) {
+        persistenceManager.appendChatMessage(userMessage);
+        persistenceManager.markDirty();
+    }
+    
     updateChatUI();
     
     // Set processing state
     chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: true });
     
     try {
+        // Check for session memory commands first
+        const sessionCommand = parseSessionCommand(text);
+        if (sessionCommand) {
+            log('Session command detected:', sessionCommand.type);
+            const response = executeSessionCommand(sessionMemory, sessionCommand);
+            
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: response 
+            });
+            
+            chatHistory.push({
+                role: 'assistant',
+                content: response,
+                timestamp: new Date()
+            });
+            
+            // Add to session memory
+            if (sessionMemory) {
+                sessionMemory.addTurn(text, response, { type: 'command' });
+            }
+            
+            taskController.reset();
+            chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+            chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+            updateChatUI();
+            return;
+        }
+        
+        // Check for /memory-help command
+        if (text.trim().toLowerCase() === '/memory-help' || text.trim().toLowerCase() === '/session-help') {
+            chatWebviewView?.webview.postMessage({ 
+                type: 'appendResponse', 
+                text: SESSION_MEMORY_HELP 
+            });
+            
+            chatHistory.push({
+                role: 'assistant',
+                content: SESSION_MEMORY_HELP,
+                timestamp: new Date()
+            });
+            
+            taskController.reset();
+            chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
+            chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
+            updateChatUI();
+            return;
+        }
+        
+        // Expand @N references in the user message
+        let expandedText = text;
+        if (sessionMemory && sessionMemory.hasReferences(text)) {
+            const { expanded, references } = sessionMemory.expandReferences(text);
+            expandedText = expanded;
+            
+            if (references.length > 0) {
+                log('Expanded references:', references.map(r => r.ref).join(', '));
+                
+                // Show user that we're using referenced content
+                const refList = references.map(r => r.ref).join(', ');
+                chatWebviewView?.webview.postMessage({ 
+                    type: 'appendResponse', 
+                    text: `*Using content from: ${refList}*\n\n`
+                });
+            }
+        }
+        
         // Check for simple/direct commands that skip planning
         const skipPlanningPatterns = [
             /^(hi|hello|hey|thanks|thank you)/i,
@@ -17297,15 +19101,15 @@ async function handleChatMessage(text) {
         ];
         
         // Documentation generation should bypass planning
-        const isDocumentGeneration = /^(?:document|generate\s+(?:full\s+)?(?:doc|documentation)|documentation|deepwiki|full\s*doc)/i.test(text.trim());
+        const isDocumentGeneration = /^(?:document|generate\s+(?:full\s+)?(?:doc|documentation)|documentation|deepwiki|full\s*doc)/i.test(expandedText.trim());
         
         debugLog('ROUTE', `Files: ${contextFiles.size} | isDocGen: ${isDocumentGeneration}`, {
-            query: text.substring(0, 80),
+            query: expandedText.substring(0, 80),
             fileCount: contextFiles.size,
             isDocGeneration: isDocumentGeneration
         });
         
-        const shouldSkipPlanning = skipPlanningPatterns.some(p => p.test(text.trim()));
+        const shouldSkipPlanning = skipPlanningPatterns.some(p => p.test(expandedText.trim()));
         
         // For large codebases, use LLM to classify the query type
         const LARGE_CODEBASE_THRESHOLD = 50;
@@ -17318,7 +19122,7 @@ async function handleChatMessage(text) {
                 text: '*Analyzing query type...*\n\n'
             });
             
-            const queryType = await classifyQueryWithLLM(text, contextFiles.size);
+            const queryType = await classifyQueryWithLLM(expandedText, contextFiles.size);
             debugLog('CLASSIFY', `Query type: ${queryType}`, queryType);
             
             if (queryType === 'overview' || queryType === 'domain' || queryType === 'specific') {
@@ -17513,6 +19317,23 @@ async function handleChatMessage(text) {
     chatWebviewView?.webview.postMessage({ type: 'finalizeResponse' });
     chatWebviewView?.webview.postMessage({ type: 'setProcessing', processing: false });
     updateChatUI();
+    
+    // Add to session memory for @N references
+    if (sessionMemory && chatHistory.length >= 2) {
+        const lastAssistant = chatHistory[chatHistory.length - 1];
+        if (lastAssistant && lastAssistant.role === 'assistant') {
+            const originalUserText = text; // Use original text, not expanded
+            sessionMemory.addTurn(originalUserText, lastAssistant.content, {
+                model: lastUsedModel,
+                filesInContext: contextFiles.size
+            });
+        }
+    }
+    
+    // Persist the entire chat history after processing
+    if (persistenceManager) {
+        persistenceManager.markDirty();
+    }
 }
 
 // Keep determineMode for backward compatibility but it's less important now
@@ -20626,42 +22447,6 @@ function detectTaskType(prompt) {
     return 'auto';
 }
 
-/**
- * Get the preferred provider order based on task type
- * NOTE: For now, only use Copilot. API server is for codebase search, not LLM.
- * @param {'coding' | 'docs' | 'auto'} taskType
- * @returns {string[]} - Ordered list of providers to try
- */
-function getProviderOrderForTask(taskType) {
-    const config = vscode.workspace.getConfiguration('astra');
-    const codingProvider = config.get('llm.codingProvider') || 'copilot';
-    
-    // For coding tasks (translation, code generation):
-    // - Default: Copilot with Claude Sonnet 4.5 (via GitHub Copilot)
-    // - User can override via astra.llm.codingProvider setting
-    
-    if (taskType === 'coding') {
-        // Use configured provider first for coding tasks
-        const order = [codingProvider];
-        
-        // Add fallbacks
-        if (codingProvider !== 'copilot') order.push('copilot');
-        if (codingProvider !== 'anthropic') order.push('anthropic');
-        if (codingProvider !== 'openai') order.push('openai');
-        
-        log(`Coding task: Provider order = ${order.join(' → ')}`);
-        return order;
-    }
-    
-    // For docs/explanation tasks: prefer Copilot (free)
-    if (taskType === 'docs') {
-        return ['copilot', 'anthropic', 'openai'];
-    }
-    
-    // Default: try all providers
-    return ['copilot', 'anthropic', 'openai'];
-}
-
 // ============================================================
 // Language Model Integration
 // ============================================================
@@ -20717,14 +22502,41 @@ async function callLanguageModelForDoc(prompt) {
     return { text: result, error: null };
 }
 
-async function callLanguageModel(prompt, taskType = null) {
-    const config = vscode.workspace.getConfiguration('astra');
-    const apiUrl = config.get('apiUrl') || 'http://localhost:8080';
+async function callLanguageModel(prompt, taskTypeOrOptions = null) {
+    // Support both old signature (string taskType) and new signature (options object)
+    let taskType = null;
+    let preferStrongerModel = false;
+    
+    if (typeof taskTypeOrOptions === 'object' && taskTypeOrOptions !== null) {
+        // New options-based signature
+        taskType = taskTypeOrOptions.task || taskTypeOrOptions.taskType || null;
+        preferStrongerModel = taskTypeOrOptions.preferStrongerModel || false;
+    } else {
+        // Old string-based signature for backward compatibility
+        taskType = taskTypeOrOptions;
+    }
     
     // Detect task type if not provided
     if (!taskType) {
         taskType = detectTaskType(prompt);
     }
+    
+    // If analysis task or preferStrongerModel flag, use stronger model
+    if (taskType === 'analysis' || preferStrongerModel) {
+        // Override to use analysis model (configured in settings)
+        taskType = 'analysis';
+    }
+    
+    // Map old task types to new LLMConfig task types
+    const taskMapping = {
+        'coding': LLMConfig.TASKS.CODING,
+        'docs': LLMConfig.TASKS.SUMMARY,
+        'summary': LLMConfig.TASKS.SUMMARY,
+        'classification': LLMConfig.TASKS.CLASSIFICATION,
+        'analysis': LLMConfig.TASKS.ANALYSIS,
+        'auto': LLMConfig.TASKS.DEFAULT
+    };
+    const llmTask = taskMapping[taskType] || LLMConfig.TASKS.DEFAULT;
     
     // Prepend system prompt (only for user-facing queries, not internal calls)
     // Skip for classification, docs generation, and summary tasks
@@ -20736,32 +22548,19 @@ async function callLanguageModel(prompt, taskType = null) {
         }
     }
     
-    // Get the appropriate model based on task type
-    let preferredModel = null;
-    switch (taskType) {
-        case 'coding':
-            preferredModel = config.get('llm.codegenModel') || config.get('llm.copilotModel') || 'claude-sonnet-4';
-            break;
-        case 'docs':
-            preferredModel = config.get('llm.documentationModel') || 'gpt-4o-mini';
-            break;
-        case 'classification':
-            preferredModel = config.get('llm.classificationModel') || 'gpt-4o-mini';
-            break;
-        default:
-            // 'auto' and other tasks use the general copilot model
-            preferredModel = config.get('llm.copilotModel') || 'claude-sonnet-4';
-    }
+    // Get the model from centralized config
+    const preferredModel = LLMConfig.getModelForTask(llmTask);
     
     debugLog('LLM', `Model selection`, {
         taskType,
+        llmTask,
         preferredModel,
         promptSize: prompt.length,
         hasSystemPrompt: !skipSystemPromptTasks.includes(taskType)
     });
     
-    // Get provider order based on task type
-    const providerOrder = getProviderOrderForTask(taskType);
+    // Get provider order from centralized config
+    const providerOrder = LLMConfig.getProviderPriority();
     debugLog('LLM', `Provider order: ${providerOrder.join(' → ')}`);
     log('Prompt size:', prompt.length, 'chars');
     
@@ -20798,12 +22597,13 @@ async function callLanguageModel(prompt, taskType = null) {
             }
             
             case 'anthropic': {
-                const anthropicKey = config.get('anthropicApiKey') || config.get('llm.anthropicApiKey');
+                const anthropicKey = LLMConfig.getApiKey('anthropic');
                 if (anthropicKey) {
-                    const model = config.get('llm.anthropicModel') || 'claude-sonnet-4-5-20250514';
+                    const model = preferredModel;
+                    const displayName = LLMConfig.getDisplayName(model);
                     chatWebviewView?.webview.postMessage({ 
                         type: 'appendResponse', 
-                        text: `\n*Trying Anthropic ${model}...*\n`
+                        text: `\n*Trying Anthropic ${displayName}...*\n`
                     });
                     try {
                         const result = await callAnthropicApi(prompt, anthropicKey, model);
@@ -20822,12 +22622,13 @@ async function callLanguageModel(prompt, taskType = null) {
             }
             
             case 'openai': {
-                const openaiKey = config.get('openaiApiKey') || config.get('llm.openaiApiKey');
+                const openaiKey = LLMConfig.getApiKey('openai');
                 if (openaiKey) {
-                    const model = config.get('llm.openaiModel') || 'gpt-4o';
+                    const model = preferredModel;
+                    const displayName = LLMConfig.getDisplayName(model);
                     chatWebviewView?.webview.postMessage({ 
                         type: 'appendResponse', 
-                        text: `\n*Trying OpenAI ${model}...*\n`
+                        text: `\n*Trying OpenAI ${displayName}...*\n`
                     });
                     try {
                         const result = await callOpenAIApi(prompt, openaiKey, model);
@@ -20865,10 +22666,9 @@ async function callLanguageModelForCoding(prompt) {
 // Try GitHub Copilot with retry logic
 async function tryCopilot(prompt, preferredModel = null) {
     const maxRetries = 2;
-    const config = vscode.workspace.getConfiguration('astra');
     
-    // Get preferred model from config or parameter
-    const configuredModel = preferredModel || config.get('llm.copilotModel') || 'claude-sonnet-4';
+    // Get preferred model from parameter or LLMConfig
+    const configuredModel = preferredModel || LLMConfig.getDefaultModel();
     
     // Check if settings changed - if so, clear the failed models cache
     if (lastCopilotModelSetting !== configuredModel) {
@@ -20928,51 +22728,16 @@ async function tryCopilot(prompt, preferredModel = null) {
                 log(`Filtered out ${originalCount - models.length} previously failed models, ${models.length} remaining`);
             }
             
-            // Select model based on preference (Claude Sonnet 4.5 > Claude 3.5 > GPT-4o)
+            // Select model using centralized search order from LLMConfig
             let model = null;
+            const modelSearchOrder = LLMConfig.getModelSearchOrder(configuredModel);
             
-            // Try to find the configured/preferred model first
-            const modelSearchOrder = [
-                // Claude Sonnet 4.5 variants
-                m => m.family?.toLowerCase().includes('claude-sonnet-4') || 
-                     m.name?.toLowerCase().includes('claude-sonnet-4') ||
-                     m.id?.toLowerCase().includes('claude-sonnet-4'),
-                // Claude 3.5 Sonnet
-                m => m.family?.toLowerCase().includes('claude-3.5-sonnet') ||
-                     m.name?.toLowerCase().includes('claude-3.5-sonnet') ||
-                     m.family?.toLowerCase().includes('claude-3-5-sonnet'),
-                // Any Claude model
-                m => m.family?.toLowerCase().includes('claude') ||
-                     m.name?.toLowerCase().includes('claude'),
-                // GPT-4o
-                m => m.family?.toLowerCase().includes('gpt-4o') ||
-                     m.name?.toLowerCase().includes('gpt-4o'),
-                // GPT-4
-                m => m.family?.toLowerCase().includes('gpt-4') ||
-                     m.name?.toLowerCase().includes('gpt-4'),
-            ];
-            
-            // If user specified a model, try to match it first
-            if (configuredModel) {
-                const configLower = configuredModel.toLowerCase();
-                model = models.find(m => 
-                    m.family?.toLowerCase().includes(configLower) ||
-                    m.name?.toLowerCase().includes(configLower) ||
-                    m.id?.toLowerCase().includes(configLower)
-                );
+            // Search in order of preference
+            for (const searchFn of modelSearchOrder) {
+                model = models.find(searchFn);
                 if (model) {
-                    log(`Found configured model: ${model.name || model.id}`);
-                }
-            }
-            
-            // If no match, search in order of preference
-            if (!model) {
-                for (const searchFn of modelSearchOrder) {
-                    model = models.find(searchFn);
-                    if (model) {
-                        log(`Found model by preference: ${model.name || model.id}`);
-                        break;
-                    }
+                    log(`Found model by preference: ${model.name || model.id}`);
+                    break;
                 }
             }
             
@@ -21407,9 +23172,8 @@ function parsePromptParts(prompt) {
 
 // Call Anthropic Claude API directly
 async function callAnthropicApi(prompt, apiKey, model = null) {
-    // Get model from config if not provided
-    const config = vscode.workspace.getConfiguration('astra');
-    const configuredModel = model || config.get('llm.anthropicModel') || 'claude-sonnet-4-5-20250514';
+    // Use provided model or get default from LLMConfig
+    const configuredModel = model || LLMConfig.getDefaultModel();
     
     log(`Anthropic API: Using model ${configuredModel}`);
     
@@ -21463,9 +23227,8 @@ async function callAnthropicApi(prompt, apiKey, model = null) {
 
 // Call OpenAI API directly
 async function callOpenAIApi(prompt, apiKey, model = null) {
-    // Get model from config if not provided
-    const config = vscode.workspace.getConfiguration('astra');
-    const configuredModel = model || config.get('llm.openaiModel') || 'gpt-4o';
+    // Use provided model or get default from LLMConfig
+    const configuredModel = model || LLMConfig.getDefaultModel();
     
     log(`OpenAI API: Using model ${configuredModel}`);
     
@@ -21680,11 +23443,20 @@ async function addFileToContext(uri, silent = false) {
                 }
             }
             
-            contextFiles.set(uri.fsPath, {
+            const fileData = {
                 uri: uri,
                 content: pdfResult.text || `[PDF file: ${fileName} - could not extract text. Consider using a PDF-to-text tool first.]`,
-                language: 'pdf'
-            });
+                language: 'pdf',
+                addedAt: new Date().toISOString()
+            };
+            
+            contextFiles.set(uri.fsPath, fileData);
+            
+            // Persist the file
+            if (persistenceManager) {
+                persistenceManager.saveContextFile(uri.fsPath, fileData);
+                persistenceManager.markDirty();
+            }
             
             contextTreeProvider.refresh();
             updateChatStatus();
@@ -21722,11 +23494,20 @@ async function addFileToContext(uri, silent = false) {
         const language = detectLanguage(uri.path);
         log('addFileToContext: Detected language:', language, 'for file:', uri.path);
         
-        contextFiles.set(uri.fsPath, {
+        const fileData = {
             uri: uri,
             content: text,
-            language: language
-        });
+            language: language,
+            addedAt: new Date().toISOString()
+        };
+        
+        contextFiles.set(uri.fsPath, fileData);
+        
+        // Persist the file
+        if (persistenceManager) {
+            persistenceManager.saveContextFile(uri.fsPath, fileData);
+            persistenceManager.markDirty();
+        }
         
         contextTreeProvider.refresh();
         updateChatStatus();
@@ -22117,9 +23898,76 @@ async function addDirectoryToContext(dirUri, depth = 0) {
 
 let contextTreeProvider;
 
-function activate(context) {
+async function activate(context) {
     outputChannel = vscode.window.createOutputChannel('AstraCode');
-    log('AstraCode v5.0.0 activating...');
+    log('AstraCode v5.1.3 activating...');
+    
+    // Initialize the new modular CodeIndex
+    codeIndexManager = new CodeIndex({
+        log: log,
+        onProgress: (pct, msg) => {
+            chatWebviewView?.webview.postMessage({ 
+                type: 'indexProgress', 
+                progress: pct, 
+                message: msg 
+            });
+        }
+    });
+    log('CodeIndex module initialized');
+    
+    // Initialize session memory
+    sessionMemory = new SessionMemory({
+        maxTurns: 100,
+        log: log
+    });
+    log('SessionMemory initialized');
+    
+    // Initialize persistence manager
+    persistenceManager = new PersistenceManager(context);
+    
+    // Restore state from previous session
+    try {
+        log('Restoring state from previous session...');
+        const restoredState = await persistenceManager.restoreAll();
+        
+        // Restore context files
+        if (restoredState.contextFiles && restoredState.contextFiles.size > 0) {
+            for (const [path, file] of restoredState.contextFiles) {
+                contextFiles.set(path, file);
+            }
+            log('Restored', contextFiles.size, 'context files');
+        }
+        
+        // Restore chat history
+        if (restoredState.chatHistory && restoredState.chatHistory.length > 0) {
+            chatHistory = restoredState.chatHistory;
+            log('Restored', chatHistory.length, 'chat messages');
+        }
+        
+        // Restore mode
+        if (restoredState.currentMode) {
+            currentMode = restoredState.currentMode;
+            log('Restored mode:', currentMode);
+        }
+        
+        // Log last session info
+        if (restoredState.lastSession) {
+            log('Last session:', restoredState.lastSession.timestamp);
+        }
+    } catch (error) {
+        log('Error restoring state:', error.message);
+    }
+    
+    // Set state references for persistence manager
+    persistenceManager.setStateReferences({
+        contextFiles: contextFiles,
+        chatHistory: chatHistory,
+        currentMode: currentMode,
+        codeIndex: codeIndex
+    });
+    
+    // Start auto-save
+    persistenceManager.startAutoSave();
     
     // Initialize search module
     initializeSearchModule();
@@ -22133,10 +23981,19 @@ function activate(context) {
     contextTreeProvider = new ContextFilesProvider();
     vscode.window.registerTreeDataProvider('astra.contextView', contextTreeProvider);
     
-    // Register chat webview provider
-    const chatProvider = new ChatViewProvider(context.extensionUri);
+    // Refresh tree with restored context files
+    if (contextFiles.size > 0) {
+        contextTreeProvider.refresh();
+    }
+    
+    // Register chat webview provider with persistence support
+    const chatProvider = new ChatViewProvider(context.extensionUri, context);
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('astra.chatView', chatProvider)
+        vscode.window.registerWebviewViewProvider('astra.chatView', chatProvider, {
+            webviewOptions: {
+                retainContextWhenHidden: true  // Keep webview state when hidden
+            }
+        })
     );
     
     // Try to load persisted vector index
@@ -22180,10 +24037,10 @@ function activate(context) {
             vscode.window.showInformationMessage(`Rebuilding index for ${contextFiles.size} files...`);
             updateChatStatus.isIndexing = true;
             try {
-                // Build symbol index
+                // Build symbol index (legacy)
                 const stats = await buildCodeIndex({ showProgress: true });
                 
-                // Build vector index
+                // Build vector index (legacy)
                 chatWebviewView?.webview.postMessage({ 
                     type: 'indexProgress', 
                     progress: 50, 
@@ -22200,6 +24057,14 @@ function activate(context) {
                         });
                     }
                 });
+                
+                // Also build using new modular CodeIndex (parallel data structure for now)
+                if (codeIndexManager) {
+                    log('Building modular CodeIndex...');
+                    await codeIndexManager.build(contextFiles);
+                    const modularStats = codeIndexManager.getStats();
+                    log('Modular CodeIndex stats:', JSON.stringify(modularStats));
+                }
                 
                 const vectorStats = getVectorIndexStats();
                 const vectorMsg = vectorStats ? `, ${vectorStats.chunks} vectors` : '';
@@ -22612,7 +24477,19 @@ function activate(context) {
     log('AstraCode activated');
 }
 
-function deactivate() {
+async function deactivate() {
+    // Save state before cleanup
+    if (persistenceManager) {
+        try {
+            log('Saving state before deactivation...');
+            await persistenceManager.saveAll();
+            persistenceManager.stopAutoSave();
+            persistenceManager.dispose();
+        } catch (error) {
+            log('Error saving state on deactivate:', error.message);
+        }
+    }
+    
     // Clear any pending timeout
     if (updateChatStatus.indexTimeout) {
         clearTimeout(updateChatStatus.indexTimeout);
