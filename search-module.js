@@ -1,7 +1,11 @@
 /**
  * AstraCode Search Module v5.1
  * Modular search with Overview/Detailed modes, O(1) indexes, and optional vector (semantic) search
+ * 
+ * NEW in v5.1: Inverted index integration for keyword-based search
  */
+
+const { InvertedIndex } = require('./inverted-index');
 
 // All callable types across languages (matches generateCodeSummaries in extension.js)
 const CALLABLE_TYPES = new Set([
@@ -28,6 +32,9 @@ const fileExtensionIndex = new Map();
 const fileDirectoryIndex = new Map();
 const moduleSummaryIndex = new Map();
 
+// Inverted index for keyword search
+let invertedIndex = null;
+
 let searchMode = 'detailed';
 
 function initialize(codeIdx, trigramIdx, vectorIdx, ctxFiles, pathUtil, logFn, progressFn) {
@@ -38,6 +45,14 @@ function initialize(codeIdx, trigramIdx, vectorIdx, ctxFiles, pathUtil, logFn, p
     pathUtils = pathUtil;
     if (logFn) log = logFn;
     if (progressFn) showProgress = progressFn;
+    
+    // Initialize inverted index
+    invertedIndex = new InvertedIndex({
+        enableSynonyms: true,
+        boostSummaries: 3.0,
+        boostSymbols: 2.5
+    });
+    
     log('Search module initialized');
 }
 
@@ -46,8 +61,19 @@ function buildSearchIndexes() {
     buildSymbolTrigramIndex();
     buildFileIndexes();
     buildModuleSummaryIndex();
+    
+    // Build inverted index
+    if (invertedIndex && contextFiles && codeIndex) {
+        invertedIndex.buildFromCodebase(contextFiles, codeIndex, { log, showProgress });
+    }
+    
     log(`Search indexes built in ${Date.now() - start}ms`);
-    return { symbolTrigrams: symbolTrigramIndex.size, fileNames: fileNameIndex.size, modules: moduleSummaryIndex.size };
+    return { 
+        symbolTrigrams: symbolTrigramIndex.size, 
+        fileNames: fileNameIndex.size, 
+        modules: moduleSummaryIndex.size,
+        invertedTerms: invertedIndex ? invertedIndex.index.size : 0
+    };
 }
 
 function buildSymbolTrigramIndex() {
@@ -658,6 +684,243 @@ function fuzzyMatchScore(query, target) {
     return 0;
 }
 
+// ============================================================
+// INVERTED INDEX SEARCH FUNCTIONS
+// ============================================================
+
+/**
+ * Search using inverted index (keyword-based)
+ * Best for concept queries like "payment validation" or "authentication"
+ * @param {string} query - Search query
+ * @param {Object} options - Search options
+ * @returns {Array} Ranked results with file paths and scores
+ */
+function searchByKeyword(query, options = {}) {
+    if (!invertedIndex) {
+        log('Warning: Inverted index not initialized');
+        return [];
+    }
+    return invertedIndex.search(query, options);
+}
+
+/**
+ * Search for code related to a concept
+ * Searches summaries first (semantic), then code content
+ * @param {string} concept - Concept to search for (e.g., "payment processing", "authentication")
+ * @param {Object} options - Search options
+ * @returns {Array} Results with file paths, matched terms, and scores
+ */
+function searchConcept(concept, options = {}) {
+    if (!invertedIndex) {
+        log('Warning: Inverted index not initialized');
+        return [];
+    }
+    return invertedIndex.searchConcept(concept, options);
+}
+
+/**
+ * Search files by keyword
+ * @param {string} query - Search query
+ * @param {Object} options - Search options
+ * @returns {Array} File results
+ */
+function searchFilesByKeyword(query, options = {}) {
+    if (!invertedIndex) return [];
+    return invertedIndex.searchFiles(query, options);
+}
+
+/**
+ * Search symbols by keyword
+ * @param {string} query - Search query
+ * @param {Object} options - Search options
+ * @returns {Array} Symbol results
+ */
+function searchSymbolsByKeyword(query, options = {}) {
+    if (!invertedIndex) return [];
+    return invertedIndex.searchSymbols(query, options);
+}
+
+/**
+ * Search summaries by keyword (best for understanding code purpose)
+ * @param {string} query - Search query
+ * @param {Object} options - Search options
+ * @returns {Array} Summary results
+ */
+function searchSummariesByKeyword(query, options = {}) {
+    if (!invertedIndex) return [];
+    return invertedIndex.searchSummaries(query, options);
+}
+
+/**
+ * Get related terms for query expansion
+ * @param {string} query - Original query
+ * @param {number} maxTerms - Maximum terms to return
+ * @returns {Array} Related terms
+ */
+function getRelatedTerms(query, maxTerms = 10) {
+    if (!invertedIndex) return [];
+    return invertedIndex.getRelatedTerms(query, maxTerms);
+}
+
+/**
+ * Get query suggestions/completions
+ * @param {string} prefix - Partial query
+ * @param {number} maxSuggestions - Maximum suggestions
+ * @returns {Array} Suggestions with term and document count
+ */
+function suggestCompletions(prefix, maxSuggestions = 10) {
+    if (!invertedIndex) return [];
+    return invertedIndex.suggestCompletions(prefix, maxSuggestions);
+}
+
+/**
+ * Hybrid search combining inverted index, trigram, and vector search
+ * @param {string} query - Search query
+ * @param {Object} options - Search options
+ * @returns {Object} Combined results from all search methods
+ */
+function hybridSearch(query, options = {}) {
+    const { maxResults = 30, includeVector = true } = options;
+    const results = {
+        keyword: [],      // From inverted index
+        trigram: [],      // From trigram index
+        vector: [],       // From vector index
+        merged: [],       // Merged and ranked
+        relatedTerms: []  // For query expansion
+    };
+    
+    // 1. Keyword search (inverted index) - best for concepts
+    if (invertedIndex) {
+        results.keyword = invertedIndex.search(query, { maxResults });
+        results.relatedTerms = invertedIndex.getRelatedTerms(query, 5);
+    }
+    
+    // 2. Trigram search - best for exact text/identifiers
+    const trigramResults = findTextInCode(query, { maxResults });
+    results.trigram = trigramResults.map(r => ({
+        file: r.file,
+        line: r.line,
+        matchType: 'trigram',
+        score: 1.0
+    }));
+    
+    // 3. Symbol pattern search
+    const symbolResults = findSymbolsByPattern(query, { maxResults });
+    for (const sym of symbolResults) {
+        results.trigram.push({
+            file: sym.file,
+            line: sym.line,
+            name: sym.name,
+            type: sym.type,
+            matchType: 'symbol',
+            score: sym.matchScore / 100
+        });
+    }
+    
+    // 4. Vector search (if available and requested)
+    if (includeVector && options.queryVector) {
+        const vectorResults = findSymbolsByVector(options.queryVector, { maxResults });
+        results.vector = vectorResults.map(r => ({
+            file: r.file,
+            line: r.line,
+            name: r.name,
+            matchType: 'vector',
+            score: r.matchScore / 100
+        }));
+    }
+    
+    // 5. Merge and rank results
+    const scoreMap = new Map();
+    const infoMap = new Map();
+    
+    // Weight: keyword > vector > trigram
+    const weights = { keyword: 1.0, vector: 0.8, trigram: 0.6, symbol: 0.7 };
+    
+    for (const r of results.keyword) {
+        const file = r.path || r.file;
+        if (!file) continue;
+        const current = scoreMap.get(file) || 0;
+        scoreMap.set(file, current + r.score * weights.keyword);
+        if (!infoMap.has(file)) {
+            infoMap.set(file, { file, matchedTerms: r.matchedTerms, sources: ['keyword'] });
+        } else {
+            infoMap.get(file).sources.push('keyword');
+        }
+    }
+    
+    for (const r of results.trigram) {
+        const file = r.file;
+        if (!file) continue;
+        const weight = weights[r.matchType] || weights.trigram;
+        const current = scoreMap.get(file) || 0;
+        scoreMap.set(file, current + r.score * weight);
+        if (!infoMap.has(file)) {
+            infoMap.set(file, { file, name: r.name, line: r.line, sources: [r.matchType] });
+        } else {
+            infoMap.get(file).sources.push(r.matchType);
+        }
+    }
+    
+    for (const r of results.vector) {
+        const file = r.file;
+        if (!file) continue;
+        const current = scoreMap.get(file) || 0;
+        scoreMap.set(file, current + r.score * weights.vector);
+        if (!infoMap.has(file)) {
+            infoMap.set(file, { file, name: r.name, sources: ['vector'] });
+        } else {
+            infoMap.get(file).sources.push('vector');
+        }
+    }
+    
+    // Build merged results
+    for (const [file, score] of scoreMap) {
+        const info = infoMap.get(file);
+        results.merged.push({
+            ...info,
+            score,
+            sourceCount: new Set(info.sources).size
+        });
+    }
+    
+    // Sort by score, boost items found by multiple methods
+    results.merged.sort((a, b) => {
+        const scoreA = a.score * (1 + a.sourceCount * 0.2);
+        const scoreB = b.score * (1 + b.sourceCount * 0.2);
+        return scoreB - scoreA;
+    });
+    
+    results.merged = results.merged.slice(0, maxResults);
+    
+    return results;
+}
+
+/**
+ * Get inverted index statistics
+ */
+function getInvertedIndexStats() {
+    if (!invertedIndex) return null;
+    return invertedIndex.getStats();
+}
+
+/**
+ * Export inverted index for persistence
+ */
+function exportInvertedIndex() {
+    if (!invertedIndex) return null;
+    return invertedIndex.export();
+}
+
+/**
+ * Import inverted index from persistence
+ */
+function importInvertedIndex(data) {
+    if (!invertedIndex) {
+        invertedIndex = new InvertedIndex();
+    }
+    invertedIndex.import(data);
+}
+
 module.exports = {
     initialize, buildSearchIndexes, clearSearchIndexes,
     lookupSymbolByKey, lookupSymbolsByName, lookupFilesByName, lookupFilesByExtension,
@@ -668,6 +931,11 @@ module.exports = {
     traceCallersOf, traceCalleesOf,
     searchWhereIsDefined, searchWhoCallsFunction, searchWhatFunctionCalls, searchTextInCode, searchModuleOverview,
     executeOverviewSearch, executeDetailedSearch, executeSearch,
+    // NEW: Inverted index search functions
+    searchByKeyword, searchConcept, searchFilesByKeyword, searchSymbolsByKeyword, searchSummariesByKeyword,
+    getRelatedTerms, suggestCompletions, hybridSearch,
+    getInvertedIndexStats, exportInvertedIndex, importInvertedIndex,
+    // Helpers
     extractTrigrams, extractSearchTerms, fuzzyMatchScore,
     get searchMode() { return searchMode; },
     set searchMode(v) { searchMode = v; },
