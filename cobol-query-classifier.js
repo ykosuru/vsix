@@ -16,6 +16,8 @@
  *   const tables = classifier.getAllTables();  // Instant lookup, no scanning
  */
 
+const pathUtils = require('./pathUtils');
+
 // ============================================================
 // COBOL KNOWLEDGE BASE
 // ============================================================
@@ -251,7 +253,7 @@ class CobolQueryClassifier {
             
             if (!this._isCobolFile(filePath, language)) continue;
             
-            const fileName = filePath.split('/').pop() || filePath;
+            const fileName = pathUtils.getFileName(filePath) || filePath;
             const fileNameUpper = fileName.toUpperCase();
             
             this.indexedTables.byFile.set(filePath, {
