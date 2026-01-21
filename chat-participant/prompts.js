@@ -52,6 +52,7 @@ const HELP_TEXT = `# 🔍 AstraCode Help
 | \`/history\` | View last 25 queries | \`@astra /history\` |
 | \`/generated\` | List generated documentation files | \`@astra /generated\` |
 | \`/clean\` | Delete generated files | \`@astra /clean\` |
+| \`/docs\` | Show document indexing status | \`@astra /docs\` |
 | \`/stats\` | Show index statistics | \`@astra /stats\` |
 | \`/clear\` | Clear index (fresh start) | \`@astra /clear\` |
 | \`/rebuild\` | Force rebuild index | \`@astra /rebuild\` |
@@ -66,6 +67,28 @@ All commands support three input modes:
 | \`/cmd <topic>\` | Search current workspace | \`/describe FEDIN\` |
 | \`/cmd #N\` | Use history item N | \`/describe #5\` |
 | \`/cmd #file x, y\` | Use specific files | \`/describe #file payment.tal\` |
+
+## Multi-Folder Workspace
+
+Add multiple folders to your workspace:
+- \`File > Add Folder to Workspace...\`
+- Source code, docs, and requirements in separate folders
+- Save as \`.code-workspace\` file
+
+## Document Indexing
+
+AstraCode can index PDF, Excel, and Word documents:
+
+\`\`\`
+@astra /docs                   # Check parser status
+@astra /rebuild                # Re-index with documents
+@astra /find requirements      # Search across code AND docs
+\`\`\`
+
+**Install document parsers:**
+\`\`\`bash
+npm install pdf-parse xlsx mammoth
+\`\`\`
 
 ## DeepWiki Documentation
 
@@ -83,7 +106,6 @@ Generate comprehensive technical documentation:
 - API/function reference
 - Business rules catalog
 - Error handling guide
-- Configuration reference
 
 **Generated files saved to:** \`generated/<topic>_deepwiki_<timestamp>.md\`
 
@@ -93,14 +115,6 @@ Generate comprehensive technical documentation:
 @astra /generated              # List all generated files
 @astra /clean                  # Delete ALL generated files
 @astra /clean FEDIN            # Delete files matching "FEDIN"
-\`\`\`
-
-## Domain-Specific Commands
-
-\`\`\`
-@astra /domain fediso          # Fed ISO 20022 uplift
-@astra /fediso FEDIN           # Shortcut for /domain fediso
-@astra /domains                # List all available domains
 \`\`\`
 
 ## Workflow Example
