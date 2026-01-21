@@ -23,6 +23,10 @@ let indexedWorkspace = null;
 let lastSearchResults = null;  // Store last search results for chaining
 let lastSearchTerm = null;     // Store last search term
 
+// History tracking - last 25 Q&A pairs
+const MAX_HISTORY = 25;
+let queryHistory = [];  // { id, timestamp, command, query, summary, files }
+
 function activate(context) {
     const outputChannel = vscode.window.createOutputChannel('AstraCode');
     outputChannel.appendLine('AstraCode Copilot participant activated');
@@ -36,6 +40,16 @@ function activate(context) {
         // Handle /help command
         if (request.command === 'help') {
             return showHelp(response);
+        }
+        
+        // Handle /history command
+        if (request.command === 'history') {
+            return showHistory(response, query);
+        }
+        
+        // Handle /use command - reuse results from history
+        if (request.command === 'use') {
+            return handleUseCommand(query, response, outputChannel);
         }
         
         // Handle /clear command
@@ -133,6 +147,125 @@ function showHelp(response) {
     response.markdown(HELP_TEXT);
 }
 
+/**
+ * Show query history
+ */
+function showHistory(response, query) {
+    const arg = query.trim();
+    
+    // Check if user wants to reference a specific history item
+    const numMatch = arg.match(/^#?(\d+)$/);
+    if (numMatch) {
+        const id = parseInt(numMatch[1]);
+        const item = queryHistory.find(h => h.id === id);
+        if (item) {
+            response.markdown(`## 📜 History #${item.id}\n\n`);
+            response.markdown(`**Time:** ${item.timestamp.toLocaleString()}\n\n`);
+            response.markdown(`**Command:** \`/${item.command || 'query'}\`\n\n`);
+            response.markdown(`**Query:** ${item.query}\n\n`);
+            response.markdown(`**Summary:**\n${item.summary}\n\n`);
+            if (item.files && item.files.length > 0) {
+                response.markdown(`**Files:**\n`);
+                for (const file of item.files) {
+                    response.markdown(`- \`${file}\`\n`);
+                }
+            }
+            response.markdown(`\n💡 *Use \`@astra /use #${item.id}\` to reuse these results*`);
+        } else {
+            response.markdown(`❌ History item #${id} not found. Use \`@astra /history\` to see available items.`);
+        }
+        return;
+    }
+    
+    // Show full history
+    if (queryHistory.length === 0) {
+        response.markdown('📜 **No history yet.** Run some queries first!');
+        return;
+    }
+    
+    response.markdown(`# 📜 Query History (Last ${queryHistory.length})\n\n`);
+    response.markdown(`| # | Time | Command | Query | Files |\n`);
+    response.markdown(`|---|------|---------|-------|-------|\n`);
+    
+    // Show newest first
+    const reversed = [...queryHistory].reverse();
+    for (const item of reversed) {
+        const time = item.timestamp.toLocaleTimeString();
+        const cmd = item.command ? `/${item.command}` : 'query';
+        const queryPreview = item.query.length > 30 ? item.query.slice(0, 30) + '...' : item.query;
+        const fileCount = item.files ? item.files.length : 0;
+        response.markdown(`| #${item.id} | ${time} | \`${cmd}\` | ${queryPreview} | ${fileCount} |\n`);
+    }
+    
+    response.markdown(`\n**Usage:**\n`);
+    response.markdown(`- \`@astra /history #5\` - View details of history item #5\n`);
+    response.markdown(`- \`@astra /use #5\` - Reuse results from history item #5\n`);
+}
+
+/**
+ * Add entry to history
+ */
+function addToHistory(command, query, summary, files) {
+    const id = queryHistory.length > 0 ? queryHistory[queryHistory.length - 1].id + 1 : 1;
+    
+    queryHistory.push({
+        id,
+        timestamp: new Date(),
+        command: command || null,
+        query: query || '',
+        summary: summary || '',
+        files: files || [],
+        results: lastSearchResults  // Store results for /use command
+    });
+    
+    // Keep only last MAX_HISTORY items
+    if (queryHistory.length > MAX_HISTORY) {
+        queryHistory.shift();
+    }
+    
+    return id;
+}
+
+/**
+ * Handle /use command - reuse results from history
+ */
+function handleUseCommand(query, response, outputChannel) {
+    const numMatch = query.trim().match(/^#?(\d+)$/);
+    if (!numMatch) {
+        response.markdown('**Usage:** `@astra /use #5`\n\nReuse results from a history item for further commands.\n\n**Example:**\n```\n@astra /use #5\n@astra /translate\n```');
+        return;
+    }
+    
+    const id = parseInt(numMatch[1]);
+    const item = queryHistory.find(h => h.id === id);
+    
+    if (!item) {
+        response.markdown(`❌ History item #${id} not found. Use \`@astra /history\` to see available items.`);
+        return;
+    }
+    
+    if (!item.results || item.results.length === 0) {
+        response.markdown(`⚠️ History item #${id} has no saved results to reuse.`);
+        return;
+    }
+    
+    // Set the last results to the history item's results
+    lastSearchResults = item.results;
+    lastSearchTerm = item.query;
+    
+    outputChannel.appendLine(`/use: Loaded ${item.results.length} results from history #${id}`);
+    
+    response.markdown(`✅ **Loaded history #${id}**\n\n`);
+    response.markdown(`- **Query:** ${item.query}\n`);
+    response.markdown(`- **Results:** ${item.results.length} code matches\n`);
+    response.markdown(`- **Files:** ${item.files?.length || 0}\n\n`);
+    response.markdown(`Now you can run:\n`);
+    response.markdown(`- \`@astra /describe\` - Describe this code\n`);
+    response.markdown(`- \`@astra /translate\` - Translate to Java\n`);
+    response.markdown(`- \`@astra /requirements\` - Extract requirements\n`);
+    response.markdown(`- \`@astra /fediso\` - Apply Fed ISO 20022 uplift\n`);
+}
+
 // ============================================================
 // COMMAND HANDLERS
 // ============================================================
@@ -175,14 +308,20 @@ async function handleFindCommand(query, response, outputChannel, workspaceRoot, 
     lastSearchResults = results;
     lastSearchTerm = searchTerm;
     
+    // Get unique files for history
+    const uniqueFiles = [...new Set(results.map(r => r.file))];
+    
+    // Add to history
+    const historyId = addToHistory('find', searchTerm, `Found ${results.length} matches`, uniqueFiles);
+    
     if (results.length === 0) {
         response.markdown(`No matches found for: \`${searchTerm}\`\n\nTry:\n- Different spelling\n- Partial term\n- \`@astra /rebuild\` to refresh index`);
         return;
     }
     
     // Format results
-    response.markdown(`## 🔍 Found ${results.length} matches for \`${searchTerm}\`\n\n`);
-    response.markdown(`💡 *Tip: Use \`@astra /translate\` or \`@astra /describe\` to work with these results*\n\n`);
+    response.markdown(`## 🔍 Found ${results.length} matches for \`${searchTerm}\` *(History #${historyId})*\n\n`);
+    response.markdown(`💡 *Tip: Use \`@astra /translate\`, \`@astra /describe\`, or \`@astra /use #${historyId}\` later*\n\n`);
     
     const byFile = groupByFile(results);
     for (const [file, fileResults] of byFile) {
@@ -233,6 +372,10 @@ async function handleDescribeCommand(query, response, outputChannel, workspaceRo
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
+    // Save to history
+    const uniqueFiles = [...new Set(results.map(r => r.file))];
+    addToHistory('describe', searchTerm, `Described ${uniqueFiles.length} files`, uniqueFiles);
+    
     const systemPrompt = DESCRIBE_SYSTEM_PROMPT;
     const userPrompt = getDescribeUserPrompt(searchTerm, context);
 
@@ -275,6 +418,10 @@ async function handleTranslateCommand(query, response, outputChannel, workspaceR
     }
     
     const context = formatResultsForLLM(results, workspaceRoot);
+    
+    // Save to history
+    const uniqueFiles = [...new Set(results.map(r => r.file))];
+    addToHistory('translate', searchTerm, `Translated ${uniqueFiles.length} files to Java`, uniqueFiles);
     
     const systemPrompt = TRANSLATE_SYSTEM_PROMPT;
     const userPrompt = getTranslateUserPrompt(context);
@@ -361,6 +508,10 @@ async function handleFedIsoCommand(query, response, outputChannel, workspaceRoot
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
+    // Save to history
+    const uniqueFiles = [...new Set(results.map(r => r.file))];
+    addToHistory('fediso', searchTerm, `Fed ISO 20022 uplift for ${uniqueFiles.length} files`, uniqueFiles);
+    
     const systemPrompt = FEDISO_SYSTEM_PROMPT;
     const userPrompt = getFedIsoUserPrompt(context);
 
@@ -404,6 +555,10 @@ async function handleRequirementsCommand(query, response, outputChannel, workspa
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
+    // Save to history
+    const uniqueFiles = [...new Set(results.map(r => r.file))];
+    addToHistory('requirements', searchTerm, `Extracted requirements from ${uniqueFiles.length} files`, uniqueFiles);
+    
     const systemPrompt = REQUIREMENTS_SYSTEM_PROMPT;
     const userPrompt = getRequirementsUserPrompt(searchTerm, context);
 
@@ -426,6 +581,14 @@ async function handleGeneralQuery(query, response, outputChannel, workspaceRoot,
         response.markdown(`No matches found. Try:\n- Different keywords\n- \`@astra /find <term>\`\n- \`@astra /help\` for commands`);
         return;
     }
+    
+    // Save results for chaining
+    lastSearchResults = searchResults;
+    lastSearchTerm = query;
+    
+    // Save to history
+    const uniqueFiles = [...new Set(searchResults.map(r => r.file))];
+    addToHistory(null, query, `Query answered from ${uniqueFiles.length} files`, uniqueFiles);
 
     response.progress('Analyzing code...');
     const formattedContext = formatResultsForLLM(searchResults, workspaceRoot);
@@ -830,6 +993,7 @@ function deactivate() {
     indexedWorkspace = null;
     lastSearchResults = null;
     lastSearchTerm = null;
+    queryHistory = [];
 }
 
 module.exports = { activate, deactivate };
