@@ -22,7 +22,40 @@
  * @returns {string} Language identifier
  */
 function detectLanguage(filePath) {
-    const ext = filePath.split('.').pop().toLowerCase();
+    // Get just the filename
+    const fileName = filePath.split('/').pop().split('\\').pop();
+    
+    // Check for known names without extensions
+    const knownNames = {
+        'readme': 'text',
+        'makefile': 'makefile',
+        'dockerfile': 'dockerfile',
+        'license': 'text',
+        'authors': 'text',
+        'changelog': 'text',
+        'contributing': 'text',
+        'gitignore': 'config',
+        'gitattributes': 'config',
+        'editorconfig': 'config',
+        'eslintrc': 'json',
+        'prettierrc': 'json',
+        'babelrc': 'json',
+        'npmrc': 'config',
+        'yarnrc': 'config'
+    };
+    
+    const lowerName = fileName.toLowerCase();
+    if (knownNames[lowerName]) {
+        return knownNames[lowerName];
+    }
+    
+    // Check for extension
+    const parts = fileName.split('.');
+    if (parts.length < 2) {
+        return 'text'; // No extension, default to text
+    }
+    
+    const ext = parts.pop().toLowerCase();
     const langMap = {
         // Legacy - COBOL
         'cbl': 'cobol', 'cob': 'cobol', 'cobol': 'cobol', 'cpy': 'cobol', 'pco': 'cobol',
@@ -57,6 +90,8 @@ function detectLanguage(filePath) {
         'go': 'go', 'rs': 'rust', 'rb': 'ruby', 'php': 'php',
         'swift': 'swift', 'fs': 'fsharp', 'vb': 'vb',
         'pl': 'perl', 'r': 'r', 'lua': 'lua',
+        // Parser generators
+        'y': 'yacc', 'l': 'lex',
         // Config
         'md': 'markdown', 'txt': 'text', 'log': 'log',
         'ini': 'ini', 'cfg': 'ini', 'conf': 'ini', 'properties': 'properties',
@@ -826,6 +861,290 @@ class CodeIndex {
 }
 
 // ============================================================
+// LANGUAGE CONFIGURATION - Call patterns, body detection, etc.
+// ============================================================
+
+/**
+ * Get language-specific configuration for call detection and body parsing
+ * @param {string} language - The programming language
+ * @returns {Object} Configuration object
+ */
+function getLanguageConfig(language) {
+    const configs = {
+        // C-style languages (C, C++, Java, JavaScript, TypeScript, C#, Go, Rust)
+        c: {
+            callPatterns: [
+                /\b([a-zA-Z_]\w*)\s*\(/g  // function_name(
+            ],
+            excludeKeywords: ['if', 'for', 'while', 'switch', 'catch', 'return', 'sizeof', 'typeof', 'alignof', 'defined'],
+            bodyDelimiters: { start: '{', end: '}' },
+            commentPatterns: [/\/\/.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g, /'(?:[^'\\]|\\.)*'/g]
+        },
+        cpp: {
+            callPatterns: [
+                /\b([a-zA-Z_]\w*)\s*\(/g,
+                /\b([a-zA-Z_]\w*)\s*<[^>]*>\s*\(/g  // template<T>()
+            ],
+            excludeKeywords: ['if', 'for', 'while', 'switch', 'catch', 'return', 'sizeof', 'typeof', 'alignof', 'decltype', 'static_cast', 'dynamic_cast', 'const_cast', 'reinterpret_cast'],
+            bodyDelimiters: { start: '{', end: '}' },
+            commentPatterns: [/\/\/.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g, /'(?:[^'\\]|\\.)*'/g]
+        },
+        java: {
+            callPatterns: [
+                /\b([a-zA-Z_]\w*)\s*\(/g,
+                /\bnew\s+([a-zA-Z_]\w*)\s*\(/g  // new ClassName()
+            ],
+            excludeKeywords: ['if', 'for', 'while', 'switch', 'catch', 'return', 'instanceof', 'synchronized', 'assert'],
+            bodyDelimiters: { start: '{', end: '}' },
+            commentPatterns: [/\/\/.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g]
+        },
+        javascript: {
+            callPatterns: [
+                /\b([a-zA-Z_$]\w*)\s*\(/g,
+                /\bnew\s+([a-zA-Z_$]\w*)\s*\(/g,
+                /\.([a-zA-Z_$]\w*)\s*\(/g  // method calls
+            ],
+            excludeKeywords: ['if', 'for', 'while', 'switch', 'catch', 'return', 'typeof', 'instanceof', 'await', 'async', 'function', 'class'],
+            bodyDelimiters: { start: '{', end: '}' },
+            commentPatterns: [/\/\/.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g, /'(?:[^'\\]|\\.)*'/g, /`(?:[^`\\]|\\.)*`/g]
+        },
+        typescript: {
+            callPatterns: [
+                /\b([a-zA-Z_$]\w*)\s*\(/g,
+                /\bnew\s+([a-zA-Z_$]\w*)\s*(?:<[^>]*>)?\s*\(/g,
+                /\.([a-zA-Z_$]\w*)\s*(?:<[^>]*>)?\s*\(/g
+            ],
+            excludeKeywords: ['if', 'for', 'while', 'switch', 'catch', 'return', 'typeof', 'instanceof', 'await', 'async', 'function', 'class', 'interface', 'type'],
+            bodyDelimiters: { start: '{', end: '}' },
+            commentPatterns: [/\/\/.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g, /'(?:[^'\\]|\\.)*'/g, /`(?:[^`\\]|\\.)*`/g]
+        },
+        csharp: {
+            callPatterns: [
+                /\b([a-zA-Z_]\w*)\s*\(/g,
+                /\bnew\s+([a-zA-Z_]\w*)\s*(?:<[^>]*>)?\s*\(/g
+            ],
+            excludeKeywords: ['if', 'for', 'foreach', 'while', 'switch', 'catch', 'return', 'typeof', 'sizeof', 'nameof', 'await', 'lock', 'using'],
+            bodyDelimiters: { start: '{', end: '}' },
+            commentPatterns: [/\/\/.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g, /@"(?:[^"]|"")*"/g]
+        },
+        python: {
+            callPatterns: [
+                /\b([a-zA-Z_]\w*)\s*\(/g,
+                /\.([a-zA-Z_]\w*)\s*\(/g
+            ],
+            excludeKeywords: ['if', 'for', 'while', 'with', 'except', 'return', 'yield', 'assert', 'print', 'lambda', 'class', 'def'],
+            bodyDelimiters: { type: 'indent' },  // Python uses indentation
+            commentPatterns: [/#.*$/gm, /'''[\s\S]*?'''/g, /"""[\s\S]*?"""/g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g, /'(?:[^'\\]|\\.)*'/g, /"""[\s\S]*?"""/g, /'''[\s\S]*?'''/g]
+        },
+        go: {
+            callPatterns: [
+                /\b([a-zA-Z_]\w*)\s*\(/g,
+                /\.([a-zA-Z_]\w*)\s*\(/g
+            ],
+            excludeKeywords: ['if', 'for', 'switch', 'select', 'return', 'defer', 'go', 'range', 'make', 'new', 'append', 'len', 'cap', 'delete', 'copy'],
+            bodyDelimiters: { start: '{', end: '}' },
+            commentPatterns: [/\/\/.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g, /`[^`]*`/g]
+        },
+        rust: {
+            callPatterns: [
+                /\b([a-zA-Z_]\w*)\s*[!]?\s*\(/g,  // macros have !
+                /::([a-zA-Z_]\w*)\s*\(/g,  // path::func()
+                /\.([a-zA-Z_]\w*)\s*\(/g
+            ],
+            excludeKeywords: ['if', 'for', 'while', 'loop', 'match', 'return', 'unsafe', 'async', 'await', 'move', 'ref', 'mut', 'Box', 'Vec', 'Some', 'None', 'Ok', 'Err'],
+            bodyDelimiters: { start: '{', end: '}' },
+            commentPatterns: [/\/\/.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/"(?:[^"\\]|\\.)*"/g, /r#*"[\s\S]*?"#*/g]
+        },
+        
+        // Legacy languages
+        cobol: {
+            callPatterns: [
+                /\bPERFORM\s+([A-Z0-9][-A-Z0-9]*)/gi,
+                /\bCALL\s+['"]?([A-Z0-9][-A-Z0-9]*)/gi,
+                /\bINVOKE\s+([A-Z0-9][-A-Z0-9]*)/gi,
+                /\bGO\s+TO\s+([A-Z0-9][-A-Z0-9]*)/gi
+            ],
+            excludeKeywords: ['THRU', 'THROUGH', 'UNTIL', 'VARYING', 'TIMES', 'WITH', 'TEST', 'BEFORE', 'AFTER'],
+            bodyDelimiters: { type: 'paragraph' },  // COBOL uses paragraphs/sections
+            commentPatterns: [/^\s{6}\*.*$/gm],  // Column 7 asterisk
+            stringPatterns: [/"[^"]*"/g, /'[^']*'/g]
+        },
+        tal: {
+            callPatterns: [
+                /\bCALL\s+(\w+)/gi,
+                /\b(\w+)\s*\(/g,  // proc_name(
+                /\bPROCESS\s+CALL\s+(\w+)/gi
+            ],
+            excludeKeywords: ['IF', 'THEN', 'ELSE', 'DO', 'WHILE', 'FOR', 'UNTIL', 'CASE', 'RETURN', 'SCAN', 'RSCAN', 'MOVE', 'STORE'],
+            bodyDelimiters: { start: 'BEGIN', end: 'END' },
+            commentPatterns: [/--.*$/gm, /!.*$/gm],
+            stringPatterns: [/"[^"]*"/g]
+        },
+        
+        // SQL
+        sql: {
+            callPatterns: [
+                /\bEXEC(?:UTE)?\s+(\w+)/gi,
+                /\bCALL\s+(\w+)/gi,
+                /\b(\w+)\s*\(/g  // function calls
+            ],
+            excludeKeywords: ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'ON', 'AND', 'OR', 'NOT', 'IN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'AS', 'COUNT', 'SUM', 'AVG', 'MAX', 'MIN', 'COALESCE', 'NULLIF', 'CAST', 'CONVERT'],
+            bodyDelimiters: { start: 'BEGIN', end: 'END' },
+            commentPatterns: [/--.*$/gm, /\/\*[\s\S]*?\*\//g],
+            stringPatterns: [/'[^']*'/g]
+        }
+    };
+    
+    // Aliases
+    configs.h = configs.c;
+    configs.hpp = configs.cpp;
+    configs.cc = configs.cpp;
+    configs.cxx = configs.cpp;
+    configs.jsx = configs.javascript;
+    configs.mjs = configs.javascript;
+    configs.ts = configs.typescript;
+    configs.tsx = configs.typescript;
+    configs.cs = configs.csharp;
+    configs.py = configs.python;
+    configs.rs = configs.rust;
+    configs.cob = configs.cobol;
+    configs.cbl = configs.cobol;
+    
+    // Return config or default to C-style
+    return configs[language] || configs.c;
+}
+
+/**
+ * Extract function calls from code using language-specific patterns
+ * @param {string} code - The code to analyze
+ * @param {string} language - The programming language
+ * @returns {Set<string>} Set of called function names
+ */
+function extractCalls(code, language) {
+    const config = getLanguageConfig(language);
+    const calls = new Set();
+    const excludeSet = new Set(config.excludeKeywords.map(k => k.toLowerCase()));
+    
+    // Remove comments to avoid false positives
+    let cleanCode = code;
+    for (const pattern of config.commentPatterns) {
+        cleanCode = cleanCode.replace(pattern, ' ');
+    }
+    
+    // Remove strings to avoid false positives
+    for (const pattern of config.stringPatterns) {
+        cleanCode = cleanCode.replace(pattern, '""');
+    }
+    
+    // Apply each call pattern
+    for (const pattern of config.callPatterns) {
+        // Reset regex state
+        pattern.lastIndex = 0;
+        let match;
+        while ((match = pattern.exec(cleanCode)) !== null) {
+            // Get the captured group (function name)
+            const funcName = match[1] || match[2];
+            if (funcName && !excludeSet.has(funcName.toLowerCase())) {
+                calls.add(funcName);
+            }
+        }
+    }
+    
+    return calls;
+}
+
+/**
+ * Find the end of a function body based on language
+ * @param {string[]} lines - Array of code lines
+ * @param {number} startLine - Starting line index (0-based)
+ * @param {string} language - The programming language
+ * @returns {number} End line index
+ */
+function findFunctionBodyEnd(lines, startLine, language) {
+    const config = getLanguageConfig(language);
+    const delimiters = config.bodyDelimiters;
+    
+    // Indentation-based (Python)
+    if (delimiters.type === 'indent') {
+        const startIndent = lines[startLine].match(/^(\s*)/)[1].length;
+        for (let i = startLine + 1; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.trim() === '') continue;  // Skip empty lines
+            const indent = line.match(/^(\s*)/)[1].length;
+            if (indent <= startIndent && line.trim() !== '') {
+                return i;
+            }
+        }
+        return lines.length;
+    }
+    
+    // Paragraph-based (COBOL)
+    if (delimiters.type === 'paragraph') {
+        for (let i = startLine + 1; i < lines.length; i++) {
+            const line = lines[i];
+            // New paragraph/section starts with label in column 8-11
+            if (/^.{7}[A-Z0-9][-A-Z0-9]*\s*(SECTION)?\s*\.\s*$/i.test(line)) {
+                return i;
+            }
+            // END-* statement
+            if (/^\s*END-/i.test(line.substring(7))) {
+                return i + 1;
+            }
+        }
+        return lines.length;
+    }
+    
+    // Brace/keyword-based (most languages)
+    let depth = 0;
+    let started = false;
+    const startDelim = delimiters.start;
+    const endDelim = delimiters.end;
+    
+    for (let i = startLine; i < lines.length; i++) {
+        const line = lines[i];
+        
+        if (typeof startDelim === 'string' && startDelim.length === 1) {
+            // Single character delimiters (braces)
+            for (const char of line) {
+                if (char === startDelim) {
+                    depth++;
+                    started = true;
+                } else if (char === endDelim) {
+                    depth--;
+                    if (started && depth === 0) {
+                        return i + 1;
+                    }
+                }
+            }
+        } else {
+            // Keyword delimiters (BEGIN/END)
+            const upperLine = line.toUpperCase();
+            if (upperLine.includes(startDelim)) {
+                depth++;
+                started = true;
+            }
+            if (upperLine.includes(endDelim)) {
+                depth--;
+                if (started && depth === 0) {
+                    return i + 1;
+                }
+            }
+        }
+    }
+    
+    return Math.min(startLine + 200, lines.length);  // Fallback: limit to 200 lines
+}
+
+// ============================================================
 // EXPORTS
 // ============================================================
 
@@ -837,6 +1156,10 @@ module.exports = {
     parseFile,
     generateSummaryFromName,
     generateFunctionSummary,
+    // Language configuration
+    getLanguageConfig,
+    extractCalls,
+    findFunctionBodyEnd,
     // Individual parsers (for testing/extension)
     parsers: {
         parseCStyle,
