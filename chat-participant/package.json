@@ -1,8 +1,8 @@
 {
   "name": "astracode-copilot",
   "displayName": "AstraCode for Copilot Chat",
-  "description": "Grep-powered code search integrated with GitHub Copilot Chat",
-  "version": "0.1.0",
+  "description": "Code search with function call indexing for GitHub Copilot Chat",
+  "version": "0.2.0",
   "publisher": "astracode",
   "engines": {
     "vscode": "^1.90.0"
@@ -18,7 +18,7 @@
         "id": "astracode.chat",
         "name": "astra",
         "fullName": "AstraCode",
-        "description": "Search and analyze your codebase with grep-powered retrieval",
+        "description": "Search code with function call tracking - answers 'who calls X?' queries",
         "isSticky": false
       }
     ]
