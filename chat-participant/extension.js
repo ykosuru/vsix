@@ -64,10 +64,28 @@ function activate(context) {
         
         // Handle /rebuild command
         if (request.command === 'rebuild') {
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!workspaceRoot) {
+                response.markdown('❌ No workspace folder open. Please open a folder first.');
+                return;
+            }
+            
             grepIndex = null;
             indexedWorkspace = null;
             outputChannel.appendLine('Forcing index rebuild...');
             response.progress('Rebuilding index from scratch...');
+            
+            await buildIndex(workspaceRoot, outputChannel);
+            indexedWorkspace = workspaceRoot;
+            
+            const stats = grepIndex.getStats();
+            response.markdown(`✅ **Index rebuilt successfully!**\n\n`);
+            response.markdown(`- **Files indexed:** ${stats.files}\n`);
+            response.markdown(`- **Total lines:** ${stats.totalLines.toLocaleString()}\n`);
+            response.markdown(`- **Unique functions:** ${stats.uniqueFunctions.toLocaleString()}\n`);
+            response.markdown(`- **Call sites tracked:** ${stats.indexedCalls.toLocaleString()}\n`);
+            response.markdown(`- **Build time:** ${stats.buildTime}ms\n`);
+            return;
         }
         
         // Handle /stats command
