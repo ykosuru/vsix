@@ -6,6 +6,12 @@
   "engines": {
     "vscode": "^1.85.0"
   },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionDependencies": [
+    "github.copilot-chat"
+  ],
   "dependencies": {
     "pdf-parse": "^1.1.1",
     "xlsx": "^0.18.5",
