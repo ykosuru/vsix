@@ -8,6 +8,8 @@ const {
     getTranslateUserPrompt,
     REQUIREMENTS_SYSTEM_PROMPT,
     getRequirementsUserPrompt,
+    DEEPWIKI_SYSTEM_PROMPT,
+    getDeepWikiUserPrompt,
     GENERAL_SYSTEM_PROMPT,
     getGeneralUserPrompt,
     getDomainPrompt,
@@ -104,6 +106,67 @@ function activate(context) {
             }
             return;
         }
+        
+        // Handle /generated command - list generated files
+        if (request.command === 'generated') {
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!workspaceRoot) {
+                response.markdown('❌ No workspace folder open.');
+                return;
+            }
+            
+            const files = await getGeneratedFiles(workspaceRoot);
+            if (files.length === 0) {
+                response.markdown('📂 **No generated files found.**\n\nRun `/describe`, `/translate`, `/deepwiki` etc. to generate documentation.');
+                return;
+            }
+            
+            response.markdown(`# 📂 Generated Files (${files.length})\n\n`);
+            response.markdown(`| File | Actions |\n`);
+            response.markdown(`|------|--------|\n`);
+            for (const file of files.sort((a, b) => b.name.localeCompare(a.name))) {
+                response.markdown(`| \`${file.name}\` | [Open](${file.uri}) |\n`);
+            }
+            response.markdown(`\n**Commands:**\n`);
+            response.markdown(`- \`/clean\` — Delete all generated files\n`);
+            response.markdown(`- \`/clean FEDIN\` — Delete files containing "FEDIN"\n`);
+            return;
+        }
+        
+        // Handle /clean command - delete generated files
+        if (request.command === 'clean') {
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!workspaceRoot) {
+                response.markdown('❌ No workspace folder open.');
+                return;
+            }
+            
+            const pattern = query.trim() || '*';
+            const files = await getGeneratedFiles(workspaceRoot);
+            
+            if (files.length === 0) {
+                response.markdown('📂 **No generated files to clean.**');
+                return;
+            }
+            
+            // Show what will be deleted and ask for confirmation
+            const toDelete = pattern === '*' 
+                ? files 
+                : files.filter(f => f.name.toLowerCase().includes(pattern.toLowerCase()));
+            
+            if (toDelete.length === 0) {
+                response.markdown(`❌ No files matching "${pattern}" found.`);
+                return;
+            }
+            
+            const deleted = await deleteGeneratedFiles(workspaceRoot, pattern);
+            response.markdown(`🗑️ **Deleted ${deleted} generated file(s)**\n\n`);
+            if (pattern !== '*') {
+                response.markdown(`Pattern: \`${pattern}\`\n`);
+            }
+            response.markdown(`\n💡 *Use \`/generated\` to see remaining files*`);
+            return;
+        }
 
         // All other commands need a workspace
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -136,6 +199,9 @@ function activate(context) {
                 
                 case 'translate':
                     return await handleTranslateCommand(query, response, outputChannel, workspaceRoot, token);
+                
+                case 'deepwiki':
+                    return await handleDeepWikiCommand(query, response, outputChannel, workspaceRoot, token);
                 
                 case 'fediso':
                     return await handleDomainCommand('fediso', query, response, outputChannel, workspaceRoot, token);
@@ -553,6 +619,96 @@ async function handleTranslateCommand(query, response, outputChannel, workspaceR
 
     await streamLLMResponse(systemPrompt, userPrompt, response, outputChannel, token);
     appendFileReferences(results, workspaceRoot, response);
+}
+
+/**
+ * /deepwiki - Generate comprehensive DeepWiki-style documentation
+ * Syntax: /deepwiki <topic> | /deepwiki #N | /deepwiki #file a.tal, b.cbl
+ */
+async function handleDeepWikiCommand(query, response, outputChannel, workspaceRoot, token) {
+    const input = parseCommandInput(query);
+    let results;
+    let searchTerm;
+    
+    switch (input.type) {
+        case 'files':
+            // #file a.tal, b.cbl
+            results = await loadSpecificFiles(input.value, workspaceRoot, outputChannel);
+            searchTerm = input.value.join(', ');
+            break;
+            
+        case 'history':
+            // #N - use history item
+            const historyData = getHistoryResults(input.value);
+            if (historyData.error) {
+                response.markdown(`❌ ${historyData.error}`);
+                return;
+            }
+            results = historyData.results;
+            searchTerm = historyData.searchTerm;
+            response.markdown(`*Using history #${input.value}: \`${searchTerm}\`*\n\n`);
+            break;
+            
+        case 'search':
+            // Fresh search within current context
+            searchTerm = input.value;
+            response.progress(`Generating DeepWiki documentation: ${searchTerm}...`);
+            results = searchCode(searchTerm, 60);  // More results for comprehensive docs
+            break;
+            
+        case 'empty':
+        default:
+            // Show usage
+            response.markdown('**Usage:** `@astra /deepwiki <topic>`\n\n');
+            response.markdown('**Syntax:**\n');
+            response.markdown('- `/deepwiki FEDIN` — Generate comprehensive documentation\n');
+            response.markdown('- `/deepwiki #5` — Use results from history item #5\n');
+            response.markdown('- `/deepwiki #file payment.tal` — Specific files\n');
+            response.markdown('\n**Output:** DeepWiki-style technical documentation with:\n');
+            response.markdown('- Architecture diagrams (Mermaid)\n');
+            response.markdown('- Sequence diagrams\n');
+            response.markdown('- Data flow analysis\n');
+            response.markdown('- API/function reference\n');
+            response.markdown('- Business rules catalog\n');
+            if (queryHistory.length > 0) {
+                const last = queryHistory[queryHistory.length - 1];
+                response.markdown(`\n💡 *Recent: #${last.id} \`${last.query}\` — use \`/deepwiki #${last.id}\`*`);
+            }
+            return;
+    }
+    
+    if (!results || results.length === 0) {
+        response.markdown(`No code found for: \`${searchTerm}\``);
+        return;
+    }
+    
+    const context = formatResultsForLLM(results, workspaceRoot);
+    
+    // Save to history with cached results
+    const uniqueFiles = [...new Set(results.map(r => r.file))];
+    addToHistory('deepwiki', searchTerm, `DeepWiki docs for ${uniqueFiles.length} files`, uniqueFiles, results);
+    
+    const systemPrompt = DEEPWIKI_SYSTEM_PROMPT;
+    const userPrompt = getDeepWikiUserPrompt(searchTerm, context);
+
+    // Stream response and save to generated/ directory
+    const savedPath = await streamLLMResponseAndSave(
+        systemPrompt, 
+        userPrompt, 
+        response, 
+        outputChannel, 
+        token, 
+        workspaceRoot, 
+        searchTerm, 
+        'deepwiki'
+    );
+    
+    appendFileReferences(results, workspaceRoot, response);
+    
+    if (savedPath) {
+        const relativePath = path.relative(workspaceRoot, savedPath);
+        response.markdown(`\n\n---\n📄 **Saved to:** \`${relativePath}\``);
+    }
 }
 
 /**
@@ -974,6 +1130,106 @@ async function streamLLMResponse(systemPrompt, userPrompt, response, outputChann
 }
 
 /**
+ * Stream LLM response and save to generated/ directory
+ * Returns the generated file path
+ */
+async function streamLLMResponseAndSave(systemPrompt, userPrompt, response, outputChannel, token, workspaceRoot, term, command) {
+    const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+    let model = models.find(m => m.name.toLowerCase().includes('claude') && m.name.toLowerCase().includes('sonnet'));
+    if (!model) model = models.find(m => m.name.toLowerCase().includes('claude'));
+    if (!model && models.length > 0) model = models[0];
+
+    if (!model) {
+        response.markdown('❌ No language model available. Make sure GitHub Copilot is authenticated.');
+        return null;
+    }
+
+    outputChannel.appendLine(`Using model: ${model.name}`);
+    
+    const messages = [vscode.LanguageModelChatMessage.User(systemPrompt + '\n\n' + userPrompt)];
+    const chatResponse = await model.sendRequest(messages, {}, token);
+    
+    // Collect full response while streaming
+    let fullResponse = '';
+    for await (const chunk of chatResponse.text) {
+        response.markdown(chunk);
+        fullResponse += chunk;
+    }
+    
+    // Save to generated/ directory
+    const generatedDir = path.join(workspaceRoot, 'generated');
+    
+    // Ensure generated directory exists
+    try {
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(generatedDir));
+    } catch (e) {
+        // Directory might already exist
+    }
+    
+    // Create filename: <term>_<command>_<timestamp>.md
+    const sanitizedTerm = term.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const filename = `${sanitizedTerm}_${command}_${timestamp}.md`;
+    const filePath = path.join(generatedDir, filename);
+    
+    // Add header with metadata
+    const header = `<!-- Generated by AstraCode -->
+<!-- Command: /${command} ${term} -->
+<!-- Timestamp: ${new Date().toISOString()} -->
+<!-- Source files: See bottom of document -->
+
+`;
+    
+    // Write file
+    const content = Buffer.from(header + fullResponse, 'utf8');
+    await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), content);
+    
+    outputChannel.appendLine(`Saved output to: ${filePath}`);
+    
+    return filePath;
+}
+
+/**
+ * Get list of generated files
+ */
+async function getGeneratedFiles(workspaceRoot) {
+    const generatedDir = path.join(workspaceRoot, 'generated');
+    const pattern = new vscode.RelativePattern(generatedDir, '*.md');
+    
+    try {
+        const files = await vscode.workspace.findFiles(pattern, null, 100);
+        return files.map(f => ({
+            path: f.fsPath,
+            name: path.basename(f.fsPath),
+            uri: f
+        }));
+    } catch (e) {
+        return [];
+    }
+}
+
+/**
+ * Delete generated files
+ */
+async function deleteGeneratedFiles(workspaceRoot, pattern = '*') {
+    const files = await getGeneratedFiles(workspaceRoot);
+    let deleted = 0;
+    
+    for (const file of files) {
+        if (pattern === '*' || file.name.includes(pattern)) {
+            try {
+                await vscode.workspace.fs.delete(file.uri);
+                deleted++;
+            } catch (e) {
+                // Skip files that can't be deleted
+            }
+        }
+    }
+    
+    return deleted;
+}
+
+/**
  * Group results by file
  */
 function groupByFile(results) {
@@ -1019,18 +1275,20 @@ function appendFileReferences(results, workspaceRoot, response) {
 async function buildIndex(workspaceRoot, outputChannel) {
     const contextFiles = new Map();
     
+    // Source code extensions only - exclude .md to avoid indexing generated docs
     const extensions = [
         'ts', 'tsx', 'js', 'jsx', 'py', 'java', 'c', 'cpp', 'h', 'hpp',
         'cs', 'go', 'rs', 'rb', 'php', 'swift', 'kt', 'scala', 'sql',
-        'tal', 'cbl', 'cob', 'cobol', 'pli', 'md', 'json', 'yaml', 'yml'
+        'tal', 'cbl', 'cob', 'cobol', 'pli', 'pco', 'cpy', 'json', 'yaml', 'yml'
     ];
     
     const pattern = `**/*.{${extensions.join(',')}}`;
-    const excludePattern = '**/node_modules/**';
+    // Exclude node_modules and generated directory
+    const excludePattern = '{**/node_modules/**,**/generated/**}';
     
     const files = await vscode.workspace.findFiles(pattern, excludePattern, 5000);
     
-    outputChannel.appendLine(`Found ${files.length} files to index`);
+    outputChannel.appendLine(`Found ${files.length} files to index (excluding generated/)`);
     
     for (const fileUri of files) {
         try {
