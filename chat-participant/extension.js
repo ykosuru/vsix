@@ -1,6 +1,19 @@
 const vscode = require('vscode');
 const path = require('path');
 const { GrepIndex } = require('./grep-search');
+const {
+    DESCRIBE_SYSTEM_PROMPT,
+    getDescribeUserPrompt,
+    TRANSLATE_SYSTEM_PROMPT,
+    getTranslateUserPrompt,
+    FEDISO_SYSTEM_PROMPT,
+    getFedIsoUserPrompt,
+    REQUIREMENTS_SYSTEM_PROMPT,
+    getRequirementsUserPrompt,
+    GENERAL_SYSTEM_PROMPT,
+    getGeneralUserPrompt,
+    HELP_TEXT
+} = require('./prompts');
 
 const PARTICIPANT_ID = 'astracode.chat';
 
@@ -117,70 +130,7 @@ function activate(context) {
 // ============================================================
 
 function showHelp(response) {
-    response.markdown(`# 🔍 AstraCode Help
-
-## Commands
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| \`/find\` | Search for code by keyword | \`@astra /find FEDIN\` |
-| \`/describe\` | Describe functionality of code | \`@astra /describe FEDIN-PARSE\` |
-| \`/translate\` | Translate TAL to Java | \`@astra /translate PROC-VALIDATE\` |
-| \`/fediso\` | Uplift to Fed ISO 20022 | \`@astra /fediso FEDIN message\` |
-| \`/requirements\` | Extract business requirements | \`@astra /requirements wire transfer\` |
-| \`/extract\` | Alias for /requirements | \`@astra /extract validation rules\` |
-| \`/stats\` | Show index statistics | \`@astra /stats\` |
-| \`/clear\` | Clear index (fresh start) | \`@astra /clear\` |
-| \`/rebuild\` | Force rebuild index | \`@astra /rebuild\` |
-| \`/help\` | Show this help | \`@astra /help\` |
-
-## Specifying Files
-
-You can specify files directly with any command:
-
-\`\`\`
-@astra /translate files: FEDIN.tal, FEDOUT.tal
-@astra /describe files: payment-validator.c
-@astra /fediso files: wire-msg.tal, fed-parse.tal
-\`\`\`
-
-## Command Chaining
-
-Run multiple operations in sequence:
-
-\`\`\`
-@astra /find account validation then /translate then /fediso
-@astra /find FEDIN then /describe then /requirements
-\`\`\`
-
-## Using Previous Results
-
-Commands without arguments use the last \`/find\` results:
-
-\`\`\`
-@astra /find FEDIN              # Find code first
-@astra /translate               # Translate what was found
-@astra /fediso                  # Apply ISO uplift to same code
-\`\`\`
-
-## General Queries
-
-Without a command, AstraCode answers code questions:
-
-- \`@astra who calls heap_insert\`
-- \`@astra explain partition pruning\`
-- \`@astra find usages of validateTransaction\`
-
-## Workflow Example
-
-\`\`\`
-@astra /find account validation      # Step 1: Find relevant code
-@astra /describe                     # Step 2: Understand it
-@astra /requirements                 # Step 3: Extract requirements
-@astra /translate                    # Step 4: Convert to Java
-@astra /fediso                       # Step 5: Apply ISO 20022 mapping
-\`\`\`
-`);
+    response.markdown(HELP_TEXT);
 }
 
 // ============================================================
@@ -283,23 +233,8 @@ async function handleDescribeCommand(query, response, outputChannel, workspaceRo
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
-    const systemPrompt = `You are an expert code analyst. Describe the functionality of the code clearly and concisely.
-
-Your description should include:
-1. **Purpose**: What does this code do? (1-2 sentences)
-2. **Key Functions**: List main functions/procedures and their roles
-3. **Data Flow**: How does data move through the code?
-4. **Business Logic**: What business rules are implemented?
-5. **Dependencies**: What does it call or depend on?
-
-Be specific and reference actual function names and line numbers.`;
-
-    const userPrompt = `## Code to Describe: ${searchTerm}
-
-${context}
-
-## Instructions
-Provide a clear description of this code's functionality.`;
+    const systemPrompt = DESCRIBE_SYSTEM_PROMPT;
+    const userPrompt = getDescribeUserPrompt(searchTerm, context);
 
     await streamLLMResponse(systemPrompt, userPrompt, response, outputChannel, token);
     appendFileReferences(results, workspaceRoot, response);
@@ -341,37 +276,8 @@ async function handleTranslateCommand(query, response, outputChannel, workspaceR
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
-    const systemPrompt = `You are an expert TAL (Transaction Application Language) to Java translator.
-
-Translate the TAL code to modern Java while:
-1. **Preserving all business logic exactly**
-2. Using Java best practices (proper types, null safety, streams)
-3. Adding comments explaining original TAL constructs
-4. Using appropriate types (BigDecimal for money, Optional for nullable)
-
-**TAL to Java mapping:**
-| TAL | Java |
-|-----|------|
-| PROC | method |
-| STRUCT | class or record |
-| STRING[0:n] | String |
-| INT | int/long |
-| FIXED(n) | BigDecimal |
-| LITERAL | static final |
-| CALL | method call |
-| DEFINE | constant |
-
-**Output format:**
-1. Brief summary of what the TAL code does
-2. Complete Java translation with comments
-3. Any assumptions made`;
-
-    const userPrompt = `## TAL Code to Translate
-
-${context}
-
-## Instructions
-Translate this TAL code to Java. Preserve all business logic.`;
+    const systemPrompt = TRANSLATE_SYSTEM_PROMPT;
+    const userPrompt = getTranslateUserPrompt(context);
 
     await streamLLMResponse(systemPrompt, userPrompt, response, outputChannel, token);
     appendFileReferences(results, workspaceRoot, response);
@@ -455,48 +361,15 @@ async function handleFedIsoCommand(query, response, outputChannel, workspaceRoot
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
-    const systemPrompt = `You are an expert in Fed wire transfers and ISO 20022 migration.
-
-Your task is to analyze legacy Fed wire code and provide ISO 20022 (pacs.008) uplift guidance.
-
-**FEDIN/FEDOUT to ISO 20022 Mapping:**
-
-| Legacy Field | ISO 20022 pacs.008 | XPath |
-|--------------|-------------------|-------|
-| SENDER-ABA | Instructing Agent | /InstgAgt/FinInstnId/ClrSysMmbId/MmbId |
-| RECEIVER-ABA | Instructed Agent | /InstdAgt/FinInstnId/ClrSysMmbId/MmbId |
-| AMOUNT | Interbank Settlement Amount | /IntrBkSttlmAmt |
-| SENDER-REF | End to End ID | /PmtId/EndToEndId |
-| IMAD | UETR | /PmtId/UETR |
-| ORIG-NAME | Debtor Name | /Dbtr/Nm |
-| ORIG-ADDR | Debtor Address | /Dbtr/PstlAdr |
-| ORIG-ACCT | Debtor Account | /DbtrAcct/Id/Othr/Id |
-| BENEF-NAME | Creditor Name | /Cdtr/Nm |
-| BENEF-ACCT | Creditor Account | /CdtrAcct/Id/Othr/Id |
-| OBI | Remittance Info | /RmtInf/Ustrd |
-| VALUE-DATE | Settlement Date | /IntrBkSttlmDt |
-| TYPE-CODE | Service Level | /PmtTpInf/SvcLvl/Cd |
-
-**Output format:**
-1. **Current State**: What Fed wire fields/logic exist in the code
-2. **Field Mapping**: Map each legacy field to ISO 20022
-3. **Java Implementation**: Converter class using pacs.008
-4. **Validation Rules**: Any business rules to preserve
-5. **Migration Notes**: Considerations for the uplift`;
-
-    const userPrompt = `## Legacy Fed Wire Code
-
-${context}
-
-## Instructions
-Analyze this code and provide ISO 20022 (pacs.008) uplift guidance with Java implementation.`;
+    const systemPrompt = FEDISO_SYSTEM_PROMPT;
+    const userPrompt = getFedIsoUserPrompt(context);
 
     await streamLLMResponse(systemPrompt, userPrompt, response, outputChannel, token);
     appendFileReferences(results, workspaceRoot, response);
 }
 
 /**
- * /requirements or /extract - Extract business requirements
+ * /requirements or /extract - Extract business requirements in Gherkin format
  */
 async function handleRequirementsCommand(query, response, outputChannel, workspaceRoot, token) {
     // Check for "files:" syntax
@@ -531,41 +404,8 @@ async function handleRequirementsCommand(query, response, outputChannel, workspa
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
-    const systemPrompt = `You are a business analyst expert at extracting requirements from code.
-
-Analyze the code and extract:
-
-1. **Functional Requirements**
-   - What the system must do
-   - Input/output specifications
-   - Processing rules
-
-2. **Business Rules**
-   - Validation rules (with specific conditions)
-   - Calculations and formulas
-   - Decision logic (if X then Y)
-
-3. **Data Requirements**
-   - Required fields and their formats
-   - Data relationships
-   - Constraints (min/max, allowed values)
-
-4. **Non-Functional Requirements**
-   - Error handling behavior
-   - Performance considerations (if apparent)
-   - Security/audit requirements
-
-Format each requirement as:
-- **REQ-XXX**: [Requirement description]
-  - Source: [file:line]
-  - Priority: [Must/Should/Could]`;
-
-    const userPrompt = `## Code to Analyze: ${searchTerm}
-
-${context}
-
-## Instructions
-Extract business requirements from this code. Be specific and reference source locations.`;
+    const systemPrompt = REQUIREMENTS_SYSTEM_PROMPT;
+    const userPrompt = getRequirementsUserPrompt(searchTerm, context);
 
     await streamLLMResponse(systemPrompt, userPrompt, response, outputChannel, token);
     appendFileReferences(results, workspaceRoot, response);
@@ -590,23 +430,8 @@ async function handleGeneralQuery(query, response, outputChannel, workspaceRoot,
     response.progress('Analyzing code...');
     const formattedContext = formatResultsForLLM(searchResults, workspaceRoot);
 
-    const systemPrompt = `You are AstraCode, an expert code analyst. Answer questions about codebases clearly and concisely.
-
-Guidelines:
-- Answer the user's specific question
-- Reference specific files and line numbers
-- Explain code flow and relationships
-- For "who calls X?" - list callers with context
-- Be concise but thorough`;
-
-    const userPrompt = `## Question
-${query}
-
-${searchStrategy.functionName ? `## Search Target\nFunction/Symbol: \`${searchStrategy.functionName}\`\n\n` : ''}## Code Search Results
-${formattedContext}
-
-## Instructions
-Answer the question based on the code above.`;
+    const systemPrompt = GENERAL_SYSTEM_PROMPT;
+    const userPrompt = getGeneralUserPrompt(query, formattedContext, searchStrategy.functionName);
 
     await streamLLMResponse(systemPrompt, userPrompt, response, outputChannel, token);
     appendFileReferences(searchResults, workspaceRoot, response);
