@@ -1,945 +1,728 @@
 /**
- * AstraCode Search Module v5.1
- * Modular search with Overview/Detailed modes, O(1) indexes, and optional vector (semantic) search
+ * AstraCode Search Module v8.0 - Unified Search Architecture
  * 
- * NEW in v5.1: Inverted index integration for keyword-based search
+ * DESIGN PRINCIPLE: Always gather broad context, then enrich with specialized data.
+ * 
+ * Previous versions routed queries to different handlers that could return empty
+ * results. This version:
+ * 
+ * 1. ALWAYS runs base context search (symbols, code blocks, file matches)
+ * 2. ENRICHES with specialized data when available (call graph, grep)
+ * 3. Uses query classification only to guide LLM prompt, not gate context
+ * 
+ * This ensures "who calls heapsort" finds tuplesort.c code even when
+ * heapsort isn't a standalone function in the call graph.
  */
 
-const { InvertedIndex } = require('./inverted-index');
-
-// All callable types across languages (matches generateCodeSummaries in extension.js)
-const CALLABLE_TYPES = new Set([
-    'function', 'procedure', 'method', 'subproc',  // Common: C, Java, TAL
-    'section', 'paragraph', 'program',              // COBOL
-    'trigger',                                      // SQL
-    'define', 'macro',                              // Preprocessor
-    'forward', 'external'                           // TAL declarations
-]);
-
-let codeIndex = null;
-let trigramIndex = null;
-let vectorIndex = null;
-let contextFiles = null;
-let pathUtils = null;
-let log = console.log;
-let showProgress = () => {};
-
-// New index structures
-const symbolTrigramIndex = new Map();
-const fileTrigramIndex = new Map();
-const fileNameIndex = new Map();
-const fileExtensionIndex = new Map();
-const fileDirectoryIndex = new Map();
-const moduleSummaryIndex = new Map();
-
-// Inverted index for keyword search
-let invertedIndex = null;
-
-let searchMode = 'detailed';
-
-function initialize(codeIdx, trigramIdx, vectorIdx, ctxFiles, pathUtil, logFn, progressFn) {
-    codeIndex = codeIdx;
-    trigramIndex = trigramIdx;
-    vectorIndex = vectorIdx;
-    contextFiles = ctxFiles;
-    pathUtils = pathUtil;
-    if (logFn) log = logFn;
-    if (progressFn) showProgress = progressFn;
-    
-    // Initialize inverted index
-    invertedIndex = new InvertedIndex({
-        enableSynonyms: true,
-        boostSummaries: 3.0,
-        boostSymbols: 2.5
-    });
-    
-    log('Search module initialized');
+let GrepIndex = null;
+try {
+    GrepIndex = require('./grep-search').GrepIndex;
+} catch (e) {
+    // GrepIndex optional
 }
 
-function buildSearchIndexes() {
-    const start = Date.now();
-    buildSymbolTrigramIndex();
-    buildFileIndexes();
-    buildModuleSummaryIndex();
-    
-    // Build inverted index
-    if (invertedIndex && contextFiles && codeIndex) {
-        invertedIndex.buildFromCodebase(contextFiles, codeIndex, { log, showProgress });
+const pathUtils = require('./pathUtils');
+
+// ============================================================
+// MODULE STATE
+// ============================================================
+
+let codebaseIndex = null;
+let grepIndex = null;
+let log = (...args) => console.log('[AstraCode Search]', ...args);
+
+// ============================================================
+// QUERY INTENT DETECTION (for LLM prompt hints, not routing)
+// ============================================================
+
+const QueryIntent = {
+    CALLERS: 'callers',      // "who calls X"
+    CALLEES: 'callees',      // "what does X call"
+    EXPLAIN: 'explain',      // "explain how X works"
+    FIND: 'find',            // "find X", "show me X"
+    STRUCTURE: 'structure',  // "what fields in X"
+    GENERAL: 'general'
+};
+
+const INTENT_PATTERNS = {
+    [QueryIntent.CALLERS]: [
+        /\b(?:who|what)\s+calls?\s+['"]?([a-zA-Z_][a-zA-Z0-9_\-\s]*)['"]?/i,
+        /callers?\s+(?:of\s+)?['"]?([a-zA-Z_][a-zA-Z0-9_\-\s]*)['"]?/i,
+        /where\s+is\s+['"]?([a-zA-Z_][a-zA-Z0-9_\-\s]*)['"]?\s+(?:called|used|invoked)/i,
+        /usages?\s+of\s+['"]?([a-zA-Z_][a-zA-Z0-9_\-\s]*)['"]?/i,
+    ],
+    [QueryIntent.CALLEES]: [
+        /what\s+does\s+['"]?([a-zA-Z_][a-zA-Z0-9_\-\s]*)['"]?\s+call/i,
+        /callees?\s+(?:of\s+)?['"]?([a-zA-Z_][a-zA-Z0-9_\-\s]*)['"]?/i,
+        /functions?\s+called\s+by\s+['"]?([a-zA-Z_][a-zA-Z0-9_\-\s]*)['"]?/i,
+    ],
+    [QueryIntent.EXPLAIN]: [
+        /\b(?:explain|how\s+does|how\s+is|describe)\s+(.+?)(?:\s+work|\s+implemented|\s+done|\?|$)/i,
+        /\bwhat\s+is\s+(.+?)(?:\?|$)/i,
+    ],
+    [QueryIntent.STRUCTURE]: [
+        /\b(?:what|show)\s+(?:fields?|members?|properties)\s+(?:in|of)\s+(.+)/i,
+        /\bstruct(?:ure)?\s+(?:of\s+)?(.+)/i,
+    ],
+    [QueryIntent.FIND]: [
+        /\b(?:find|show|list|get)\s+(.+)/i,
+    ]
+};
+
+/**
+ * Detect query intent and extract target entity
+ * Returns { intent, target, variants }
+ */
+function detectIntent(query) {
+    for (const [intent, patterns] of Object.entries(INTENT_PATTERNS)) {
+        for (const pattern of patterns) {
+            const match = query.match(pattern);
+            if (match && match[1]) {
+                const target = match[1].trim();
+                return {
+                    intent,
+                    target,
+                    variants: generateVariants(target),
+                    originalQuery: query
+                };
+            }
+        }
     }
     
-    log(`Search indexes built in ${Date.now() - start}ms`);
-    return { 
-        symbolTrigrams: symbolTrigramIndex.size, 
-        fileNames: fileNameIndex.size, 
-        modules: moduleSummaryIndex.size,
-        invertedTerms: invertedIndex ? invertedIndex.index.size : 0
+    return {
+        intent: QueryIntent.GENERAL,
+        target: query,
+        variants: generateVariants(query),
+        originalQuery: query
     };
 }
 
-function buildSymbolTrigramIndex() {
-    symbolTrigramIndex.clear();
-    for (const [key, symbol] of codeIndex.symbols) {
-        if (!key.includes('@')) continue;
-        for (const tri of extractTrigrams(symbol.name.toLowerCase())) {
-            if (!symbolTrigramIndex.has(tri)) symbolTrigramIndex.set(tri, new Set());
-            symbolTrigramIndex.get(tri).add(key);
-        }
-    }
-}
-
-function buildFileIndexes() {
-    fileTrigramIndex.clear();
-    fileNameIndex.clear();
-    fileExtensionIndex.clear();
-    fileDirectoryIndex.clear();
+/**
+ * Generate search variants for a term
+ * "heap sort" -> ["heap sort", "heapsort", "heap_sort", "heapSort", ...]
+ */
+function generateVariants(term) {
+    const variants = new Set();
+    const trimmed = term.trim();
     
-    for (const [filePath] of contextFiles) {
-        const fileName = pathUtils.getFileName(filePath).toLowerCase();
-        const ext = pathUtils.getExtension(filePath).toLowerCase();
-        const dir = pathUtils.getParentDir(filePath);
-        
-        if (!fileNameIndex.has(fileName)) fileNameIndex.set(fileName, []);
-        fileNameIndex.get(fileName).push(filePath);
-        
-        if (ext) {
-            if (!fileExtensionIndex.has(ext)) fileExtensionIndex.set(ext, []);
-            fileExtensionIndex.get(ext).push(filePath);
+    variants.add(trimmed);
+    variants.add(trimmed.toLowerCase());
+    
+    // Split on whitespace, underscores, hyphens
+    const words = trimmed.split(/[\s_\-]+/).filter(w => w.length > 0);
+    
+    if (words.length >= 1) {
+        // joined: "heapsort"
+        variants.add(words.join('').toLowerCase());
+        // snake_case: "heap_sort"
+        variants.add(words.join('_').toLowerCase());
+        // UPPER_SNAKE: "HEAP_SORT"
+        variants.add(words.join('_').toUpperCase());
+        // camelCase: "heapSort"
+        if (words.length > 1) {
+            variants.add(words[0].toLowerCase() + 
+                words.slice(1).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(''));
         }
-        
-        if (dir) {
-            if (!fileDirectoryIndex.has(dir)) fileDirectoryIndex.set(dir, []);
-            fileDirectoryIndex.get(dir).push(filePath);
-        }
-        
-        for (const tri of extractTrigrams(pathUtils.getBaseName(filePath).toLowerCase())) {
-            if (!fileTrigramIndex.has(tri)) fileTrigramIndex.set(tri, new Set());
-            fileTrigramIndex.get(tri).add(filePath);
-        }
-    }
-}
-
-function buildModuleSummaryIndex() {
-    moduleSummaryIndex.clear();
-    const dirFiles = new Map();
-    for (const [filePath, summary] of codeIndex.fileSummaries) {
-        const dir = pathUtils.getParentDir(filePath);
-        if (!dir) continue;
-        if (!dirFiles.has(dir)) dirFiles.set(dir, []);
-        dirFiles.get(dir).push({ file: filePath, name: pathUtils.getFileName(filePath), summary });
+        // PascalCase: "HeapSort"
+        variants.add(words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(''));
     }
     
-    for (const [dir, files] of dirFiles) {
-        let funcCount = 0;
-        for (const [key, symbol] of codeIndex.symbols) {
-            if (key.includes('@') && symbol.file && pathUtils.getParentDir(symbol.file) === dir) {
-                if (CALLABLE_TYPES.has(symbol.type)) funcCount++;
-            }
-        }
-        moduleSummaryIndex.set(dir, {
-            path: dir, name: pathUtils.getFileName(dir) || dir,
-            summary: files.slice(0, 10).map(f => `${f.name}: ${f.summary}`).join('\n'),
-            fileCount: files.length, functionCount: funcCount
+    return Array.from(variants);
+}
+
+// ============================================================
+// INITIALIZATION
+// ============================================================
+
+function initialize(index, logFn) {
+    codebaseIndex = index;
+    if (typeof logFn === 'function') {
+        log = logFn;
+    }
+    
+    if (GrepIndex) {
+        grepIndex = new GrepIndex({ contextLines: 2, buildCallIndex: true });
+    }
+    
+    log(`Search module v8 initialized, mode: unified`);
+}
+
+function buildGrepIndex(contextFiles, options = {}) {
+    if (!GrepIndex || !grepIndex) return { error: 'GrepIndex not available' };
+    return grepIndex.build(contextFiles, { log, ...options });
+}
+
+// ============================================================
+// UNIFIED SEARCH - THE CORE
+// ============================================================
+
+/**
+ * Execute unified search - ALWAYS gathers context, THEN enriches
+ * 
+ * @param {string} query - User's search query
+ * @param {Object} options - Search options
+ * @returns {Object} Unified search results
+ */
+function executeSearch(query, options = {}) {
+    if (!codebaseIndex) {
+        log('ERROR: CodebaseIndex not initialized');
+        return { 
+            symbols: [], 
+            codeBlocks: [], 
+            enrichments: {},
+            stats: { error: 'Index not initialized' } 
+        };
+    }
+    
+    const startTime = Date.now();
+    
+    // 1. Detect intent (for prompt hints, not routing)
+    const { intent, target, variants } = detectIntent(query);
+    log(`Query: "${query}" -> intent: ${intent}, target: "${target}"`);
+    log(`Variants: ${variants.join(', ')}`);
+    
+    // 2. ALWAYS: Run broad context search using all variants
+    const baseResults = gatherBaseContext(query, variants, options);
+    
+    // 3. ENRICH: Add specialized data based on intent
+    const enrichments = gatherEnrichments(intent, target, variants, options);
+    
+    // 4. Combine and format
+    const results = combineResults(baseResults, enrichments, {
+        intent,
+        target,
+        query,
+        elapsed: Date.now() - startTime
+    });
+    
+    log(`Search complete: ${results.symbols.length} symbols, ${results.codeBlocks.length} blocks, enrichments: ${Object.keys(enrichments).filter(k => enrichments[k]).join(', ') || 'none'}`);
+    
+    return results;
+}
+
+/**
+ * STEP 1: Gather broad context - symbols, code blocks, files
+ * This ALWAYS runs regardless of query type
+ */
+function gatherBaseContext(query, variants, options = {}) {
+    const maxResults = options.maxResults || 100;
+    const allSymbols = new Map(); // key -> symbol (deduped)
+    const codeLocations = [];     // { file, line, context }
+    const matchedFiles = new Set();
+    
+    // Search with each variant
+    for (const variant of variants) {
+        // Use CodebaseIndex unified search
+        const searchResults = codebaseIndex.search(variant, {
+            maxResults: Math.ceil(maxResults / variants.length),
+            includeCodeBlocks: true,
+            searchTypes: ['all']
         });
-    }
-}
-
-function clearSearchIndexes() {
-    symbolTrigramIndex.clear();
-    fileTrigramIndex.clear();
-    fileNameIndex.clear();
-    fileExtensionIndex.clear();
-    fileDirectoryIndex.clear();
-    moduleSummaryIndex.clear();
-}
-
-// Layer 1: Atomic Lookups
-function lookupSymbolByKey(key) { return codeIndex.symbols.get(key) || null; }
-function lookupSymbolsByName(name) {
-    const results = [], nameLower = name.toLowerCase();
-    for (const [key, symbol] of codeIndex.symbols) {
-        if (key.includes('@') && symbol.name.toLowerCase() === nameLower) results.push({ ...symbol, key });
-    }
-    return results;
-}
-function lookupFilesByName(fileName) { return fileNameIndex.get(fileName.toLowerCase()) || []; }
-function lookupFilesByExtension(ext) { return fileExtensionIndex.get(ext.toLowerCase()) || []; }
-function lookupFilesInDirectory(dir) { return fileDirectoryIndex.get(dir) || []; }
-function lookupCallers(funcName) { const c = codeIndex.reverseCallGraph.get(funcName); return c ? Array.from(c) : []; }
-function lookupCallees(funcName) { const c = codeIndex.callGraph.get(funcName); return c ? Array.from(c) : []; }
-function lookupFunctionSummary(key) { return codeIndex.summaries.get(key) || null; }
-function lookupFileSummary(filePath) { return codeIndex.fileSummaries.get(filePath) || null; }
-function lookupModuleSummary(dir) { return moduleSummaryIndex.get(dir) || null; }
-
-// Layer 2: Find Functions
-function findSymbolsByPattern(pattern, options = {}) {
-    const { type = null, maxResults = 50 } = options;
-    const patternLower = pattern.toLowerCase();
-    const trigrams = extractTrigrams(patternLower);
-    
-    if (trigrams.length === 0 || symbolTrigramIndex.size === 0) {
-        return findSymbolsByPatternFallback(patternLower, type, maxResults);
-    }
-    
-    let candidates = null;
-    for (const tri of trigrams) {
-        const matches = symbolTrigramIndex.get(tri);
-        if (!matches || matches.size === 0) return [];
-        candidates = candidates === null ? new Set(matches) : new Set([...candidates].filter(k => matches.has(k)));
-        if (candidates.size === 0) return [];
-    }
-    
-    const results = [];
-    for (const key of candidates) {
-        const symbol = codeIndex.symbols.get(key);
-        if (!symbol || (type && symbol.type !== type)) continue;
-        const score = fuzzyMatchScore(patternLower, symbol.name.toLowerCase());
-        if (score >= 30) results.push({ ...symbol, key, matchScore: score });
-    }
-    return results.sort((a, b) => b.matchScore - a.matchScore).slice(0, maxResults);
-}
-
-function findSymbolsByPatternFallback(pattern, type, maxResults) {
-    const results = [];
-    for (const [key, symbol] of codeIndex.symbols) {
-        if (!key.includes('@') || (type && symbol.type !== type)) continue;
-        const score = fuzzyMatchScore(pattern, symbol.name.toLowerCase());
-        if (score >= 30) results.push({ ...symbol, key, matchScore: score });
-        if (results.length >= maxResults * 2) break;
-    }
-    return results.sort((a, b) => b.matchScore - a.matchScore).slice(0, maxResults);
-}
-
-function findSymbolsByType(type, options = {}) {
-    const { inDirectory = null, maxResults = 100 } = options;
-    const results = [];
-    for (const [key, symbol] of codeIndex.symbols) {
-        if (!key.includes('@') || symbol.type !== type) continue;
-        if (inDirectory && pathUtils.getParentDir(symbol.file) !== inDirectory) continue;
-        results.push({ ...symbol, key });
-        if (results.length >= maxResults) break;
-    }
-    return results;
-}
-
-function findFilesByPattern(pattern, options = {}) {
-    const { maxResults = 50 } = options;
-    const patternLower = pattern.toLowerCase();
-    const results = new Set();
-    const exact = fileNameIndex.get(patternLower);
-    if (exact) exact.forEach(p => results.add(p));
-    
-    if (patternLower.length >= 3) {
-        for (const tri of extractTrigrams(patternLower)) {
-            const matches = fileTrigramIndex.get(tri);
-            if (matches) matches.forEach(m => {
-                if (pathUtils.getBaseName(m).toLowerCase().includes(patternLower)) results.add(m);
-            });
-        }
-    }
-    return Array.from(results).slice(0, maxResults);
-}
-
-function findTextInCode(text, options = {}) {
-    const { caseSensitive = false, maxResults = 50 } = options;
-    if (text.length < 3 || !trigramIndex || trigramIndex.index.size === 0) return [];
-    
-    const searchTrigrams = extractTrigrams(caseSensitive ? text : text.toLowerCase());
-    if (searchTrigrams.length === 0) return [];
-    
-    let candidateFiles = null;
-    for (const tri of searchTrigrams) {
-        const fileList = trigramIndex.index.get(tri);
-        if (!fileList || fileList.length === 0) return [];
-        const files = new Set(fileList.map(f => f.file));
-        candidateFiles = candidateFiles === null ? files : new Set([...candidateFiles].filter(f => files.has(f)));
-        if (candidateFiles.size === 0) return [];
-    }
-    
-    const results = [], query = caseSensitive ? text : text.toLowerCase();
-    for (const filePath of candidateFiles) {
-        const file = contextFiles.get(filePath);
-        if (!file) continue;
-        const content = caseSensitive ? file.content : file.content.toLowerCase();
-        const lines = file.content.split('\n');
         
-        // Pre-compute line start positions for efficient lookup
-        const lineStarts = [0];
-        for (let i = 0; i < lines.length; i++) {
-            lineStarts.push(lineStarts[i] + lines[i].length + 1); // +1 for newline
+        // Collect symbols
+        for (const sym of (searchResults.symbols || [])) {
+            const key = sym.key || `${sym.file}:${sym.name}:${sym.line}`;
+            if (!allSymbols.has(key)) {
+                allSymbols.set(key, { ...sym, matchedVariant: variant });
+            }
         }
         
-        let pos = 0;
-        while ((pos = content.indexOf(query, pos)) !== -1) {
-            // Binary search for line number
-            let lo = 0, hi = lines.length - 1;
-            while (lo < hi) {
-                const mid = Math.floor((lo + hi + 1) / 2);
-                if (lineStarts[mid] <= pos) lo = mid;
-                else hi = mid - 1;
-            }
-            const lineNum = lo;
-            results.push({ file: filePath, fileName: pathUtils.getFileName(filePath), line: lineNum + 1, context: lines[lineNum]?.substring(0, 150) || '' });
-            pos += query.length;
-            if (results.length >= maxResults) break;
-        }
-        if (results.length >= maxResults) break;
-    }
-    return results;
-}
-
-function findModulesByPattern(pattern, options = {}) {
-    const { maxResults = 20 } = options;
-    const patternLower = pattern.toLowerCase();
-    const results = [];
-    for (const [dir, modInfo] of moduleSummaryIndex) {
-        if (modInfo.name.toLowerCase().includes(patternLower) || dir.toLowerCase().includes(patternLower)) {
-            results.push(modInfo);
-            if (results.length >= maxResults) break;
+        // Collect files
+        for (const file of (searchResults.files || [])) {
+            matchedFiles.add(file.path || file);
         }
     }
-    return results;
-}
-
-// New: Vector-based symbol search
-function cosineSimilarity(vecA, vecB) {
-    if (vecA.length !== vecB.length) return 0;
-    let dot = 0, normA = 0, normB = 0;
-    for (let i = 0; i < vecA.length; i++) {
-        dot += vecA[i] * vecB[i];
-        normA += vecA[i] * vecA[i];
-        normB += vecB[i] * vecB[i];
-    }
-    if (normA === 0 || normB === 0) return 0;
-    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-function findSymbolsByVector(queryVector, options = {}) {
-    const { maxResults = 50, minSimilarity = 0.35 } = options;
-    if (!vectorIndex || vectorIndex.size === 0 || !Array.isArray(queryVector) || queryVector.length === 0) return [];
-
-    const results = [];
-    for (const [key, vec] of vectorIndex) {
-        if (!Array.isArray(vec)) continue;
-        const symbol = lookupSymbolByKey(key);
-        if (!symbol || !key.includes('@')) continue;
-
-        const similarity = cosineSimilarity(queryVector, vec);
-        if (similarity >= minSimilarity) {
-            results.push({ ...symbol, key, matchScore: Math.round(similarity * 100) });
-        }
-    }
-
-    results.sort((a, b) => b.matchScore - a.matchScore);
-    return results.slice(0, maxResults);
-}
-
-// Layer 3: Get Functions
-function getCodeLines(filePath, startLine, endLine) {
-    const file = contextFiles.get(filePath);
-    if (!file) return '';
-    const lines = file.content.split('\n');
-    const start = Math.max(0, startLine - 1), end = Math.min(lines.length - 1, endLine - 1);
-    return lines.slice(start, end + 1).map((line, i) => `${(start + i + 1).toString().padStart(5)}: ${line}`).join('\n');
-}
-
-function getCodeBlockForSymbol(symbol, options = {}) {
-    const { contextBefore = 2, contextAfter = 30 } = options;
-    const file = contextFiles.get(symbol.file);
-    if (!file) return { code: '', startLine: 0, endLine: 0, fileName: '' };
-    const lines = file.content.split('\n');
-    const startLine = Math.max(1, symbol.line - contextBefore);
-    const endLine = Math.min(lines.length, symbol.line + contextAfter);
-    return { code: getCodeLines(symbol.file, startLine, endLine), startLine, endLine, fileName: pathUtils.getFileName(symbol.file) };
-}
-
-function getCodeBlockForMatch(filePath, matchLine, options = {}) {
-    const { contextLines = 8 } = options;
-    const file = contextFiles.get(filePath);
-    if (!file) return { code: '', startLine: 0, endLine: 0, fileName: '' };
-    const lines = file.content.split('\n');
-    const startLine = Math.max(1, matchLine - contextLines);
-    const endLine = Math.min(lines.length, matchLine + contextLines);
-    const code = lines.slice(startLine - 1, endLine).map((line, i) => {
-        const lineNum = startLine + i;
-        return `${lineNum.toString().padStart(5)}: ${lineNum === matchLine ? '>>> ' : '    '}${line}`;
-    }).join('\n');
-    return { code, startLine, endLine, fileName: pathUtils.getFileName(filePath) };
-}
-
-function getSymbolsInFile(filePath) {
-    const results = [];
-    for (const [key, symbol] of codeIndex.symbols) {
-        if (key.includes('@') && symbol.file === filePath) results.push({ ...symbol, key });
-    }
-    return results.sort((a, b) => a.line - b.line);
-}
-
-// Layer 4: Trace Functions
-function traceCallersOf(funcName, options = {}) {
-    const { maxDepth = 3 } = options;
-    const visited = new Set([funcName]), levels = [];
-    let current = [funcName];
-    for (let d = 0; d < maxDepth; d++) {
-        const next = [];
-        for (const fn of current) {
-            for (const caller of lookupCallers(fn)) {
-                if (!visited.has(caller)) { visited.add(caller); next.push(caller); }
+    
+    // Also do grep-style search for literal occurrences
+    if (grepIndex) {
+        for (const variant of variants.slice(0, 3)) { // Limit grep variants
+            try {
+                const grepResults = grepIndex.searchLiteral(variant, {
+                    caseSensitive: false,
+                    maxResults: 20
+                });
+                
+                for (const result of (grepResults.results || [])) {
+                    codeLocations.push({
+                        file: result.file,
+                        line: result.line,
+                        context: result.lineContent || result.context?.line,
+                        matchedVariant: variant,
+                        source: 'grep'
+                    });
+                    matchedFiles.add(result.file);
+                }
+            } catch (e) {
+                log(`Grep search failed for "${variant}": ${e.message}`);
             }
         }
-        if (next.length === 0) break;
-        levels.push(next);
-        current = next;
     }
-    return { root: funcName, direction: 'callers', levels };
-}
-
-function traceCalleesOf(funcName, options = {}) {
-    const { maxDepth = 3 } = options;
-    const visited = new Set([funcName]), levels = [];
-    let current = [funcName];
-    for (let d = 0; d < maxDepth; d++) {
-        const next = [];
-        for (const fn of current) {
-            for (const callee of lookupCallees(fn)) {
-                if (!visited.has(callee)) { visited.add(callee); next.push(callee); }
+    
+    // Sort symbols by score
+    const sortedSymbols = Array.from(allSymbols.values())
+        .sort((a, b) => (b.matchScore || 0) - (a.matchScore || 0))
+        .slice(0, maxResults);
+    
+    // Get code blocks for top symbols
+    const codeBlocks = [];
+    const seenBlocks = new Set();
+    
+    for (const sym of sortedSymbols.slice(0, 25)) {
+        const blockKey = `${sym.file}:${Math.floor((sym.line || 0) / 20)}`;
+        if (!seenBlocks.has(blockKey)) {
+            seenBlocks.add(blockKey);
+            const block = codebaseIndex.getCodeBlock(sym);
+            if (block) {
+                codeBlocks.push({
+                    symbol: sym.name,
+                    type: sym.type,
+                    matchedVariant: sym.matchedVariant,
+                    ...block
+                });
             }
         }
-        if (next.length === 0) break;
-        levels.push(next);
-        current = next;
-    }
-    return { root: funcName, direction: 'callees', levels };
-}
-
-// Layer 5: Composite Searches
-function searchWhereIsDefined(name) {
-    const symbols = findSymbolsByPattern(name, { maxResults: 20 });
-    const codeBlocks = symbols.slice(0, 10).map(sym => ({ symbol: sym, ...getCodeBlockForSymbol(sym) }));
-    return { symbols, codeBlocks };
-}
-
-function searchWhoCallsFunction(funcName) {
-    const symbols = findSymbolsByPattern(funcName, { maxResults: 5 });
-    const funcSymbol = symbols.find(s => CALLABLE_TYPES.has(s.type));
-    if (!funcSymbol) return { function: null, callers: [], callerDetails: [], codeBlocks: [] };
-    
-    const callers = lookupCallers(funcSymbol.name);
-    const callerDetails = callers.map(c => lookupSymbolsByName(c)[0]).filter(Boolean);
-    const codeBlocks = callerDetails.slice(0, 8).map(c => ({ caller: c.name, ...getCodeBlockForSymbol(c, { contextAfter: 20 }) }));
-    const funcBlock = getCodeBlockForSymbol(funcSymbol);
-    return { function: funcSymbol, functionCode: funcBlock, callers, callerDetails, codeBlocks };
-}
-
-function searchWhatFunctionCalls(funcName) {
-    const symbols = findSymbolsByPattern(funcName, { maxResults: 5 });
-    const funcSymbol = symbols.find(s => CALLABLE_TYPES.has(s.type));
-    if (!funcSymbol) return { function: null, callees: [], calleeDetails: [] };
-    
-    const callees = lookupCallees(funcSymbol.name);
-    const calleeDetails = callees.map(c => lookupSymbolsByName(c)[0]).filter(Boolean);
-    const funcBlock = getCodeBlockForSymbol(funcSymbol, { contextAfter: 50 });
-    return { function: funcSymbol, functionCode: funcBlock, callees, calleeDetails };
-}
-
-function searchTextInCode(text, options = {}) {
-    const { contextLines = 8 } = options;
-    const matches = findTextInCode(text, { maxResults: 30 });
-    const codeBlocks = [], seen = new Set();
-    for (const match of matches) {
-        const key = `${match.file}:${Math.floor(match.line / 10)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        codeBlocks.push({ file: match.file, matchLine: match.line, ...getCodeBlockForMatch(match.file, match.line, { contextLines }) });
-    }
-    return { matches, codeBlocks };
-}
-
-function searchModuleOverview(moduleName) {
-    const modules = findModulesByPattern(moduleName);
-    if (modules.length === 0) return { module: null, files: [], functions: [], summary: null };
-    const module = modules[0];
-    const files = lookupFilesInDirectory(module.path).map(f => ({ path: f, name: pathUtils.getFileName(f), summary: lookupFileSummary(f) }));
-    
-    // Get all callable types (not just function/procedure)
-    const functions = [];
-    for (const type of CALLABLE_TYPES) {
-        functions.push(...findSymbolsByType(type, { inDirectory: module.path }));
-    }
-    const functionDetails = functions.slice(0, 30).map(fn => ({ ...fn, summary: lookupFunctionSummary(fn.key)?.summary }));
-    return { module, files, functions: functionDetails, summary: module.summary };
-}
-
-// Layer 6: Orchestrators
-function executeOverviewSearch(query, options = {}) {
-    const terms = extractSearchTerms(query);
-    const results = { type: 'overview', modules: [], files: [], functions: [], callFlows: [] };
-    
-    for (const term of terms) {
-        for (const mod of findModulesByPattern(term, { maxResults: 5 })) {
-            if (!results.modules.some(m => m.path === mod.path)) results.modules.push(mod);
-        }
     }
     
-    for (const [filePath, summary] of codeIndex.fileSummaries) {
-        if (matchesTerms(summary + ' ' + pathUtils.getFileName(filePath), terms)) {
-            results.files.push({ file: filePath, name: pathUtils.getFileName(filePath), summary });
-        }
-    }
-    results.files = results.files.slice(0, 20);
-    
-    for (const [key, info] of codeIndex.summaries) {
-        if (matchesTerms(info.summary + ' ' + info.name, terms)) results.functions.push(info);
-    }
-    results.functions = results.functions.slice(0, 30);
-    
-    // Add semantically similar functions if queryVector provided
-    if (options.queryVector) {
-        const vectorSyms = findSymbolsByVector(options.queryVector, { maxResults: 40, minSimilarity: 0.35 });
-        const existingNames = new Set(results.functions.map(f => f.name));
-        for (const vsym of vectorSyms) {
-            if (CALLABLE_TYPES.has(vsym.type)) {
-                const info = codeIndex.summaries.get(vsym.key);
-                if (info && !existingNames.has(info.name)) {
-                    results.functions.push(info);
-                    existingNames.add(info.name);
+    // Add code blocks from grep locations (where we found literal matches)
+    for (const loc of codeLocations.slice(0, 15)) {
+        const blockKey = `${loc.file}:${Math.floor(loc.line / 20)}`;
+        if (!seenBlocks.has(blockKey)) {
+            seenBlocks.add(blockKey);
+            
+            // Find a symbol near this location, or create a pseudo-entry
+            const nearbySymbol = findNearestSymbol(loc.file, loc.line);
+            if (nearbySymbol) {
+                const block = codebaseIndex.getCodeBlock(nearbySymbol);
+                if (block) {
+                    codeBlocks.push({
+                        symbol: nearbySymbol.name,
+                        type: nearbySymbol.type,
+                        matchedVariant: loc.matchedVariant,
+                        grepMatch: loc.context,
+                        ...block
+                    });
+                }
+            } else {
+                // No symbol nearby - extract raw code context
+                const rawBlock = extractCodeContext(loc.file, loc.line, 30);
+                if (rawBlock) {
+                    codeBlocks.push({
+                        symbol: `[line ${loc.line}]`,
+                        type: 'code_match',
+                        matchedVariant: loc.matchedVariant,
+                        grepMatch: loc.context,
+                        ...rawBlock
+                    });
                 }
             }
         }
-        results.functions = results.functions.slice(0, 30); // re-cap
     }
     
-    for (const fn of results.functions.slice(0, 5)) {
-        const callers = lookupCallers(fn.name), callees = lookupCallees(fn.name);
-        if (callers.length || callees.length) results.callFlows.push({ name: fn.name, callers, callees });
+    return {
+        symbols: sortedSymbols,
+        codeBlocks,
+        files: Array.from(matchedFiles),
+        codeLocations
+    };
+}
+
+/**
+ * STEP 2: Gather enrichments based on intent
+ * These are OPTIONAL - we still have base context if these return nothing
+ */
+function gatherEnrichments(intent, target, variants, options = {}) {
+    const enrichments = {
+        callers: null,
+        callees: null,
+        callSites: null,
+        structure: null
+    };
+    
+    // Try to find callers/callees from call graph
+    if (intent === QueryIntent.CALLERS || intent === QueryIntent.EXPLAIN) {
+        const callerData = findCallers(variants);
+        if (callerData.found) {
+            enrichments.callers = callerData;
+        }
     }
     
-    return { ...results, context: formatOverviewResults(results) };
+    if (intent === QueryIntent.CALLEES || intent === QueryIntent.EXPLAIN) {
+        const calleeData = findCallees(variants);
+        if (calleeData.found) {
+            enrichments.callees = calleeData;
+        }
+    }
+    
+    // Try to find call sites from grep
+    if (intent === QueryIntent.CALLERS && grepIndex) {
+        const callSites = findCallSites(variants);
+        if (callSites.found) {
+            enrichments.callSites = callSites;
+        }
+    }
+    
+    return enrichments;
+}
+
+/**
+ * Find callers from call graph for any matching variant
+ */
+function findCallers(variants) {
+    if (!codebaseIndex) return { found: false };
+    
+    for (const variant of variants) {
+        const callers = codebaseIndex.getCallers?.(variant) || [];
+        if (callers.length > 0) {
+            return {
+                found: true,
+                matchedVariant: variant,
+                callers: callers.map(name => {
+                    const symbol = codebaseIndex.getSymbol?.(name);
+                    return {
+                        name,
+                        file: symbol?.file,
+                        line: symbol?.line,
+                        type: symbol?.type
+                    };
+                })
+            };
+        }
+    }
+    
+    return { found: false };
+}
+
+/**
+ * Find callees from call graph for any matching variant
+ */
+function findCallees(variants) {
+    if (!codebaseIndex) return { found: false };
+    
+    for (const variant of variants) {
+        const callees = codebaseIndex.getCallees?.(variant) || [];
+        if (callees.length > 0) {
+            return {
+                found: true,
+                matchedVariant: variant,
+                callees: callees.map(name => {
+                    const symbol = codebaseIndex.getSymbol?.(name);
+                    return {
+                        name,
+                        file: symbol?.file,
+                        line: symbol?.line,
+                        type: symbol?.type
+                    };
+                })
+            };
+        }
+    }
+    
+    return { found: false };
+}
+
+/**
+ * Find call sites from grep index
+ */
+function findCallSites(variants) {
+    if (!grepIndex) return { found: false };
+    
+    for (const variant of variants) {
+        if (grepIndex.hasFunctionCalls?.(variant)) {
+            const results = grepIndex.searchFunctionCalls(variant, { maxResults: 30 });
+            if (results.results?.length > 0) {
+                return {
+                    found: true,
+                    matchedVariant: variant,
+                    sites: results.results.map(r => ({
+                        file: r.file,
+                        line: r.line,
+                        context: r.lineContent || r.context?.line,
+                        enclosingFunction: r.enclosingFunction?.name
+                    }))
+                };
+            }
+        }
+    }
+    
+    return { found: false };
+}
+
+/**
+ * Find nearest symbol to a line in a file
+ */
+function findNearestSymbol(filePath, line) {
+    if (!codebaseIndex) return null;
+    
+    let nearest = null;
+    let minDist = Infinity;
+    
+    for (const [key, symbol] of codebaseIndex.symbols || []) {
+        if (symbol.file === filePath) {
+            const dist = Math.abs(symbol.line - line);
+            if (dist < minDist && dist < 50) {
+                minDist = dist;
+                nearest = symbol;
+            }
+        }
+    }
+    
+    return nearest;
+}
+
+/**
+ * Extract raw code context around a line
+ */
+function extractCodeContext(filePath, line, contextLines = 30) {
+    if (!codebaseIndex) return null;
+    
+    const content = codebaseIndex.getFileContent?.(filePath);
+    if (!content) return null;
+    
+    const lines = content.split('\n');
+    const startLine = Math.max(0, line - 5);
+    const endLine = Math.min(lines.length, line + contextLines);
+    
+    return {
+        file: filePath,
+        startLine: startLine + 1,
+        endLine: endLine,
+        code: lines.slice(startLine, endLine).join('\n')
+    };
+}
+
+/**
+ * STEP 3: Combine base context and enrichments into final result
+ */
+function combineResults(baseResults, enrichments, meta) {
+    const { symbols, codeBlocks, files, codeLocations } = baseResults;
+    
+    // Build formatted context for LLM
+    let context = formatContextForLLM(baseResults, enrichments, meta);
+    
+    return {
+        // Core data
+        symbols,
+        codeBlocks,
+        files,
+        
+        // Enrichments (may be null)
+        enrichments,
+        
+        // Query metadata
+        intent: meta.intent,
+        target: meta.target,
+        
+        // Formatted context for LLM
+        context,
+        
+        // Stats
+        stats: {
+            symbols: symbols.length,
+            codeBlocks: codeBlocks.length,
+            files: files.length,
+            grepMatches: codeLocations.length,
+            hasCallers: !!enrichments.callers?.found,
+            hasCallees: !!enrichments.callees?.found,
+            hasCallSites: !!enrichments.callSites?.found,
+            elapsed: meta.elapsed
+        }
+    };
+}
+
+/**
+ * Format results into LLM-friendly context
+ */
+function formatContextForLLM(baseResults, enrichments, meta) {
+    const { symbols, codeBlocks, files, codeLocations } = baseResults;
+    const { intent, target, query } = meta;
+    
+    let context = `# Search Results for: "${query}"\n`;
+    context += `Intent: ${intent}, Target: "${target}"\n\n`;
+    
+    // If we have call graph enrichments, show them prominently
+    if (enrichments.callers?.found) {
+        context += `## Call Graph: Callers of ${enrichments.callers.matchedVariant}\n`;
+        for (const caller of enrichments.callers.callers.slice(0, 10)) {
+            context += `- ${caller.name} (${caller.type || 'function'}) in ${caller.file || 'unknown'}:${caller.line || '?'}\n`;
+        }
+        context += '\n';
+    }
+    
+    if (enrichments.callees?.found) {
+        context += `## Call Graph: Functions called by ${enrichments.callees.matchedVariant}\n`;
+        for (const callee of enrichments.callees.callees.slice(0, 10)) {
+            context += `- ${callee.name} (${callee.type || 'function'}) in ${callee.file || 'unknown'}:${callee.line || '?'}\n`;
+        }
+        context += '\n';
+    }
+    
+    if (enrichments.callSites?.found) {
+        context += `## Call Sites for ${enrichments.callSites.matchedVariant}\n`;
+        for (const site of enrichments.callSites.sites.slice(0, 10)) {
+            context += `- ${site.file}:${site.line}`;
+            if (site.enclosingFunction) context += ` (in ${site.enclosingFunction})`;
+            context += '\n';
+            if (site.context) context += `  \`${site.context.trim()}\`\n`;
+        }
+        context += '\n';
+    }
+    
+    // Show symbols found
+    if (symbols.length > 0) {
+        context += `## Relevant Symbols (${symbols.length} found)\n\n`;
+        
+        // Group by file
+        const byFile = new Map();
+        for (const sym of symbols.slice(0, 30)) {
+            const file = sym.file || 'unknown';
+            if (!byFile.has(file)) byFile.set(file, []);
+            byFile.get(file).push(sym);
+        }
+        
+        for (const [file, syms] of byFile) {
+            const fileName = pathUtils.getFileName(file);
+            context += `### ${fileName}\n`;
+            context += `Path: ${file}\n\n`;
+            
+            for (const sym of syms.slice(0, 5)) {
+                context += `- **${sym.name}** (${sym.type}) line ${sym.line}`;
+                if (sym.summary) context += ` - ${sym.summary}`;
+                context += '\n';
+            }
+            context += '\n';
+        }
+    }
+    
+    // Show code blocks
+    if (codeBlocks.length > 0) {
+        context += `## Code Blocks (${codeBlocks.length} found)\n\n`;
+        
+        for (const block of codeBlocks.slice(0, 10)) {
+            context += `### ${block.symbol} (${block.type})\n`;
+            context += `File: ${block.file}, Lines: ${block.startLine}-${block.endLine}\n`;
+            if (block.grepMatch) {
+                context += `Matched: \`${block.grepMatch.trim()}\`\n`;
+            }
+            context += '```\n' + block.code + '\n```\n\n';
+        }
+    }
+    
+    // If no enrichments and query was about callers, add a note
+    if (intent === QueryIntent.CALLERS && !enrichments.callers?.found && !enrichments.callSites?.found) {
+        context += `\n---\n`;
+        context += `Note: No direct function named "${target}" found in call graph. `;
+        context += `The search results above show code locations where "${target}" appears, `;
+        context += `which may indicate inline implementations or algorithm usage rather than function calls.\n`;
+    }
+    
+    return context;
+}
+
+// ============================================================
+// CONVENIENCE WRAPPERS (for backward compatibility)
+// ============================================================
+
+// Mode is deprecated in v8 (unified search handles all cases)
+// These stubs maintain backward compatibility
+let _legacyMode = 'detailed';
+
+function setMode(mode) {
+    _legacyMode = mode;
+    log(`[DEPRECATED] setMode called with: ${mode} (ignored in v8 unified search)`);
+}
+
+function getMode() {
+    return _legacyMode;
 }
 
 function executeDetailedSearch(query, options = {}) {
-    const terms = extractSearchTerms(query);
-    const results = { type: 'detailed', symbols: [], codeBlocks: [], callTraces: [] };
-    
-    for (const term of terms) {
-        for (const sym of findSymbolsByPattern(term, { maxResults: 15 })) {
-            if (!results.symbols.some(s => s.key === sym.key)) results.symbols.push(sym);
-        }
-    }
-    
-    for (const term of terms) {
-        for (const filePath of findFilesByPattern(term, { maxResults: 10 })) {
-            for (const sym of getSymbolsInFile(filePath).slice(0, 10)) {
-                if (!results.symbols.some(s => s.key === sym.key)) results.symbols.push({ ...sym, matchScore: 85 });
-            }
-        }
-    }
-    
-    // Merge with vector results and sort by relevance
-    const symMap = new Map();
-    for (const sym of results.symbols) {
-        const score = sym.matchScore || 80;
-        symMap.set(sym.key, { ...sym, matchScore: score });
-    }
-    
-    if (options.queryVector) {
-        const vectorSyms = findSymbolsByVector(options.queryVector, { maxResults: 60, minSimilarity: 0.35 });
-        for (const vsym of vectorSyms) {
-            const existing = symMap.get(vsym.key);
-            const newScore = vsym.matchScore;
-            if (!existing || newScore > (existing.matchScore || 0)) {
-                symMap.set(vsym.key, vsym);
-            }
-        }
-    }
-    
-    results.symbols = Array.from(symMap.values())
-        .sort((a, b) => (b.matchScore || 80) - (a.matchScore || 80));
-    
-    const seen = new Set();
-    for (const sym of results.symbols.slice(0, 20)) {
-        const key = `${sym.file}:${Math.floor(sym.line / 15)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        results.codeBlocks.push({ symbol: sym.name, type: sym.type, ...getCodeBlockForSymbol(sym) });
-    }
-    
-    if (/call|trace|who|where.*called|caller|callee/i.test(query)) {
-        for (const sym of results.symbols.slice(0, 5)) {
-            if (CALLABLE_TYPES.has(sym.type)) {
-                results.callTraces.push({ name: sym.name, callers: lookupCallers(sym.name), callees: lookupCallees(sym.name) });
-            }
-        }
-    }
-    
-    return { ...results, context: formatDetailedResults(results) };
+    return executeSearch(query, { ...options, detailed: true });
 }
 
-async function executeSearch(query, options = {}) {
-    const mode = options.mode || searchMode;
-    const start = Date.now();
-    const results = mode === 'overview' ? executeOverviewSearch(query, options) : executeDetailedSearch(query, options);
-    results.elapsed = Date.now() - start;
-    results.mode = mode;
-    return results;
+function executeOverviewSearch(query, options = {}) {
+    return executeSearch(query, { ...options, maxResults: 30 });
 }
 
-// Formatting
-function formatOverviewResults(results) {
-    let ctx = '# Search Results (Overview)\n\n';
-    if (results.modules.length) {
-        ctx += '## Modules\n';
-        for (const m of results.modules) ctx += `### ${m.name}/ (${m.fileCount} files)\n${m.summary}\n\n`;
-    }
-    if (results.files.length) {
-        ctx += '## Files\n';
-        for (const f of results.files) ctx += `- **${f.name}**: ${f.summary}\n`;
-        ctx += '\n';
-    }
-    if (results.functions.length) {
-        ctx += '## Functions\n';
-        for (const fn of results.functions) ctx += `- **${fn.name}**: ${fn.summary}\n`;
-        ctx += '\n';
-    }
-    if (results.callFlows.length) {
-        ctx += '## Call Relationships\n';
-        for (const f of results.callFlows) {
-            ctx += `**${f.name}**:\n`;
-            if (f.callers.length) ctx += `  ← Called by: ${f.callers.join(', ')}\n`;
-            if (f.callees.length) ctx += `  → Calls: ${f.callees.join(', ')}\n`;
-        }
-    }
-    return ctx;
+// Legacy callers/callees - now just unified search with intent hints
+function executeCallersSearch(funcName, options = {}) {
+    return executeSearch(`who calls ${funcName}`, options);
 }
 
-function formatDetailedResults(results) {
-    let ctx = '# Search Results (Detailed)\n\n';
-    if (results.symbols.length) {
-        ctx += '## Symbols Found\n';
-        for (const s of results.symbols.slice(0, 25)) {
-            ctx += `- **${s.name}** (${s.type}) → ${pathUtils.getFileName(s.file)}:${s.line}\n`;
-        }
-        ctx += '\n';
-    }
-    if (results.codeBlocks.length) {
-        ctx += '## Source Code\n\n';
-        for (const b of results.codeBlocks.slice(0, 15)) {
-            ctx += `### ${b.fileName} (lines ${b.startLine}-${b.endLine})${b.symbol ? ' - ' + b.symbol : ''}\n\`\`\`\n${b.code}\n\`\`\`\n\n`;
-        }
-    }
-    if (results.callTraces.length) {
-        ctx += '## Call Traces\n';
-        for (const t of results.callTraces) {
-            ctx += `**${t.name}**:\n`;
-            if (t.callers.length) ctx += `  ← Called by: ${t.callers.slice(0, 8).join(', ')}\n`;
-            if (t.callees.length) ctx += `  → Calls: ${t.callees.slice(0, 8).join(', ')}\n`;
-        }
-    }
-    return ctx;
-}
-
-// Helpers
-function extractTrigrams(text) {
-    const tris = [];
-    for (let i = 0; i <= text.length - 3; i++) {
-        const tri = text.substring(i, i + 3);
-        if (!/^\s+$/.test(tri)) tris.push(tri);
-    }
-    return tris;
-}
-
-function extractSearchTerms(query) {
-    const stop = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'what', 'where', 'when', 'how', 'why', 'show', 'find', 'search', 'get', 'list', 'me', 'my', 'all', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'and', 'or', 'code', 'function', 'file', 'does', 'do']);
-    const words = query.replace(/['"]/g, '').split(/[\s,;|]+/).filter(w => w.length >= 2);
-    const terms = [];
-    for (const word of words) {
-        if (stop.has(word.toLowerCase())) continue;
-        terms.push(word);
-        const parts = word.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[-_]/g, ' ').split(/\s+/);
-        for (const part of parts.filter(p => p.length >= 3 && !stop.has(p.toLowerCase()))) {
-            if (part !== word && !terms.includes(part)) terms.push(part);
-        }
-    }
-    return terms.slice(0, 15);
-}
-
-function matchesTerms(text, terms) {
-    const lower = text.toLowerCase();
-    return terms.some(t => lower.includes(t.toLowerCase()));
-}
-
-function fuzzyMatchScore(query, target) {
-    if (query === target) return 100;
-    if (target.includes(query)) return 80 + Math.min(20, (query.length / target.length) * 20);
-    if (target.startsWith(query)) return 75;
-    const parts = target.replace(/[-_]/g, ' ').split(/\s+/);
-    for (const part of parts) {
-        if (part.includes(query)) return 60;
-        if (part.startsWith(query)) return 55;
-    }
-    let qi = 0, matches = 0;
-    for (let ti = 0; ti < target.length && qi < query.length; ti++) {
-        if (target[ti] === query[qi]) { matches++; qi++; }
-    }
-    if (qi === query.length) return 30 + Math.min(20, (matches / target.length) * 20);
-    return 0;
+function executeCalleesSearch(funcName, options = {}) {
+    return executeSearch(`what does ${funcName} call`, options);
 }
 
 // ============================================================
-// INVERTED INDEX SEARCH FUNCTIONS
+// LOOKUP FUNCTIONS (unchanged from v7)
 // ============================================================
 
-/**
- * Search using inverted index (keyword-based)
- * Best for concept queries like "payment validation" or "authentication"
- * @param {string} query - Search query
- * @param {Object} options - Search options
- * @returns {Array} Ranked results with file paths and scores
- */
-function searchByKeyword(query, options = {}) {
-    if (!invertedIndex) {
-        log('Warning: Inverted index not initialized');
-        return [];
-    }
-    return invertedIndex.search(query, options);
+function lookupSymbol(key) {
+    return codebaseIndex?.getSymbol(key) || null;
 }
 
-/**
- * Search for code related to a concept
- * Searches summaries first (semantic), then code content
- * @param {string} concept - Concept to search for (e.g., "payment processing", "authentication")
- * @param {Object} options - Search options
- * @returns {Array} Results with file paths, matched terms, and scores
- */
-function searchConcept(concept, options = {}) {
-    if (!invertedIndex) {
-        log('Warning: Inverted index not initialized');
-        return [];
-    }
-    return invertedIndex.searchConcept(concept, options);
+function lookupSymbolsByName(name) {
+    return codebaseIndex?.getSymbolsByName(name) || [];
 }
 
-/**
- * Search files by keyword
- * @param {string} query - Search query
- * @param {Object} options - Search options
- * @returns {Array} File results
- */
-function searchFilesByKeyword(query, options = {}) {
-    if (!invertedIndex) return [];
-    return invertedIndex.searchFiles(query, options);
+function lookupCallers(funcName) {
+    return codebaseIndex?.getCallers(funcName) || [];
 }
 
-/**
- * Search symbols by keyword
- * @param {string} query - Search query
- * @param {Object} options - Search options
- * @returns {Array} Symbol results
- */
-function searchSymbolsByKeyword(query, options = {}) {
-    if (!invertedIndex) return [];
-    return invertedIndex.searchSymbols(query, options);
+function lookupCallees(funcName) {
+    return codebaseIndex?.getCallees(funcName) || [];
 }
 
-/**
- * Search summaries by keyword (best for understanding code purpose)
- * @param {string} query - Search query
- * @param {Object} options - Search options
- * @returns {Array} Summary results
- */
-function searchSummariesByKeyword(query, options = {}) {
-    if (!invertedIndex) return [];
-    return invertedIndex.searchSummaries(query, options);
+function getCodeBlock(symbol, options) {
+    return codebaseIndex?.getCodeBlock(symbol, options) || null;
 }
 
-/**
- * Get related terms for query expansion
- * @param {string} query - Original query
- * @param {number} maxTerms - Maximum terms to return
- * @returns {Array} Related terms
- */
-function getRelatedTerms(query, maxTerms = 10) {
-    if (!invertedIndex) return [];
-    return invertedIndex.getRelatedTerms(query, maxTerms);
+function getFileContent(filePath) {
+    return codebaseIndex?.getFileContent(filePath) || null;
 }
 
-/**
- * Get query suggestions/completions
- * @param {string} prefix - Partial query
- * @param {number} maxSuggestions - Maximum suggestions
- * @returns {Array} Suggestions with term and document count
- */
-function suggestCompletions(prefix, maxSuggestions = 10) {
-    if (!invertedIndex) return [];
-    return invertedIndex.suggestCompletions(prefix, maxSuggestions);
+function getStats() {
+    const codebaseStats = codebaseIndex?.getStats() || {};
+    const grepStats = grepIndex?.getStats() || {};
+    return { ...codebaseStats, grep: grepStats };
 }
 
-/**
- * Hybrid search combining inverted index, trigram, and vector search
- * @param {string} query - Search query
- * @param {Object} options - Search options
- * @returns {Object} Combined results from all search methods
- */
-function hybridSearch(query, options = {}) {
-    const { maxResults = 30, includeVector = true } = options;
-    const results = {
-        keyword: [],      // From inverted index
-        trigram: [],      // From trigram index
-        vector: [],       // From vector index
-        merged: [],       // Merged and ranked
-        relatedTerms: []  // For query expansion
-    };
-    
-    // 1. Keyword search (inverted index) - best for concepts
-    if (invertedIndex) {
-        results.keyword = invertedIndex.search(query, { maxResults });
-        results.relatedTerms = invertedIndex.getRelatedTerms(query, 5);
-    }
-    
-    // 2. Trigram search - best for exact text/identifiers
-    const trigramResults = findTextInCode(query, { maxResults });
-    results.trigram = trigramResults.map(r => ({
-        file: r.file,
-        line: r.line,
-        matchType: 'trigram',
-        score: 1.0
-    }));
-    
-    // 3. Symbol pattern search
-    const symbolResults = findSymbolsByPattern(query, { maxResults });
-    for (const sym of symbolResults) {
-        results.trigram.push({
-            file: sym.file,
-            line: sym.line,
-            name: sym.name,
-            type: sym.type,
-            matchType: 'symbol',
-            score: sym.matchScore / 100
-        });
-    }
-    
-    // 4. Vector search (if available and requested)
-    if (includeVector && options.queryVector) {
-        const vectorResults = findSymbolsByVector(options.queryVector, { maxResults });
-        results.vector = vectorResults.map(r => ({
-            file: r.file,
-            line: r.line,
-            name: r.name,
-            matchType: 'vector',
-            score: r.matchScore / 100
-        }));
-    }
-    
-    // 5. Merge and rank results
-    const scoreMap = new Map();
-    const infoMap = new Map();
-    
-    // Weight: keyword > vector > trigram
-    const weights = { keyword: 1.0, vector: 0.8, trigram: 0.6, symbol: 0.7 };
-    
-    for (const r of results.keyword) {
-        const file = r.path || r.file;
-        if (!file) continue;
-        const current = scoreMap.get(file) || 0;
-        scoreMap.set(file, current + r.score * weights.keyword);
-        if (!infoMap.has(file)) {
-            infoMap.set(file, { file, matchedTerms: r.matchedTerms, sources: ['keyword'] });
-        } else {
-            infoMap.get(file).sources.push('keyword');
-        }
-    }
-    
-    for (const r of results.trigram) {
-        const file = r.file;
-        if (!file) continue;
-        const weight = weights[r.matchType] || weights.trigram;
-        const current = scoreMap.get(file) || 0;
-        scoreMap.set(file, current + r.score * weight);
-        if (!infoMap.has(file)) {
-            infoMap.set(file, { file, name: r.name, line: r.line, sources: [r.matchType] });
-        } else {
-            infoMap.get(file).sources.push(r.matchType);
-        }
-    }
-    
-    for (const r of results.vector) {
-        const file = r.file;
-        if (!file) continue;
-        const current = scoreMap.get(file) || 0;
-        scoreMap.set(file, current + r.score * weights.vector);
-        if (!infoMap.has(file)) {
-            infoMap.set(file, { file, name: r.name, sources: ['vector'] });
-        } else {
-            infoMap.get(file).sources.push('vector');
-        }
-    }
-    
-    // Build merged results
-    for (const [file, score] of scoreMap) {
-        const info = infoMap.get(file);
-        results.merged.push({
-            ...info,
-            score,
-            sourceCount: new Set(info.sources).size
-        });
-    }
-    
-    // Sort by score, boost items found by multiple methods
-    results.merged.sort((a, b) => {
-        const scoreA = a.score * (1 + a.sourceCount * 0.2);
-        const scoreB = b.score * (1 + b.sourceCount * 0.2);
-        return scoreB - scoreA;
-    });
-    
-    results.merged = results.merged.slice(0, maxResults);
-    
-    return results;
-}
-
-/**
- * Get inverted index statistics
- */
-function getInvertedIndexStats() {
-    if (!invertedIndex) return null;
-    return invertedIndex.getStats();
-}
-
-/**
- * Export inverted index for persistence
- */
-function exportInvertedIndex() {
-    if (!invertedIndex) return null;
-    return invertedIndex.export();
-}
-
-/**
- * Import inverted index from persistence
- */
-function importInvertedIndex(data) {
-    if (!invertedIndex) {
-        invertedIndex = new InvertedIndex();
-    }
-    invertedIndex.import(data);
-}
+// ============================================================
+// EXPORTS
+// ============================================================
 
 module.exports = {
-    initialize, buildSearchIndexes, clearSearchIndexes,
-    lookupSymbolByKey, lookupSymbolsByName, lookupFilesByName, lookupFilesByExtension,
-    lookupFilesInDirectory, lookupCallers, lookupCallees, lookupFunctionSummary, lookupFileSummary, lookupModuleSummary,
-    findSymbolsByPattern, findSymbolsByType, findFilesByPattern, findTextInCode, findModulesByPattern,
-    findSymbolsByVector,
-    getCodeLines, getCodeBlockForSymbol, getCodeBlockForMatch, getSymbolsInFile,
-    traceCallersOf, traceCalleesOf,
-    searchWhereIsDefined, searchWhoCallsFunction, searchWhatFunctionCalls, searchTextInCode, searchModuleOverview,
-    executeOverviewSearch, executeDetailedSearch, executeSearch,
-    // NEW: Inverted index search functions
-    searchByKeyword, searchConcept, searchFilesByKeyword, searchSymbolsByKeyword, searchSummariesByKeyword,
-    getRelatedTerms, suggestCompletions, hybridSearch,
-    getInvertedIndexStats, exportInvertedIndex, importInvertedIndex,
-    // Helpers
-    extractTrigrams, extractSearchTerms, fuzzyMatchScore,
-    get searchMode() { return searchMode; },
-    set searchMode(v) { searchMode = v; },
-    get symbolTrigramIndex() { return symbolTrigramIndex; },
-    get fileTrigramIndex() { return fileTrigramIndex; },
-    get moduleSummaryIndex() { return moduleSummaryIndex; }
+    // Initialization
+    initialize,
+    buildGrepIndex,
+    
+    // Mode (deprecated but kept for compatibility)
+    setMode,
+    getMode,
+    
+    // Core search (unified)
+    executeSearch,
+    executeDetailedSearch,
+    executeOverviewSearch,
+    
+    // Legacy compatibility
+    executeCallersSearch,
+    executeCalleesSearch,
+    
+    // Intent detection (exposed for testing)
+    detectIntent,
+    generateVariants,
+    QueryIntent,
+    
+    // Lookups
+    lookupSymbol,
+    lookupSymbolsByName,
+    lookupCallers,
+    lookupCallees,
+    getCodeBlock,
+    getFileContent,
+    getStats,
+    
+    // Expose indexes
+    get grepIndex() { return grepIndex; },
+    get codebaseIndex() { return codebaseIndex; }
 };
