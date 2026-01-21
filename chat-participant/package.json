@@ -2,7 +2,7 @@
   "name": "astracode-copilot",
   "displayName": "AstraCode for Copilot Chat",
   "description": "Code search with function call tracking for GitHub Copilot Chat",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "publisher": "astracode",
   "engines": {
     "vscode": "^1.90.0"
