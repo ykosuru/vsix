@@ -2,6 +2,13 @@ const vscode = require('vscode');
 const path = require('path');
 const { GrepIndex } = require('./grep-search');
 const {
+    getAvailableParsers,
+    parseDocument,
+    getSupportedDocumentExtensions,
+    isSupportedDocument,
+    formatDocumentForIndex
+} = require('./document-parser');
+const {
     DESCRIBE_SYSTEM_PROMPT,
     getDescribeUserPrompt,
     TRANSLATE_SYSTEM_PROMPT,
@@ -25,10 +32,117 @@ let grepIndex = null;
 let indexedWorkspace = null;
 let lastSearchResults = null;  // Store last search results for chaining
 let lastSearchTerm = null;     // Store last search term
+let prebuiltIndex = null;      // Pre-built index from Python tool
 
 // History tracking - last 25 Q&A pairs
 const MAX_HISTORY = 25;
 let queryHistory = [];  // { id, timestamp, command, query, summary, files }
+
+/**
+ * Load pre-built index from .astra-index.json
+ */
+async function loadPrebuiltIndex(workspaceRoot, outputChannel) {
+    const indexPath = path.join(workspaceRoot, '.astra-index.json');
+    
+    try {
+        const uri = vscode.Uri.file(indexPath);
+        const content = await vscode.workspace.fs.readFile(uri);
+        const jsonStr = Buffer.from(content).toString('utf8');
+        prebuiltIndex = JSON.parse(jsonStr);
+        
+        outputChannel.appendLine(`\n✅ Loaded pre-built index: ${indexPath}`);
+        outputChannel.appendLine(`   Files: ${prebuiltIndex.stats?.indexed_files || 0}`);
+        outputChannel.appendLine(`   Lines: ${prebuiltIndex.stats?.total_lines || 0}`);
+        outputChannel.appendLine(`   Functions: ${prebuiltIndex.stats?.functions || 0}`);
+        outputChannel.appendLine(`   Created: ${prebuiltIndex.created || 'unknown'}`);
+        
+        return true;
+    } catch (e) {
+        // No pre-built index found
+        prebuiltIndex = null;
+        return false;
+    }
+}
+
+/**
+ * Search the pre-built index
+ */
+function searchPrebuiltIndex(query, maxResults = 50) {
+    if (!prebuiltIndex || !prebuiltIndex.files) {
+        return [];
+    }
+    
+    const results = [];
+    const queryLower = query.toLowerCase();
+    const queryTerms = queryLower.split(/\s+/).filter(t => t.length >= 2);
+    
+    for (const [filepath, fileData] of Object.entries(prebuiltIndex.files)) {
+        if (!fileData.content) continue;
+        
+        for (const lineData of fileData.content) {
+            // Check if any query term matches
+            const matches = queryTerms.some(term => lineData.lower.includes(term));
+            
+            if (matches) {
+                results.push({
+                    file: filepath,
+                    line: lineData.line,
+                    matchLine: lineData.content,
+                    content: lineData.content,
+                    context: {
+                        before: [],
+                        after: []
+                    }
+                });
+                
+                if (results.length >= maxResults) {
+                    return results;
+                }
+            }
+        }
+    }
+    
+    return results;
+}
+
+/**
+ * Create a GrepIndex-compatible wrapper from pre-built index
+ */
+function createIndexFromPrebuilt(prebuilt, outputChannel) {
+    outputChannel.appendLine('Creating index from pre-built data...');
+    
+    // Build context files map from pre-built index
+    const contextFiles = new Map();
+    
+    for (const [filepath, fileData] of Object.entries(prebuilt.files || {})) {
+        // Reconstruct content from line index
+        const content = fileData.content
+            ? fileData.content.map(l => l.content).join('\n')
+            : '';
+        
+        contextFiles.set(filepath, {
+            content: content,
+            language: fileData.ext?.slice(1) || 'txt'
+        });
+    }
+    
+    // Create GrepIndex with the content
+    const index = new GrepIndex({
+        contextLines: 3,
+        maxResults: 100,
+        buildCallIndex: true
+    });
+    
+    index.build(contextFiles, {
+        log: (msg) => outputChannel.appendLine(msg)
+    });
+    
+    // Store pre-built stats
+    index._prebuiltStats = prebuilt.stats;
+    index._prebuiltCreated = prebuilt.created;
+    
+    return index;
+}
 
 function activate(context) {
     const outputChannel = vscode.window.createOutputChannel('AstraCode');
@@ -58,9 +172,10 @@ function activate(context) {
         // Handle /clear command
         if (request.command === 'clear') {
             grepIndex = null;
+            prebuiltIndex = null;
             indexedWorkspace = null;
             outputChannel.appendLine('Index cleared');
-            response.markdown('🗑️ **Index cleared.** Next query will rebuild fresh from workspace files.');
+            response.markdown('🗑️ **Index cleared.** Next query will reload from `.astra-index.json` or rebuild.');
             return;
         }
         
@@ -73,9 +188,10 @@ function activate(context) {
             }
             
             grepIndex = null;
+            prebuiltIndex = null;  // Force rebuild, ignore pre-built
             indexedWorkspace = null;
             outputChannel.appendLine('Forcing index rebuild...');
-            response.progress('Rebuilding index from scratch...');
+            response.progress('Rebuilding index from scratch (ignoring .astra-index.json)...');
             
             await buildIndex(workspaceRoot, outputChannel);
             indexedWorkspace = workspaceRoot;
@@ -87,6 +203,7 @@ function activate(context) {
             response.markdown(`- **Unique functions:** ${stats.uniqueFunctions.toLocaleString()}\n`);
             response.markdown(`- **Call sites tracked:** ${stats.indexedCalls.toLocaleString()}\n`);
             response.markdown(`- **Build time:** ${stats.buildTime}ms\n`);
+            response.markdown(`\n💡 *To use Python pre-built index, run \`python astra-index.py .\` then \`/clear\`*\n`);
             return;
         }
         
@@ -94,13 +211,41 @@ function activate(context) {
         if (request.command === 'stats') {
             if (grepIndex) {
                 const stats = grepIndex.getStats();
+                const parsers = getAvailableParsers();
+                const workspaceFolders = vscode.workspace.workspaceFolders || [];
+                
                 response.markdown(`📊 **Index Statistics**\n\n`);
-                response.markdown(`- **Files indexed:** ${stats.files}\n`);
-                response.markdown(`- **Total lines:** ${stats.totalLines.toLocaleString()}\n`);
-                response.markdown(`- **Unique functions:** ${stats.uniqueFunctions.toLocaleString()}\n`);
-                response.markdown(`- **Call sites tracked:** ${stats.indexedCalls.toLocaleString()}\n`);
-                response.markdown(`- **Build time:** ${stats.buildTime}ms\n`);
-                response.markdown(`- **Last updated:** ${stats.lastUpdated?.toLocaleTimeString() || 'N/A'}\n`);
+                
+                // Show if using pre-built index
+                if (prebuiltIndex) {
+                    response.markdown(`**Source:** Pre-built index (\`.astra-index.json\`)\n`);
+                    response.markdown(`**Created:** ${prebuiltIndex.created || 'unknown'}\n\n`);
+                } else {
+                    response.markdown(`**Source:** Built on-the-fly\n\n`);
+                }
+                
+                // Show workspace folders
+                response.markdown(`**Workspace Folders:** ${workspaceFolders.length}\n`);
+                for (const folder of workspaceFolders) {
+                    response.markdown(`- \`${folder.name}\`\n`);
+                }
+                
+                response.markdown(`\n**Index:**\n`);
+                response.markdown(`- Files indexed: ${stats.files}\n`);
+                response.markdown(`- Total lines: ${stats.totalLines.toLocaleString()}\n`);
+                response.markdown(`- Unique functions: ${stats.uniqueFunctions.toLocaleString()}\n`);
+                response.markdown(`- Call sites tracked: ${stats.indexedCalls.toLocaleString()}\n`);
+                response.markdown(`- Build time: ${stats.buildTime}ms\n`);
+                
+                if (!prebuiltIndex) {
+                    response.markdown(`\n**Document Parsers:**\n`);
+                    response.markdown(`- PDF: ${parsers.pdf ? '✅' : '❌'}  Excel: ${parsers.excel ? '✅' : '❌'}  Word: ${parsers.word ? '✅' : '❌'}\n`);
+                    if (!parsers.pdf || !parsers.excel || !parsers.word) {
+                        response.markdown(`\n💡 *Run \`/docs\` for installation instructions, or use Python indexer*\n`);
+                    }
+                }
+                
+                response.markdown(`\n💡 *To rebuild: \`/rebuild\` or run \`python astra-index.py .\`*\n`);
             } else {
                 response.markdown('⚠️ No index built yet. Run a query to build the index.');
             }
@@ -167,6 +312,29 @@ function activate(context) {
             response.markdown(`\n💡 *Use \`/generated\` to see remaining files*`);
             return;
         }
+        
+        // Handle /docs command - show document indexing status
+        if (request.command === 'docs') {
+            const parsers = getAvailableParsers();
+            const docExtensions = getSupportedDocumentExtensions();
+            
+            response.markdown(`# 📄 Document Indexing Status\n\n`);
+            response.markdown(`## Supported Formats\n\n`);
+            response.markdown(`| Format | Extensions | Status | Install Command |\n`);
+            response.markdown(`|--------|------------|--------|------------------|\n`);
+            response.markdown(`| PDF | .pdf | ${parsers.pdf ? '✅ Ready' : '❌ Not installed'} | \`npm install pdf-parse\` |\n`);
+            response.markdown(`| Excel | .xlsx, .xls | ${parsers.excel ? '✅ Ready' : '❌ Not installed'} | \`npm install xlsx\` |\n`);
+            response.markdown(`| Word | .docx | ${parsers.word ? '✅ Ready' : '❌ Not installed'} | \`npm install mammoth\` |\n`);
+            
+            response.markdown(`\n## How It Works\n\n`);
+            response.markdown(`1. Add document folders to your workspace\n`);
+            response.markdown(`2. Run \`/rebuild\` to re-index with documents\n`);
+            response.markdown(`3. Search documents alongside code with \`/find\`\n\n`);
+            
+            response.markdown(`## Install All Dependencies\n\n`);
+            response.markdown(`\`\`\`bash\ncd your-extension-folder\nnpm install pdf-parse xlsx mammoth\n\`\`\`\n`);
+            return;
+        }
 
         // All other commands need a workspace
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -175,10 +343,20 @@ function activate(context) {
             return;
         }
 
-        // Build index if needed
+        // Build index if needed - first check for pre-built index
         if (!grepIndex || indexedWorkspace !== workspaceRoot) {
-            response.progress('Building code index...');
-            await buildIndex(workspaceRoot, outputChannel);
+            // Try to load pre-built index first
+            response.progress('Loading index...');
+            const hasPrebuilt = await loadPrebuiltIndex(workspaceRoot, outputChannel);
+            
+            if (hasPrebuilt) {
+                response.progress('Using pre-built index...');
+                // Build a minimal GrepIndex wrapper for compatibility
+                grepIndex = createIndexFromPrebuilt(prebuiltIndex, outputChannel);
+            } else {
+                response.progress('Building code index (no .astra-index.json found)...');
+                await buildIndex(workspaceRoot, outputChannel);
+            }
             indexedWorkspace = workspaceRoot;
         }
 
@@ -1275,34 +1453,91 @@ function appendFileReferences(results, workspaceRoot, response) {
 async function buildIndex(workspaceRoot, outputChannel) {
     const contextFiles = new Map();
     
-    // Source code extensions only - exclude .md to avoid indexing generated docs
-    const extensions = [
+    // Source code extensions
+    const codeExtensions = [
         'ts', 'tsx', 'js', 'jsx', 'py', 'java', 'c', 'cpp', 'h', 'hpp',
         'cs', 'go', 'rs', 'rb', 'php', 'swift', 'kt', 'scala', 'sql',
-        'tal', 'cbl', 'cob', 'cobol', 'pli', 'pco', 'cpy', 'json', 'yaml', 'yml'
+        'tal', 'cbl', 'cob', 'cobol', 'pli', 'pco', 'cpy', 'json', 'yaml', 'yml',
+        'xml', 'csv', 'txt'
     ];
     
-    const pattern = `**/*.{${extensions.join(',')}}`;
-    // Exclude node_modules and generated directory
-    const excludePattern = '{**/node_modules/**,**/generated/**}';
+    // Document extensions (PDF, Excel, Word)
+    const docExtensions = getSupportedDocumentExtensions();
+    const allExtensions = [...codeExtensions, ...docExtensions];
     
-    const files = await vscode.workspace.findFiles(pattern, excludePattern, 5000);
+    const pattern = `**/*.{${allExtensions.join(',')}}`;
+    const excludePattern = '{**/node_modules/**,**/generated/**,**/.git/**}';
     
-    outputChannel.appendLine(`Found ${files.length} files to index (excluding generated/)`);
+    // Get ALL workspace folders
+    const workspaceFolders = vscode.workspace.workspaceFolders || [];
+    outputChannel.appendLine(`\n📁 Indexing ${workspaceFolders.length} workspace folder(s):`);
+    
+    for (const folder of workspaceFolders) {
+        outputChannel.appendLine(`   - ${folder.name}: ${folder.uri.fsPath}`);
+    }
+    
+    // Search across ALL workspace folders
+    const files = await vscode.workspace.findFiles(pattern, excludePattern, 10000);
+    
+    outputChannel.appendLine(`\nFound ${files.length} files to index`);
+    
+    // Check available document parsers
+    const parsers = getAvailableParsers();
+    let codeCount = 0;
+    let docCount = 0;
+    let docSkipped = 0;
     
     for (const fileUri of files) {
         try {
-            const content = await vscode.workspace.fs.readFile(fileUri);
-            const text = Buffer.from(content).toString('utf8');
-            const ext = path.extname(fileUri.fsPath).slice(1);
+            const filePath = fileUri.fsPath;
+            const ext = path.extname(filePath).slice(1).toLowerCase();
             
-            contextFiles.set(fileUri.fsPath, {
-                content: text,
-                language: ext
-            });
+            if (docExtensions.includes(ext)) {
+                // Document file - try to parse
+                if ((ext === 'pdf' && !parsers.pdf) ||
+                    ((ext === 'xlsx' || ext === 'xls') && !parsers.excel) ||
+                    (ext === 'docx' && !parsers.word)) {
+                    docSkipped++;
+                    continue;
+                }
+                
+                try {
+                    const content = await vscode.workspace.fs.readFile(fileUri);
+                    const buffer = Buffer.from(content);
+                    const parsed = await parseDocument(buffer, filePath);
+                    
+                    if (parsed) {
+                        const formattedText = formatDocumentForIndex(parsed, filePath);
+                        contextFiles.set(filePath, {
+                            content: formattedText,
+                            language: ext,
+                            isDocument: true,
+                            metadata: parsed.metadata
+                        });
+                        docCount++;
+                    }
+                } catch (e) {
+                    outputChannel.appendLine(`  ⚠️ Failed to parse: ${path.basename(filePath)}`);
+                }
+            } else {
+                // Code file - read as text
+                const content = await vscode.workspace.fs.readFile(fileUri);
+                const text = Buffer.from(content).toString('utf8');
+                
+                contextFiles.set(filePath, {
+                    content: text,
+                    language: ext
+                });
+                codeCount++;
+            }
         } catch (e) {
             // Skip files that can't be read
         }
+    }
+    
+    outputChannel.appendLine(`✅ Indexed: ${codeCount} code files, ${docCount} documents`);
+    if (docSkipped > 0) {
+        outputChannel.appendLine(`⚠️ Skipped ${docSkipped} documents (missing parsers - run /docs)`);
     }
     
     grepIndex = new GrepIndex({
