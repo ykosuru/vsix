@@ -1,0 +1,26 @@
+{
+  "name": "astracode-copilot",
+  "displayName": "AstraCode for Copilot Chat",
+  "description": "Grep-powered code search integrated with GitHub Copilot Chat",
+  "version": "0.1.0",
+  "publisher": "astracode",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "astracode.chat",
+        "name": "astra",
+        "fullName": "AstraCode",
+        "description": "Search and analyze your codebase with grep-powered retrieval",
+        "isSticky": false
+      }
+    ]
+  }
+}
