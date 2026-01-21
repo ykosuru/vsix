@@ -228,9 +228,9 @@ function showHistory(response, query) {
 }
 
 /**
- * Add entry to history
+ * Add entry to history with cached results for later reuse
  */
-function addToHistory(command, query, summary, files) {
+function addToHistory(command, query, summary, files, cachedResults = null) {
     const id = queryHistory.length > 0 ? queryHistory[queryHistory.length - 1].id + 1 : 1;
     
     queryHistory.push({
@@ -240,7 +240,7 @@ function addToHistory(command, query, summary, files) {
         query: query || '',
         summary: summary || '',
         files: files || [],
-        results: lastSearchResults  // Store results for /use command
+        cachedResults: cachedResults || lastSearchResults || []  // Store results for #N reference
     });
     
     // Keep only last MAX_HISTORY items
@@ -269,13 +269,13 @@ function handleUseCommand(query, response, outputChannel) {
         return;
     }
     
-    if (!item.results || item.results.length === 0) {
+    if (!item.cachedResults || item.cachedResults.length === 0) {
         response.markdown(`⚠️ History item #${id} has no saved results to reuse.`);
         return;
     }
     
     // Set the last results to the history item's results
-    lastSearchResults = item.results;
+    lastSearchResults = item.cachedResults;
     lastSearchTerm = item.query;
     
     outputChannel.appendLine(`/use: Loaded ${item.results.length} results from history #${id}`);
@@ -336,8 +336,8 @@ async function handleFindCommand(query, response, outputChannel, workspaceRoot, 
     // Get unique files for history
     const uniqueFiles = [...new Set(results.map(r => r.file))];
     
-    // Add to history
-    const historyId = addToHistory('find', searchTerm, `Found ${results.length} matches`, uniqueFiles);
+    // Add to history with cached results
+    const historyId = addToHistory('find', searchTerm, `Found ${results.length} matches`, uniqueFiles, results);
     
     if (results.length === 0) {
         response.markdown(`No matches found for: \`${searchTerm}\`\n\nTry:\n- Different spelling\n- Partial term\n- \`@astra /rebuild\` to refresh index`);
@@ -346,7 +346,7 @@ async function handleFindCommand(query, response, outputChannel, workspaceRoot, 
     
     // Format results
     response.markdown(`## 🔍 Found ${results.length} matches for \`${searchTerm}\` *(History #${historyId})*\n\n`);
-    response.markdown(`💡 *Tip: Use \`@astra /translate\`, \`@astra /describe\`, or \`@astra /use #${historyId}\` later*\n\n`);
+    response.markdown(`💡 *Tip: Use \`/describe #${historyId}\`, \`/translate #${historyId}\`, or \`/requirements #${historyId}\`*\n\n`);
     
     const byFile = groupByFile(results);
     for (const [file, fileResults] of byFile) {
@@ -361,33 +361,140 @@ async function handleFindCommand(query, response, outputChannel, workspaceRoot, 
     }
 }
 
+// Legacy source file extensions for filtering
+const LEGACY_SOURCE_EXTENSIONS = ['.tal', '.cbl', '.cob', '.cobol', '.pco', '.pli', '.cpy'];
+
+/**
+ * Unified input parsing for all commands
+ * Syntax:
+ *   <topic>           → Fresh search
+ *   #N                → Use history item N
+ *   #file a.tal, b.cbl → Use specific files
+ * 
+ * Returns: { type: 'search' | 'history' | 'files' | 'empty', value: string | number | string[] }
+ */
+function parseCommandInput(query) {
+    const trimmed = query.trim();
+    
+    if (!trimmed) {
+        return { type: 'empty', value: null };
+    }
+    
+    // #N - history reference (e.g., #5, #12)
+    const historyMatch = trimmed.match(/^#(\d+)$/);
+    if (historyMatch) {
+        return { type: 'history', value: parseInt(historyMatch[1]) };
+    }
+    
+    // #file or #files - specific files
+    const filesMatch = trimmed.match(/^#files?\s+(.+)$/i);
+    if (filesMatch) {
+        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
+        return { type: 'files', value: fileNames };
+    }
+    
+    // Legacy support: files: syntax
+    const legacyFilesMatch = trimmed.match(/^files?:\s*(.+)$/i);
+    if (legacyFilesMatch) {
+        const fileNames = legacyFilesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
+        return { type: 'files', value: fileNames };
+    }
+    
+    // Default: fresh search
+    return { type: 'search', value: trimmed };
+}
+
+/**
+ * Get results from history item, with optional filtering to legacy source
+ * Returns { results, searchTerm, error } 
+ */
+function getHistoryResults(historyId, filterLegacy = true) {
+    const historyItem = queryHistory.find(h => h.id === historyId);
+    
+    if (!historyItem) {
+        return { results: null, searchTerm: null, error: `History item #${historyId} not found. Use \`/history\` to see available items.` };
+    }
+    
+    if (!historyItem.cachedResults || historyItem.cachedResults.length === 0) {
+        return { results: null, searchTerm: null, error: `History item #${historyId} has no cached results. Try a fresh search.` };
+    }
+    
+    let results = historyItem.cachedResults;
+    const searchTerm = historyItem.query;
+    
+    if (filterLegacy) {
+        const filtered = filterToLegacySource(results);
+        if (filtered.length === 0) {
+            const fileNames = [...new Set(results.map(r => path.basename(r.file)))].slice(0, 5).join(', ');
+            return { 
+                results: null, 
+                searchTerm, 
+                error: `History #${historyId} has no legacy source files (TAL, COBOL, etc).\n\nFound: ${fileNames}\n\nTry a fresh search with \`<topic>\`.` 
+            };
+        }
+        results = filtered;
+    }
+    
+    return { results, searchTerm, error: null };
+}
+
+/**
+ * Filter results to only include legacy source files
+ */
+function filterToLegacySource(results) {
+    return results.filter(r => 
+        LEGACY_SOURCE_EXTENSIONS.some(ext => r.file.toLowerCase().endsWith(ext))
+    );
+}
+
 /**
  * /describe - Describe functionality of code
+ * Syntax: /describe <topic> | /describe #N | /describe #file a.tal, b.cbl
  */
 async function handleDescribeCommand(query, response, outputChannel, workspaceRoot, token) {
-    // Check for "files:" syntax
-    const filesMatch = query.match(/files?:\s*(.+)/i);
+    const input = parseCommandInput(query);
     let results;
     let searchTerm;
     
-    if (filesMatch) {
-        // Load specific files
-        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
-        results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
-        searchTerm = fileNames.join(', ');
-    } else if (query.trim()) {
-        // Search by term
-        searchTerm = query.trim();
-        response.progress(`Analyzing: ${searchTerm}...`);
-        results = searchCode(searchTerm, 40);
-    } else if (lastSearchResults && lastSearchResults.length > 0) {
-        // Use last results
-        results = lastSearchResults;
-        searchTerm = lastSearchTerm || 'previous search';
-        response.markdown(`*Using results from previous search: \`${searchTerm}\`*\n\n`);
-    } else {
-        response.markdown('**Usage:** `@astra /describe <function or module>`\n\n**Examples:**\n- `@astra /describe FEDIN-PARSE`\n- `@astra /describe files: payment.tal, validate.tal`\n- First run `/find`, then `/describe` to use those results');
-        return;
+    switch (input.type) {
+        case 'files':
+            // #file a.tal, b.cbl
+            results = await loadSpecificFiles(input.value, workspaceRoot, outputChannel);
+            searchTerm = input.value.join(', ');
+            break;
+            
+        case 'history':
+            // #N - use history item
+            const historyData = getHistoryResults(input.value, true);
+            if (historyData.error) {
+                response.markdown(`❌ ${historyData.error}`);
+                return;
+            }
+            results = historyData.results;
+            searchTerm = historyData.searchTerm;
+            response.markdown(`*Using history #${input.value}: \`${searchTerm}\`*\n\n`);
+            break;
+            
+        case 'search':
+            // Fresh search
+            searchTerm = input.value;
+            response.progress(`Analyzing: ${searchTerm}...`);
+            results = searchCode(searchTerm, 40);
+            break;
+            
+        case 'empty':
+        default:
+            // Show usage
+            response.markdown('**Usage:** `@astra /describe <topic>`\n\n');
+            response.markdown('**Syntax:**\n');
+            response.markdown('- `/describe FEDIN-PARSE` — Fresh search\n');
+            response.markdown('- `/describe #5` — Use results from history item #5\n');
+            response.markdown('- `/describe #file payment.tal, validate.cbl` — Specific files\n');
+            if (queryHistory.length > 0) {
+                const last = queryHistory[queryHistory.length - 1];
+                response.markdown(`\n💡 *Recent: #${last.id} \`${last.query}\` — use \`/describe #${last.id}\`*`);
+            }
+            return;
     }
     
     if (!results || results.length === 0) {
@@ -397,9 +504,9 @@ async function handleDescribeCommand(query, response, outputChannel, workspaceRo
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
-    // Save to history
+    // Save to history with cached results
     const uniqueFiles = [...new Set(results.map(r => r.file))];
-    addToHistory('describe', searchTerm, `Described ${uniqueFiles.length} files`, uniqueFiles);
+    addToHistory('describe', searchTerm, `Described ${uniqueFiles.length} files`, uniqueFiles, results);
     
     const systemPrompt = DESCRIBE_SYSTEM_PROMPT;
     const userPrompt = getDescribeUserPrompt(searchTerm, context);
@@ -410,31 +517,52 @@ async function handleDescribeCommand(query, response, outputChannel, workspaceRo
 
 /**
  * /translate - Translate TAL to Java
+ * Syntax: /translate <topic> | /translate #N | /translate #file a.tal, b.cbl
  */
 async function handleTranslateCommand(query, response, outputChannel, workspaceRoot, token) {
-    // Check for "files:" syntax
-    const filesMatch = query.match(/files?:\s*(.+)/i);
+    const input = parseCommandInput(query);
     let results;
     let searchTerm;
     
-    if (filesMatch) {
-        // Load specific files
-        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
-        results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
-        searchTerm = fileNames.join(', ');
-    } else if (query.trim()) {
-        // Search by term
-        searchTerm = query.trim();
-        response.progress(`Finding TAL code: ${searchTerm}...`);
-        results = searchCode(searchTerm, 30);
-    } else if (lastSearchResults && lastSearchResults.length > 0) {
-        // Use last results
-        results = lastSearchResults;
-        searchTerm = lastSearchTerm || 'previous search';
-        response.markdown(`*Translating results from previous search: \`${searchTerm}\`*\n\n`);
-    } else {
-        response.markdown('**Usage:** `@astra /translate <term or files>`\n\n**Examples:**\n- `@astra /translate PROC-VALIDATE`\n- `@astra /translate files: FEDIN.tal, FEDOUT.tal`\n- First run `/find FEDIN`, then `/translate` to translate those results');
-        return;
+    switch (input.type) {
+        case 'files':
+            // #file a.tal, b.cbl
+            results = await loadSpecificFiles(input.value, workspaceRoot, outputChannel);
+            searchTerm = input.value.join(', ');
+            break;
+            
+        case 'history':
+            // #N - use history item (filter to legacy source)
+            const historyData = getHistoryResults(input.value, true);
+            if (historyData.error) {
+                response.markdown(`❌ ${historyData.error}`);
+                return;
+            }
+            results = historyData.results;
+            searchTerm = historyData.searchTerm;
+            response.markdown(`*Using history #${input.value}: \`${searchTerm}\`*\n\n`);
+            break;
+            
+        case 'search':
+            // Fresh search
+            searchTerm = input.value;
+            response.progress(`Finding TAL code: ${searchTerm}...`);
+            results = searchCode(searchTerm, 30);
+            break;
+            
+        case 'empty':
+        default:
+            // Show usage
+            response.markdown('**Usage:** `@astra /translate <topic>`\n\n');
+            response.markdown('**Syntax:**\n');
+            response.markdown('- `/translate PROC-VALIDATE` — Fresh search\n');
+            response.markdown('- `/translate #5` — Use results from history item #5\n');
+            response.markdown('- `/translate #file FEDIN.tal, FEDOUT.tal` — Specific files\n');
+            if (queryHistory.length > 0) {
+                const last = queryHistory[queryHistory.length - 1];
+                response.markdown(`\n💡 *Recent: #${last.id} \`${last.query}\` — use \`/translate #${last.id}\`*`);
+            }
+            return;
     }
     
     if (!results || results.length === 0) {
@@ -444,9 +572,9 @@ async function handleTranslateCommand(query, response, outputChannel, workspaceR
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
-    // Save to history
+    // Save to history with cached results
     const uniqueFiles = [...new Set(results.map(r => r.file))];
-    addToHistory('translate', searchTerm, `Translated ${uniqueFiles.length} files to Java`, uniqueFiles);
+    addToHistory('translate', searchTerm, `Translated ${uniqueFiles.length} files to Java`, uniqueFiles, results);
     
     const systemPrompt = TRANSLATE_SYSTEM_PROMPT;
     const userPrompt = getTranslateUserPrompt(context);
@@ -474,17 +602,18 @@ function showDomains(response) {
         response.markdown(`| \`${domain.key}\` | ${domain.name} | ${domain.description} |\n`);
     }
     
-    response.markdown(`\n**Usage:**\n`);
+    response.markdown(`\n**Syntax:**\n`);
     response.markdown(`\`\`\`\n`);
-    response.markdown(`@astra /domain fediso             # Run fediso analysis\n`);
-    response.markdown(`@astra /domain swift files: x.tal # Run swift analysis on specific files\n`);
-    response.markdown(`@astra /fediso                    # Shortcut for /domain fediso\n`);
+    response.markdown(`@astra /fediso FEDIN message     # Fresh search\n`);
+    response.markdown(`@astra /fediso #5                # Use history item #5\n`);
+    response.markdown(`@astra /fediso #file payment.tal # Use specific files\n`);
     response.markdown(`\`\`\`\n`);
     response.markdown(`\n💡 *Custom domains can be registered programmatically*`);
 }
 
 /**
  * /domain - Run domain-specific analysis
+ * Syntax: /domain <domainKey> <topic> | /domain <domainKey> #N | /domain <domainKey> #file a.tal
  * @param {string} domainKeyOrQuery - Domain key or "domainKey query"
  * @param {string} additionalQuery - Additional query if domain key is separate
  */
@@ -493,7 +622,7 @@ async function handleDomainCommand(domainKeyOrQuery, additionalQuery, response, 
     let domainKey;
     let query;
     
-    if (additionalQuery) {
+    if (additionalQuery !== undefined && additionalQuery !== '') {
         // Called as /fediso or similar shortcut
         domainKey = domainKeyOrQuery;
         query = additionalQuery;
@@ -531,84 +660,83 @@ async function handleDomainCommand(domainKeyOrQuery, additionalQuery, response, 
     
     outputChannel.appendLine(`Domain: ${domainKey}, Name: ${domainPrompt.name}`);
     
-    // Check for "files:" syntax
-    const filesMatch = query.match(/files?:\s*(.+)/i);
+    const input = parseCommandInput(query);
     let results;
     let searchTerm;
     
-    if (filesMatch) {
-        // Load specific files
-        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
-        results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
-        searchTerm = fileNames.join(', ');
-    } else if (query.trim()) {
-        // Search by user term + domain default terms
-        searchTerm = query.trim();
-        response.progress(`Finding code for ${domainPrompt.name}: ${searchTerm}...`);
-        
-        const searchTerms = [...(domainPrompt.searchTerms || []), ...searchTerm.split(/\s+/)];
-        results = [];
-        
-        for (const term of searchTerms) {
-            if (term.length < 3) continue;
-            const termResults = grepIndex.searchLiteral(term, { 
-                caseSensitive: false, 
-                maxResults: 15 
-            });
-            results.push(...termResults.results);
-        }
-        
-        // Dedupe
-        const seen = new Set();
-        results = results.filter(r => {
-            const key = `${r.file}:${r.line}`;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        }).slice(0, 40);
-    } else if (lastSearchResults && lastSearchResults.length > 0) {
-        // Use last results
-        results = lastSearchResults;
-        searchTerm = lastSearchTerm || 'previous search';
-        response.markdown(`*Applying ${domainPrompt.name} to results from: \`${searchTerm}\`*\n\n`);
-    } else {
-        // Default: search using domain's default search terms
-        response.progress(`Finding code for ${domainPrompt.name}...`);
-        searchTerm = (domainPrompt.searchTerms || []).join(' ') || domainKey;
-        
-        const searchTerms = domainPrompt.searchTerms || [domainKey];
-        results = [];
-        
-        for (const term of searchTerms) {
-            const termResults = grepIndex.searchLiteral(term, { 
-                caseSensitive: false, 
-                maxResults: 15 
-            });
-            results.push(...termResults.results);
-        }
-        
-        // Dedupe
-        const seen = new Set();
-        results = results.filter(r => {
-            const key = `${r.file}:${r.line}`;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        }).slice(0, 40);
+    switch (input.type) {
+        case 'files':
+            // #file a.tal, b.cbl
+            results = await loadSpecificFiles(input.value, workspaceRoot, outputChannel);
+            searchTerm = input.value.join(', ');
+            break;
+            
+        case 'history':
+            // #N - use history item (filter to legacy source)
+            const historyData = getHistoryResults(input.value, true);
+            if (historyData.error) {
+                response.markdown(`❌ ${historyData.error}`);
+                return;
+            }
+            results = historyData.results;
+            searchTerm = historyData.searchTerm;
+            response.markdown(`*Applying ${domainPrompt.name} to history #${input.value}: \`${searchTerm}\`*\n\n`);
+            break;
+            
+        case 'search':
+            // Fresh search with domain terms
+            searchTerm = input.value;
+            response.progress(`Finding code for ${domainPrompt.name}: ${searchTerm}...`);
+            
+            const searchTerms = [...(domainPrompt.searchTerms || []), ...searchTerm.split(/\s+/)];
+            results = [];
+            
+            for (const term of searchTerms) {
+                if (term.length < 3) continue;
+                const termResults = grepIndex.searchLiteral(term, { 
+                    caseSensitive: false, 
+                    maxResults: 15 
+                });
+                results.push(...termResults.results);
+            }
+            
+            // Dedupe
+            const seen = new Set();
+            results = results.filter(r => {
+                const key = `${r.file}:${r.line}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            }).slice(0, 40);
+            break;
+            
+        case 'empty':
+        default:
+            // Show usage
+            response.markdown(`**Usage:** \`@astra /${domainKey} <topic>\`\n\n`);
+            response.markdown('**Syntax:**\n');
+            response.markdown(`- \`/${domainKey} FEDIN message\` — Fresh search\n`);
+            response.markdown(`- \`/${domainKey} #5\` — Use results from history item #5\n`);
+            response.markdown(`- \`/${domainKey} #file payment.tal\` — Specific files\n`);
+            if (queryHistory.length > 0) {
+                const last = queryHistory[queryHistory.length - 1];
+                response.markdown(`\n💡 *Recent: #${last.id} \`${last.query}\` — use \`/${domainKey} #${last.id}\`*`);
+            }
+            return;
     }
     
     if (!results || results.length === 0) {
         response.markdown(`No code found for ${domainPrompt.name}.\n\nTry:\n`);
-        response.markdown(`- \`@astra /find ${(domainPrompt.searchTerms || [])[0] || domainKey}\` then \`@astra /domain ${domainKey}\`\n`);
-        response.markdown(`- \`@astra /domain ${domainKey} files: myfile.tal\`\n`);
+        response.markdown(`- \`@astra /find ${(domainPrompt.searchTerms || [])[0] || domainKey}\` then \`@astra /${domainKey} #N\`\n`);
+        response.markdown(`- \`@astra /${domainKey} #file myfile.tal\`\n`);
         return;
     }
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
-    // Save to history
+    // Save to history with cached results
     const uniqueFiles = [...new Set(results.map(r => r.file))];
-    addToHistory(domainKey, searchTerm, `${domainPrompt.name} for ${uniqueFiles.length} files`, uniqueFiles);
+    addToHistory(domainKey, searchTerm, `${domainPrompt.name} for ${uniqueFiles.length} files`, uniqueFiles, results);
     
     // Use domain-specific prompts
     const systemPrompt = domainPrompt.systemPrompt;
@@ -620,31 +748,52 @@ async function handleDomainCommand(domainKeyOrQuery, additionalQuery, response, 
 
 /**
  * /requirements or /extract - Extract business requirements in Gherkin format
+ * Syntax: /requirements <topic> | /requirements #N | /requirements #file a.tal
  */
 async function handleRequirementsCommand(query, response, outputChannel, workspaceRoot, token) {
-    // Check for "files:" syntax
-    const filesMatch = query.match(/files?:\s*(.+)/i);
+    const input = parseCommandInput(query);
     let results;
     let searchTerm;
     
-    if (filesMatch) {
-        // Load specific files
-        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
-        results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
-        searchTerm = fileNames.join(', ');
-    } else if (query.trim()) {
-        // Search by term
-        searchTerm = query.trim();
-        response.progress(`Extracting requirements for: ${searchTerm}...`);
-        results = searchCode(searchTerm, 50);
-    } else if (lastSearchResults && lastSearchResults.length > 0) {
-        // Use last results
-        results = lastSearchResults;
-        searchTerm = lastSearchTerm || 'previous search';
-        response.markdown(`*Extracting requirements from previous search: \`${searchTerm}\`*\n\n`);
-    } else {
-        response.markdown('**Usage:** `@astra /requirements <topic>`\n\n**Examples:**\n- `@astra /requirements wire transfer validation`\n- `@astra /requirements files: payment.tal`\n- First run `/find`, then `/requirements` to extract from those results');
-        return;
+    switch (input.type) {
+        case 'files':
+            // #file a.tal, b.cbl
+            results = await loadSpecificFiles(input.value, workspaceRoot, outputChannel);
+            searchTerm = input.value.join(', ');
+            break;
+            
+        case 'history':
+            // #N - use history item (filter to legacy source)
+            const historyData = getHistoryResults(input.value, true);
+            if (historyData.error) {
+                response.markdown(`❌ ${historyData.error}`);
+                return;
+            }
+            results = historyData.results;
+            searchTerm = historyData.searchTerm;
+            response.markdown(`*Extracting requirements from history #${input.value}: \`${searchTerm}\`*\n\n`);
+            break;
+            
+        case 'search':
+            // Fresh search
+            searchTerm = input.value;
+            response.progress(`Extracting requirements for: ${searchTerm}...`);
+            results = searchCode(searchTerm, 50);
+            break;
+            
+        case 'empty':
+        default:
+            // Show usage
+            response.markdown('**Usage:** `@astra /requirements <topic>`\n\n');
+            response.markdown('**Syntax:**\n');
+            response.markdown('- `/requirements wire transfer validation` — Fresh search\n');
+            response.markdown('- `/requirements #5` — Use results from history item #5\n');
+            response.markdown('- `/requirements #file payment.tal` — Specific files\n');
+            if (queryHistory.length > 0) {
+                const last = queryHistory[queryHistory.length - 1];
+                response.markdown(`\n💡 *Recent: #${last.id} \`${last.query}\` — use \`/requirements #${last.id}\`*`);
+            }
+            return;
     }
     
     if (!results || results.length === 0) {
@@ -654,9 +803,9 @@ async function handleRequirementsCommand(query, response, outputChannel, workspa
     
     const context = formatResultsForLLM(results, workspaceRoot);
     
-    // Save to history
+    // Save to history with cached results
     const uniqueFiles = [...new Set(results.map(r => r.file))];
-    addToHistory('requirements', searchTerm, `Extracted requirements from ${uniqueFiles.length} files`, uniqueFiles);
+    addToHistory('requirements', searchTerm, `Extracted requirements from ${uniqueFiles.length} files`, uniqueFiles, results);
     
     const systemPrompt = REQUIREMENTS_SYSTEM_PROMPT;
     const userPrompt = getRequirementsUserPrompt(searchTerm, context);
@@ -685,9 +834,9 @@ async function handleGeneralQuery(query, response, outputChannel, workspaceRoot,
     lastSearchResults = searchResults;
     lastSearchTerm = query;
     
-    // Save to history
+    // Save to history with cached results
     const uniqueFiles = [...new Set(searchResults.map(r => r.file))];
-    addToHistory(null, query, `Query answered from ${uniqueFiles.length} files`, uniqueFiles);
+    addToHistory(null, query, `Query answered from ${uniqueFiles.length} files`, uniqueFiles, searchResults);
 
     response.progress('Analyzing code...');
     const formattedContext = formatResultsForLLM(searchResults, workspaceRoot);
