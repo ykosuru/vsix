@@ -2,7 +2,7 @@
   "name": "astracode-copilot",
   "displayName": "AstraCode for Copilot Chat",
   "description": "Code search with function call tracking for GitHub Copilot Chat",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "publisher": "astracode",
   "engines": {
     "vscode": "^1.90.0"
@@ -66,6 +66,14 @@
           {
             "name": "help",
             "description": "Show help and usage"
+          },
+          {
+            "name": "history",
+            "description": "View last 25 queries and results"
+          },
+          {
+            "name": "use",
+            "description": "Reuse results from history (e.g., /use #5)"
           }
         ]
       }
