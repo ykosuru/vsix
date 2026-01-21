@@ -6,12 +6,13 @@ const {
     getDescribeUserPrompt,
     TRANSLATE_SYSTEM_PROMPT,
     getTranslateUserPrompt,
-    FEDISO_SYSTEM_PROMPT,
-    getFedIsoUserPrompt,
     REQUIREMENTS_SYSTEM_PROMPT,
     getRequirementsUserPrompt,
     GENERAL_SYSTEM_PROMPT,
     getGeneralUserPrompt,
+    getDomainPrompt,
+    hasDomainPrompt,
+    listDomainPrompts,
     HELP_TEXT
 } = require('./prompts');
 
@@ -119,7 +120,13 @@ function activate(context) {
                     return await handleTranslateCommand(query, response, outputChannel, workspaceRoot, token);
                 
                 case 'fediso':
-                    return await handleFedIsoCommand(query, response, outputChannel, workspaceRoot, token);
+                    return await handleDomainCommand('fediso', query, response, outputChannel, workspaceRoot, token);
+                
+                case 'domain':
+                    return await handleDomainCommand(query, '', response, outputChannel, workspaceRoot, token);
+                
+                case 'domains':
+                    return showDomains(response);
                 
                 case 'requirements':
                 case 'extract':
@@ -431,9 +438,81 @@ async function handleTranslateCommand(query, response, outputChannel, workspaceR
 }
 
 /**
- * /fediso - Uplift to Fed ISO 20022
+ * Show available domain prompts
  */
-async function handleFedIsoCommand(query, response, outputChannel, workspaceRoot, token) {
+function showDomains(response) {
+    const domains = listDomainPrompts();
+    
+    if (domains.length === 0) {
+        response.markdown('❌ No domain prompts registered.');
+        return;
+    }
+    
+    response.markdown(`# 🏢 Available Domain Prompts\n\n`);
+    response.markdown(`| Domain | Name | Description |\n`);
+    response.markdown(`|--------|------|-------------|\n`);
+    
+    for (const domain of domains) {
+        response.markdown(`| \`${domain.key}\` | ${domain.name} | ${domain.description} |\n`);
+    }
+    
+    response.markdown(`\n**Usage:**\n`);
+    response.markdown(`\`\`\`\n`);
+    response.markdown(`@astra /domain fediso             # Run fediso analysis\n`);
+    response.markdown(`@astra /domain swift files: x.tal # Run swift analysis on specific files\n`);
+    response.markdown(`@astra /fediso                    # Shortcut for /domain fediso\n`);
+    response.markdown(`\`\`\`\n`);
+    response.markdown(`\n💡 *Custom domains can be registered programmatically*`);
+}
+
+/**
+ * /domain - Run domain-specific analysis
+ * @param {string} domainKeyOrQuery - Domain key or "domainKey query"
+ * @param {string} additionalQuery - Additional query if domain key is separate
+ */
+async function handleDomainCommand(domainKeyOrQuery, additionalQuery, response, outputChannel, workspaceRoot, token) {
+    // Parse domain key and query
+    let domainKey;
+    let query;
+    
+    if (additionalQuery) {
+        // Called as /fediso or similar shortcut
+        domainKey = domainKeyOrQuery;
+        query = additionalQuery;
+    } else {
+        // Called as /domain fediso <query>
+        const parts = domainKeyOrQuery.trim().split(/\s+/);
+        domainKey = parts[0];
+        query = parts.slice(1).join(' ');
+    }
+    
+    if (!domainKey) {
+        response.markdown('**Usage:** `@astra /domain <domain> [query]`\n\n');
+        response.markdown('**Available domains:**\n');
+        const domains = listDomainPrompts();
+        for (const domain of domains) {
+            response.markdown(`- \`${domain.key}\` - ${domain.name}\n`);
+        }
+        response.markdown(`\nRun \`@astra /domains\` for full details.`);
+        return;
+    }
+    
+    // Look up domain prompt
+    const domainPrompt = getDomainPrompt(domainKey);
+    
+    if (!domainPrompt) {
+        response.markdown(`❌ **Domain prompt not found:** \`${domainKey}\`\n\n`);
+        response.markdown(`**Available domains:**\n`);
+        const domains = listDomainPrompts();
+        for (const domain of domains) {
+            response.markdown(`- \`${domain.key}\` - ${domain.name}\n`);
+        }
+        response.markdown(`\nRun \`@astra /domains\` for full details.`);
+        return;
+    }
+    
+    outputChannel.appendLine(`Domain: ${domainKey}, Name: ${domainPrompt.name}`);
+    
     // Check for "files:" syntax
     const filesMatch = query.match(/files?:\s*(.+)/i);
     let results;
@@ -445,15 +524,14 @@ async function handleFedIsoCommand(query, response, outputChannel, workspaceRoot
         results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
         searchTerm = fileNames.join(', ');
     } else if (query.trim()) {
-        // Search by term
+        // Search by user term + domain default terms
         searchTerm = query.trim();
-        response.progress(`Finding Fed wire code: ${searchTerm}...`);
+        response.progress(`Finding code for ${domainPrompt.name}: ${searchTerm}...`);
         
-        // Search for Fed-related terms plus user's term
-        const fedTerms = ['FEDIN', 'FEDOUT', 'FED', 'wire', 'transfer', ...searchTerm.split(/\s+/)];
+        const searchTerms = [...(domainPrompt.searchTerms || []), ...searchTerm.split(/\s+/)];
         results = [];
         
-        for (const term of fedTerms) {
+        for (const term of searchTerms) {
             if (term.length < 3) continue;
             const termResults = grepIndex.searchLiteral(term, { 
                 caseSensitive: false, 
@@ -474,16 +552,16 @@ async function handleFedIsoCommand(query, response, outputChannel, workspaceRoot
         // Use last results
         results = lastSearchResults;
         searchTerm = lastSearchTerm || 'previous search';
-        response.markdown(`*Applying Fed ISO 20022 uplift to results from: \`${searchTerm}\`*\n\n`);
+        response.markdown(`*Applying ${domainPrompt.name} to results from: \`${searchTerm}\`*\n\n`);
     } else {
-        // Default: search for common Fed terms
-        response.progress(`Finding Fed wire code...`);
-        searchTerm = 'FEDIN FEDOUT wire';
+        // Default: search using domain's default search terms
+        response.progress(`Finding code for ${domainPrompt.name}...`);
+        searchTerm = (domainPrompt.searchTerms || []).join(' ') || domainKey;
         
-        const fedTerms = ['FEDIN', 'FEDOUT', 'FED', 'wire', 'transfer'];
+        const searchTerms = domainPrompt.searchTerms || [domainKey];
         results = [];
         
-        for (const term of fedTerms) {
+        for (const term of searchTerms) {
             const termResults = grepIndex.searchLiteral(term, { 
                 caseSensitive: false, 
                 maxResults: 15 
@@ -502,7 +580,9 @@ async function handleFedIsoCommand(query, response, outputChannel, workspaceRoot
     }
     
     if (!results || results.length === 0) {
-        response.markdown(`No Fed wire code found.\n\nTry:\n- \`@astra /find FEDIN\` then \`@astra /fediso\`\n- \`@astra /fediso files: wire-msg.tal\``);
+        response.markdown(`No code found for ${domainPrompt.name}.\n\nTry:\n`);
+        response.markdown(`- \`@astra /find ${(domainPrompt.searchTerms || [])[0] || domainKey}\` then \`@astra /domain ${domainKey}\`\n`);
+        response.markdown(`- \`@astra /domain ${domainKey} files: myfile.tal\`\n`);
         return;
     }
     
@@ -510,10 +590,11 @@ async function handleFedIsoCommand(query, response, outputChannel, workspaceRoot
     
     // Save to history
     const uniqueFiles = [...new Set(results.map(r => r.file))];
-    addToHistory('fediso', searchTerm, `Fed ISO 20022 uplift for ${uniqueFiles.length} files`, uniqueFiles);
+    addToHistory(domainKey, searchTerm, `${domainPrompt.name} for ${uniqueFiles.length} files`, uniqueFiles);
     
-    const systemPrompt = FEDISO_SYSTEM_PROMPT;
-    const userPrompt = getFedIsoUserPrompt(context);
+    // Use domain-specific prompts
+    const systemPrompt = domainPrompt.systemPrompt;
+    const userPrompt = domainPrompt.getUserPrompt(context);
 
     await streamLLMResponse(systemPrompt, userPrompt, response, outputChannel, token);
     appendFileReferences(results, workspaceRoot, response);
