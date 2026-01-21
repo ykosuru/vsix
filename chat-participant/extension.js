@@ -16,6 +16,41 @@ function activate(context) {
     const participant = vscode.chat.createChatParticipant(PARTICIPANT_ID, async (request, chatContext, response, token) => {
         const query = request.prompt;
         outputChannel.appendLine(`\n=== New Query: ${query} ===`);
+        
+        // Handle /clear command
+        if (request.command === 'clear') {
+            grepIndex = null;
+            indexedWorkspace = null;
+            outputChannel.appendLine('Index cleared');
+            response.markdown('🗑️ **Index cleared.** Next query will rebuild fresh from workspace files.');
+            return;
+        }
+        
+        // Handle /rebuild command
+        if (request.command === 'rebuild') {
+            grepIndex = null;
+            indexedWorkspace = null;
+            outputChannel.appendLine('Forcing index rebuild...');
+            response.progress('Rebuilding index from scratch...');
+            // Fall through to normal query handling which will rebuild
+        }
+        
+        // Handle /stats command
+        if (request.command === 'stats') {
+            if (grepIndex) {
+                const stats = grepIndex.getStats();
+                response.markdown(`📊 **Index Statistics**\n\n`);
+                response.markdown(`- **Files indexed:** ${stats.files}\n`);
+                response.markdown(`- **Total lines:** ${stats.totalLines.toLocaleString()}\n`);
+                response.markdown(`- **Unique functions:** ${stats.uniqueFunctions.toLocaleString()}\n`);
+                response.markdown(`- **Call sites tracked:** ${stats.indexedCalls.toLocaleString()}\n`);
+                response.markdown(`- **Build time:** ${stats.buildTime}ms\n`);
+                response.markdown(`- **Last updated:** ${stats.lastUpdated?.toLocaleTimeString() || 'N/A'}\n`);
+            } else {
+                response.markdown('⚠️ No index built yet. Run a query to build the index.');
+            }
+            return;
+        }
 
         try {
             const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
