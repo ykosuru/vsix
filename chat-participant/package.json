@@ -1,88 +1,40 @@
 {
-  "name": "astracode-copilot",
-  "displayName": "AstraCode for Copilot Chat",
-  "description": "Code search with function call tracking for GitHub Copilot Chat",
-  "version": "0.7.0",
-  "publisher": "astracode",
+  "name": "astracode",
+  "version": "0.5.0",
+  "description": "AI-powered code analysis for legacy system modernization",
+  "main": "extension.js",
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.85.0"
   },
-  "extensionDependencies": [
-    "github.copilot-chat"
-  ],
-  "activationEvents": [
-    "onStartupFinished"
-  ],
-  "categories": [
-    "Programming Languages",
-    "Chat"
-  ],
-  "main": "./out/extension.js",
+  "dependencies": {
+    "pdf-parse": "^1.1.1",
+    "xlsx": "^0.18.5",
+    "mammoth": "^1.6.0"
+  },
   "contributes": {
     "chatParticipants": [
       {
         "id": "astracode.chat",
         "name": "astra",
-        "fullName": "AstraCode",
-        "description": "Search code with function call tracking - answers 'who calls X?' queries",
-        "isSticky": false,
+        "description": "Code analysis and documentation",
+        "isSticky": true,
         "commands": [
-          {
-            "name": "find",
-            "description": "Search for code by keyword"
-          },
-          {
-            "name": "describe",
-            "description": "Describe functionality of code"
-          },
-          {
-            "name": "translate",
-            "description": "Translate TAL to Java"
-          },
-          {
-            "name": "fediso",
-            "description": "Uplift to Fed ISO 20022"
-          },
-          {
-            "name": "domain",
-            "description": "Run domain-specific analysis (e.g., /domain swift)"
-          },
-          {
-            "name": "domains",
-            "description": "List available domain prompts"
-          },
-          {
-            "name": "requirements",
-            "description": "Extract business requirements from code"
-          },
-          {
-            "name": "extract",
-            "description": "Alias for /requirements"
-          },
-          {
-            "name": "stats",
-            "description": "Show index statistics"
-          },
-          {
-            "name": "clear",
-            "description": "Clear index (fresh start, no accumulated context)"
-          },
-          {
-            "name": "rebuild",
-            "description": "Force rebuild the code index"
-          },
-          {
-            "name": "help",
-            "description": "Show help and usage"
-          },
-          {
-            "name": "history",
-            "description": "View last 25 queries and results"
-          },
-          {
-            "name": "use",
-            "description": "Reuse results from history (e.g., /use #5)"
-          }
+          { "name": "find", "description": "Search for code" },
+          { "name": "describe", "description": "Describe code functionality" },
+          { "name": "deepwiki", "description": "Generate DeepWiki documentation" },
+          { "name": "translate", "description": "Translate code to Java" },
+          { "name": "requirements", "description": "Extract requirements (Gherkin)" },
+          { "name": "domain", "description": "Run domain-specific analysis" },
+          { "name": "domains", "description": "List domain prompts" },
+          { "name": "fediso", "description": "Fed ISO 20022 analysis" },
+          { "name": "history", "description": "View query history" },
+          { "name": "generated", "description": "List generated files" },
+          { "name": "clean", "description": "Delete generated files" },
+          { "name": "docs", "description": "Document indexing status" },
+          { "name": "stats", "description": "Index statistics" },
+          { "name": "clear", "description": "Clear index" },
+          { "name": "rebuild", "description": "Rebuild index" },
+          { "name": "help", "description": "Show help" }
         ]
       }
     ]
