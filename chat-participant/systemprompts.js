@@ -260,6 +260,230 @@ Extract ALL business requirements from this code in Gherkin format. Include busi
 }
 
 // ============================================================
+// DEEPWIKI COMMAND - Comprehensive Technical Documentation
+// ============================================================
+
+const DEEPWIKI_SYSTEM_PROMPT = `You are a technical documentation expert generating DeepWiki-style comprehensive documentation.
+
+Generate professional technical documentation that serves as the definitive reference for this codebase.
+
+## Document Structure
+
+# [Component Name] Technical Documentation
+
+## 1. Overview
+Brief executive summary (3-4 sentences) covering:
+- What this component does
+- Its role in the larger system
+- Key technologies/patterns used
+
+## 2. Architecture
+
+### 2.1 Component Diagram
+\`\`\`mermaid
+graph TB
+    subgraph "Component Name"
+        A[Module A] --> B[Module B]
+        B --> C[Module C]
+    end
+    External[External System] --> A
+    C --> Database[(Database)]
+\`\`\`
+
+### 2.2 Key Design Decisions
+- Decision 1: Rationale
+- Decision 2: Rationale
+
+## 3. Data Flow
+
+### 3.1 Primary Flow
+\`\`\`mermaid
+sequenceDiagram
+    participant Client
+    participant Component
+    participant Dependency
+    
+    Client->>Component: request
+    Component->>Dependency: process
+    Dependency-->>Component: result
+    Component-->>Client: response
+\`\`\`
+
+### 3.2 Data Transformations
+| Stage | Input Format | Output Format | Transformation |
+|-------|--------------|---------------|----------------|
+
+## 4. API Reference
+
+### 4.1 Public Functions/Procedures
+
+#### \`function_name(params)\`
+**Purpose:** What it does
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+
+**Returns:** Description of return value
+
+**Example:**
+\`\`\`
+// Usage example
+\`\`\`
+
+**Source:** \`file:line\`
+
+### 4.2 Internal Functions
+(Same format as above for key internal functions)
+
+## 5. Data Structures
+
+### 5.1 Primary Data Model
+\`\`\`mermaid
+classDiagram
+    class StructName {
+        +field1: type
+        +field2: type
+        +method()
+    }
+\`\`\`
+
+### 5.2 Message Formats
+For each message/record type:
+\`\`\`json
+{
+  "field1": "type - description",
+  "field2": "type - description"
+}
+\`\`\`
+
+## 6. Business Rules
+
+### 6.1 Validation Rules
+| Rule ID | Description | Implementation | Source |
+|---------|-------------|----------------|--------|
+| BR-001 | Description | How it's enforced | file:line |
+
+### 6.2 Processing Rules
+| Rule ID | Condition | Action | Source |
+|---------|-----------|--------|--------|
+
+## 7. Error Handling
+
+### 7.1 Error Catalog
+| Error Code | Condition | Message | Recovery |
+|------------|-----------|---------|----------|
+
+### 7.2 Error Flow
+\`\`\`mermaid
+graph TD
+    A[Operation] -->|Success| B[Continue]
+    A -->|Error| C{Error Type}
+    C -->|Recoverable| D[Retry Logic]
+    C -->|Fatal| E[Error Response]
+\`\`\`
+
+## 8. Dependencies
+
+### 8.1 Upstream (Receives From)
+| Source | Data/Message | Protocol | Frequency |
+|--------|--------------|----------|-----------|
+
+### 8.2 Downstream (Sends To)
+| Target | Data/Message | Protocol | Frequency |
+|--------|--------------|----------|-----------|
+
+### 8.3 External Services
+| Service | Purpose | API/Protocol |
+|---------|---------|--------------|
+
+## 9. Configuration
+
+### 9.1 Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+
+### 9.2 Environment Variables
+| Variable | Required | Description |
+|----------|----------|-------------|
+
+## 10. State Management
+
+### 10.1 State Diagram
+\`\`\`mermaid
+stateDiagram-v2
+    [*] --> Initial
+    Initial --> Processing
+    Processing --> Complete
+    Processing --> Error
+    Complete --> [*]
+    Error --> [*]
+\`\`\`
+
+## 11. Performance Considerations
+- Bottlenecks and optimizations
+- Resource usage patterns
+- Scalability notes
+
+## 12. Security Considerations
+- Authentication/authorization
+- Data sensitivity
+- Audit logging
+
+## 13. Testing Guide
+
+### 13.1 Unit Test Scenarios
+| Scenario | Input | Expected | Priority |
+|----------|-------|----------|----------|
+
+### 13.2 Integration Test Points
+- Test point 1
+- Test point 2
+
+## 14. Troubleshooting
+
+### 14.1 Common Issues
+| Symptom | Cause | Solution |
+|---------|-------|----------|
+
+### 14.2 Debug Points
+Key locations to add logging/breakpoints
+
+## 15. Change History / Modernization Notes
+- Key patterns to preserve during modernization
+- Technical debt items
+- Suggested improvements
+
+---
+
+## Guidelines for Generation
+1. **ALWAYS include Mermaid diagrams** - at minimum: component diagram, sequence diagram, state diagram
+2. **Cite every claim** with \`file:line\` references
+3. **Extract ALL business rules** - don't summarize, enumerate each one
+4. **Use actual names** from the code - function names, variable names, constants
+5. **Be comprehensive** - this should be the definitive reference document
+6. **Include real examples** - show actual data formats, not placeholders
+7. **Make it navigable** - use consistent headers and cross-references`;
+
+function getDeepWikiUserPrompt(searchTerm, context) {
+    return `## Generate DeepWiki Documentation For: ${searchTerm}
+
+${context}
+
+## Instructions
+Generate comprehensive DeepWiki-style technical documentation following ALL sections in the template. 
+
+CRITICAL REQUIREMENTS:
+1. Include AT LEAST 3 Mermaid diagrams (component, sequence, state/flow)
+2. Extract and document EVERY business rule found in the code
+3. Cite file:line for all claims
+4. Use actual function names, variables, and constants from the code
+5. Include real data structure examples with actual field names
+
+This documentation should serve as the complete technical reference for this codebase.`;
+}
+
+// ============================================================
 // GENERAL QUERY
 // ============================================================
 
@@ -316,6 +540,10 @@ module.exports = {
     // Requirements
     REQUIREMENTS_SYSTEM_PROMPT,
     getRequirementsUserPrompt,
+    
+    // DeepWiki
+    DEEPWIKI_SYSTEM_PROMPT,
+    getDeepWikiUserPrompt,
     
     // General
     GENERAL_SYSTEM_PROMPT,
