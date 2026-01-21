@@ -2,7 +2,7 @@
   "name": "astracode-copilot",
   "displayName": "AstraCode for Copilot Chat",
   "description": "Code search with function call tracking for GitHub Copilot Chat",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "astracode",
   "engines": {
     "vscode": "^1.90.0"
@@ -42,6 +42,14 @@
           {
             "name": "fediso",
             "description": "Uplift to Fed ISO 20022"
+          },
+          {
+            "name": "domain",
+            "description": "Run domain-specific analysis (e.g., /domain swift)"
+          },
+          {
+            "name": "domains",
+            "description": "List available domain prompts"
           },
           {
             "name": "requirements",
