@@ -245,10 +245,23 @@ const HELP_TEXT = `# 🔍 AstraCode Help
 | \`/fediso\` | Uplift to Fed ISO 20022 | \`@astra /fediso FEDIN message\` |
 | \`/requirements\` | Extract business requirements | \`@astra /requirements wire transfer\` |
 | \`/extract\` | Alias for /requirements | \`@astra /extract validation rules\` |
+| \`/history\` | View last 25 queries | \`@astra /history\` |
+| \`/use\` | Reuse results from history | \`@astra /use #5\` |
 | \`/stats\` | Show index statistics | \`@astra /stats\` |
 | \`/clear\` | Clear index (fresh start) | \`@astra /clear\` |
 | \`/rebuild\` | Force rebuild index | \`@astra /rebuild\` |
 | \`/help\` | Show this help | \`@astra /help\` |
+
+## History & Reuse
+
+View your recent queries and reuse their results:
+
+\`\`\`
+@astra /history                  # View last 25 queries
+@astra /history #5               # View details of query #5
+@astra /use #5                   # Load results from query #5
+@astra /translate                # Now works on loaded results
+\`\`\`
 
 ## Specifying Files
 
@@ -295,6 +308,8 @@ Without a command, AstraCode answers code questions:
 @astra /requirements                 # Step 3: Extract requirements
 @astra /translate                    # Step 4: Convert to Java
 @astra /fediso                       # Step 5: Apply ISO 20022 mapping
+@astra /history                      # View all your queries
+@astra /use #1                       # Go back to step 1 results
 \`\`\`
 `;
 
