@@ -1,33 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
-  <Metadata>
-    <Identity Language="en-US" Id="astracode" Version="5.0.0" Publisher="astracode" />
-    <DisplayName>AstraCode</DisplayName>
-    <Description xml:space="preserve">AI-powered code analysis for legacy system modernization. Features intelligent code search, TAL/COBOL parsing, semantic analysis, and LLM-powered code understanding.</Description>
-    <Tags>ai,code-analysis,legacy,modernization,tal,cobol,copilot,gpt,claude,code-search,semantic-search</Tags>
-    <Categories>Programming Languages,Machine Learning,Other</Categories>
-    <GalleryFlags>Public</GalleryFlags>
-    <Badges></Badges>
-    <Properties>
-      <Property Id="Microsoft.VisualStudio.Code.Engine" Value="^1.80.0" />
-      <Property Id="Microsoft.VisualStudio.Code.ExtensionDependencies" Value="" />
-      <Property Id="Microsoft.VisualStudio.Code.ExtensionPack" Value="" />
-      <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="workspace" />
-      <Property Id="Microsoft.VisualStudio.Code.LocalizedLanguages" Value="" />
-      <Property Id="Microsoft.VisualStudio.Services.GitHubFlavoredMarkdown" Value="true" />
-    </Properties>
-    <License>extension/LICENSE</License>
-    <Icon>extension/icon.png</Icon>
-  </Metadata>
-  <Installation>
-    <InstallationTarget Id="Microsoft.VisualStudio.Code"/>
-  </Installation>
-  <Dependencies/>
-  <Assets>
-    <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true" />
-    <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true" />
-    <Asset Type="Microsoft.VisualStudio.Services.Content.Changelog" Path="extension/CHANGELOG.md" Addressable="true" />
-    <Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="extension/LICENSE" Addressable="true" />
-    <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/icon.png" Addressable="true" />
-  </Assets>
+    <Metadata>
+        <Identity Language="en-US" Id="astracode" Version="0.5.0" Publisher="astracode"/>
+        <DisplayName>AstraCode</DisplayName>
+        <Description xml:space="preserve">AI-powered code analysis for legacy system modernization</Description>
+        <Tags>copilot,chat,code analysis,TAL,COBOL,legacy,modernization</Tags>
+        <Categories>Chat,Programming Languages,Other</Categories>
+        <GalleryFlags>Public</GalleryFlags>
+        <Properties>
+            <Property Id="Microsoft.VisualStudio.Code.Engine" Value="^1.90.0"/>
+            <Property Id="Microsoft.VisualStudio.Code.ExtensionDependencies" Value="github.copilot-chat"/>
+            <Property Id="Microsoft.VisualStudio.Code.ExtensionPack" Value=""/>
+            <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="workspace"/>
+            <Property Id="Microsoft.VisualStudio.Code.LocalizedLanguages" Value=""/>
+        </Properties>
+    </Metadata>
+    <Installation>
+        <InstallationTarget Id="Microsoft.VisualStudio.Code"/>
+    </Installation>
+    <Dependencies/>
+    <Assets>
+        <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
+    </Assets>
 </PackageManifest>
