@@ -1,17 +1,23 @@
 {
   "name": "astracode",
+  "displayName": "AstraCode",
+  "publisher": "your-publisher-id",
   "version": "0.5.0",
   "description": "AI-powered code analysis for legacy system modernization",
   "main": "extension.js",
   "engines": {
     "vscode": "^1.85.0"
   },
-  "activationEvents": ["onStartupFinished"],
+  "categories": ["Chat"],
+  "activationEvents": [
+    "onChatParticipant:astracode.chat"
+  ],
   "contributes": {
     "chatParticipants": [
       {
         "id": "astracode.chat",
         "name": "astra",
+        "fullName": "AstraCode",
         "description": "Code analysis and documentation",
         "isSticky": true,
         "commands": [
