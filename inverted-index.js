@@ -1,194 +1,46 @@
 /**
- * AstraCode Inverted Index Module v5.1
+ * AstraCode Enhanced Inverted Index
  * 
- * Fast keyword-based search across code content, summaries, and symbols.
- * Provides O(1) lookup for "find all code mentioning X".
+ * Integrates with KeywordLearner to use dynamically learned vocabulary
+ * instead of hardcoded synonym lists.
  * 
- * Index Types:
- * 1. Content Index - Keywords from actual code
- * 2. Summary Index - Keywords from function/file summaries
- * 3. Symbol Index - Function/class/variable names
- * 4. Concept Index - Domain concepts and business terms
- * 
- * Usage:
- *   const { InvertedIndex } = require('./inverted-index');
- *   const index = new InvertedIndex();
- *   index.buildFromCodebase(contextFiles, codeIndex);
- *   const results = index.search('payment validation');
+ * Key Differences from Original:
+ * 1. No hardcoded STOP_WORDS - learned from codebase
+ * 2. No hardcoded synonym groups - learned from co-occurrence
+ * 3. Term weights based on learned importance
+ * 4. Domain-aware query expansion
  */
 
+const { KeywordLearner } = require('./keyword-learner');
+const pathUtils = require('./pathUtils');
+
 // ============================================================
-// STOP WORDS - Common words to exclude from indexing
+// MINIMAL BOOTSTRAP STOP WORDS
+// Only truly universal terms that should never be indexed
+// Everything else is learned from the codebase
 // ============================================================
 
-const STOP_WORDS = new Set([
-    // English
-    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
-    'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-    'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought',
-    'used', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it',
-    'we', 'they', 'what', 'which', 'who', 'whom', 'whose', 'where', 'when',
-    'why', 'how', 'all', 'each', 'every', 'both', 'few', 'more', 'most',
-    'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same',
-    'so', 'than', 'too', 'very', 'just', 'also', 'now', 'here', 'there',
-    
-    // Code-specific noise words
-    'function', 'return', 'if', 'else', 'for', 'while', 'do', 'switch',
-    'case', 'break', 'continue', 'default', 'try', 'catch', 'finally',
-    'throw', 'throws', 'new', 'class', 'interface', 'extends', 'implements',
-    'public', 'private', 'protected', 'static', 'final', 'abstract',
-    'void', 'int', 'string', 'boolean', 'true', 'false', 'null', 'undefined',
-    'var', 'let', 'const', 'import', 'export', 'require', 'module',
-    'param', 'returns', 'type', 'todo', 'fixme', 'note', 'xxx',
-    
-    // Common variable names
-    'i', 'j', 'k', 'n', 'x', 'y', 'z', 'tmp', 'temp', 'val', 'value',
-    'key', 'index', 'count', 'result', 'results', 'data', 'item', 'items',
-    'arr', 'array', 'list', 'map', 'set', 'obj', 'object', 'str', 'num'
+const BOOTSTRAP_STOP_WORDS = new Set([
+    // Single letters
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    // Articles only (other words might be important in code)
+    'the', 'an'
 ]);
-
-// ============================================================
-// TERM EXTRACTION
-// ============================================================
-
-/**
- * Extract indexable terms from text
- * @param {string} text - Text to extract terms from
- * @param {Object} options - Extraction options
- * @returns {Map<string, number>} Term -> frequency map
- */
-function extractTerms(text, options = {}) {
-    const {
-        minLength = 2,
-        maxLength = 50,
-        includeNumbers = false,
-        splitCamelCase = true,
-        splitSnakeCase = true,
-        lowercase = true
-    } = options;
-    
-    const termFreq = new Map();
-    
-    if (!text || typeof text !== 'string') return termFreq;
-    
-    // Normalize text
-    let normalized = text;
-    
-    // Split camelCase: processPayment -> process Payment
-    if (splitCamelCase) {
-        normalized = normalized.replace(/([a-z])([A-Z])/g, '$1 $2');
-    }
-    
-    // Split snake_case: process_payment -> process payment
-    if (splitSnakeCase) {
-        normalized = normalized.replace(/_/g, ' ');
-    }
-    
-    // Remove special characters, keep alphanumeric and spaces
-    normalized = normalized.replace(/[^a-zA-Z0-9\s]/g, ' ');
-    
-    // Split into words
-    const words = normalized.split(/\s+/);
-    
-    for (let word of words) {
-        if (lowercase) word = word.toLowerCase();
-        
-        // Skip if too short/long
-        if (word.length < minLength || word.length > maxLength) continue;
-        
-        // Skip numbers unless requested
-        if (!includeNumbers && /^\d+$/.test(word)) continue;
-        
-        // Skip stop words
-        if (STOP_WORDS.has(word.toLowerCase())) continue;
-        
-        // Add to frequency map
-        termFreq.set(word, (termFreq.get(word) || 0) + 1);
-    }
-    
-    return termFreq;
-}
-
-/**
- * Extract terms from code with language awareness
- * @param {string} code - Source code
- * @param {string} language - Programming language
- * @returns {Map<string, number>} Term -> frequency map
- */
-function extractCodeTerms(code, language) {
-    const termFreq = new Map();
-    
-    // Extract from comments (high value for understanding)
-    const commentPatterns = [
-        /\/\/(.+)$/gm,                    // Single-line //
-        /\/\*[\s\S]*?\*\//g,              // Multi-line /* */
-        /#(.+)$/gm,                        // Python/Shell #
-        /--(.+)$/gm,                       // SQL --
-        /\*(.+)$/gm,                       // COBOL *
-    ];
-    
-    for (const pattern of commentPatterns) {
-        let match;
-        while ((match = pattern.exec(code)) !== null) {
-            const commentTerms = extractTerms(match[1] || match[0], { minLength: 3 });
-            for (const [term, freq] of commentTerms) {
-                // Comments are weighted higher (2x)
-                termFreq.set(term, (termFreq.get(term) || 0) + freq * 2);
-            }
-        }
-    }
-    
-    // Extract from string literals (often contain business terms)
-    const stringPatterns = [
-        /"([^"]+)"/g,
-        /'([^']+)'/g,
-        /`([^`]+)`/g
-    ];
-    
-    for (const pattern of stringPatterns) {
-        let match;
-        while ((match = pattern.exec(code)) !== null) {
-            const stringTerms = extractTerms(match[1], { minLength: 3 });
-            for (const [term, freq] of stringTerms) {
-                // Strings weighted 1.5x
-                termFreq.set(term, (termFreq.get(term) || 0) + freq * 1.5);
-            }
-        }
-    }
-    
-    // Extract identifiers (function names, variables)
-    const identifierPattern = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
-    let match;
-    while ((match = identifierPattern.exec(code)) !== null) {
-        const idTerms = extractTerms(match[1], { minLength: 3 });
-        for (const [term, freq] of idTerms) {
-            termFreq.set(term, (termFreq.get(term) || 0) + freq);
-        }
-    }
-    
-    return termFreq;
-}
 
 // ============================================================
 // POSTING LIST
 // ============================================================
 
-/**
- * Posting entry - represents one occurrence of a term
- */
 class Posting {
     constructor(docId, docType, frequency, positions = [], metadata = {}) {
-        this.docId = docId;           // File path or symbol key
-        this.docType = docType;       // 'file', 'function', 'summary', 'comment'
-        this.frequency = frequency;   // Term frequency in this doc
-        this.positions = positions;   // Line numbers where term appears
-        this.metadata = metadata;     // Additional info (function name, etc.)
+        this.docId = docId;
+        this.docType = docType;
+        this.frequency = frequency;
+        this.positions = positions;
+        this.metadata = metadata;
     }
     
-    /**
-     * Calculate TF-IDF score
-     */
     tfidf(totalDocs, docsWithTerm) {
         const tf = Math.log(1 + this.frequency);
         const idf = Math.log(totalDocs / (1 + docsWithTerm));
@@ -197,33 +49,33 @@ class Posting {
 }
 
 // ============================================================
-// INVERTED INDEX
+// ENHANCED INVERTED INDEX
 // ============================================================
 
-/**
- * Main inverted index class
- */
-class InvertedIndex {
+class EnhancedInvertedIndex {
     constructor(options = {}) {
         this.options = {
             minTermLength: 2,
             maxTermLength: 50,
-            enableStemming: false,      // Future: add stemming
-            enableSynonyms: true,       // Enable synonym expansion
-            boostComments: 2.0,         // Weight for comment terms
-            boostSummaries: 3.0,        // Weight for summary terms
-            boostSymbols: 2.5,          // Weight for symbol names
+            enableStemming: true,
+            enableLearnedSynonyms: true,
+            boostComments: 2.0,
+            boostSummaries: 3.0,
+            boostSymbols: 2.5,
             ...options
         };
         
         // Main index: term -> Posting[]
         this.index = new Map();
         
-        // Document metadata: docId -> {path, type, name, summary, ...}
+        // Document metadata
         this.documents = new Map();
         
         // Reverse index: docId -> Set<terms>
         this.docTerms = new Map();
+        
+        // Keyword learner instance
+        this.keywordLearner = new KeywordLearner();
         
         // Statistics
         this.stats = {
@@ -235,139 +87,239 @@ class InvertedIndex {
             indexedSummaries: 0,
             lastUpdated: null
         };
-        
-        // Synonym map for concept expansion
-        this.synonyms = new Map();
-        this._initSynonyms();
-        
-        // Concept clusters (related terms)
-        this.concepts = new Map();
     }
     
     /**
-     * Initialize common synonyms/related terms
+     * Build index from codebase with vocabulary learning
      */
-    _initSynonyms() {
-        const synonymGroups = [
-            // Authentication/Authorization
-            ['auth', 'authentication', 'login', 'signin', 'signon', 'credential', 'password', 'token', 'jwt', 'oauth', 'session'],
-            ['authorize', 'authorization', 'permission', 'access', 'role', 'privilege', 'acl'],
-            
-            // Data operations
-            ['create', 'insert', 'add', 'new', 'post'],
-            ['read', 'get', 'fetch', 'retrieve', 'query', 'select', 'find', 'lookup'],
-            ['update', 'modify', 'edit', 'change', 'put', 'patch', 'set'],
-            ['delete', 'remove', 'drop', 'destroy', 'clear', 'purge'],
-            
-            // Validation
-            ['validate', 'validation', 'verify', 'check', 'assert', 'ensure', 'sanitize'],
-            ['error', 'exception', 'failure', 'invalid', 'fault', 'problem'],
-            
-            // Payment/Financial
-            ['payment', 'pay', 'transaction', 'transfer', 'remittance', 'wire'],
-            ['amount', 'balance', 'total', 'sum', 'money', 'currency', 'fund'],
-            ['account', 'acct', 'customer', 'client', 'party', 'beneficiary'],
-            ['bank', 'financial', 'institution', 'fi'],
-            
-            // Processing
-            ['process', 'handle', 'execute', 'run', 'perform', 'do'],
-            ['parse', 'extract', 'decode', 'deserialize', 'unmarshal'],
-            ['format', 'encode', 'serialize', 'marshal', 'convert', 'transform'],
-            
-            // Configuration
-            ['config', 'configuration', 'settings', 'options', 'preferences', 'params'],
-            ['init', 'initialize', 'setup', 'bootstrap', 'start', 'begin'],
-            
-            // Data structures
-            ['message', 'msg', 'request', 'req', 'payload', 'body'],
-            ['response', 'resp', 'reply', 'result', 'output'],
-            ['record', 'row', 'entry', 'item', 'entity', 'document', 'doc'],
-            ['field', 'column', 'attribute', 'property', 'prop'],
-            
-            // Legacy/Mainframe
-            ['cobol', 'copybook', 'cpy', 'mainframe', 'legacy'],
-            ['tal', 'tandem', 'nonstop', 'guardian', 'pathway'],
-            ['procedure', 'proc', 'subproc', 'paragraph', 'section'],
-            
-            // Messaging
-            ['queue', 'mq', 'message', 'publish', 'subscribe', 'event'],
-            ['send', 'emit', 'dispatch', 'transmit', 'post'],
-            ['receive', 'consume', 'listen', 'handle', 'subscribe'],
-            
-            // Database
-            ['database', 'db', 'sql', 'table', 'schema'],
-            ['index', 'idx', 'key', 'primary', 'foreign'],
-            ['join', 'relation', 'link', 'reference', 'fk'],
-            
-            // API/Network
-            ['api', 'endpoint', 'route', 'url', 'uri', 'path'],
-            ['http', 'https', 'rest', 'soap', 'grpc'],
-            ['request', 'req', 'call', 'invoke'],
-            
-            // File operations
-            ['file', 'document', 'attachment', 'blob'],
-            ['read', 'load', 'open', 'input'],
-            ['write', 'save', 'store', 'output', 'persist']
-        ];
+    async buildFromCodebase(contextFiles, codeIndex, options = {}) {
+        const { log = console.log, onProgress = null, verbose = false } = options;
+        const startTime = Date.now();
         
-        for (const group of synonymGroups) {
-            for (const term of group) {
-                if (!this.synonyms.has(term)) {
-                    this.synonyms.set(term, new Set());
+        this.clear();
+        
+        log('EnhancedInvertedIndex: Building with vocabulary learning...');
+        
+        // Phase 1: Learn vocabulary from codebase
+        await this.keywordLearner.learn(contextFiles, codeIndex, {
+            log: verbose ? log : () => {},
+            onProgress: (pct, msg) => onProgress?.(pct * 0.5, msg)
+        });
+        
+        if (verbose) {
+            log(`Learned vocabulary: ${this.keywordLearner.vocabulary.size} terms`);
+            log(`Learned synonyms: ${this.keywordLearner.synonymClusters.size} clusters`);
+            log(`Learned stop words: ${this.keywordLearner.learnedStopWords.size}`);
+        }
+        
+        // Phase 2: Build inverted index using learned vocabulary
+        let fileCount = 0;
+        const totalFiles = contextFiles.size;
+        
+        for (const [filePath, fileInfo] of contextFiles) {
+            this.addDocument(
+                `file:${filePath}`,
+                fileInfo.content,
+                'file',
+                {
+                    path: filePath,
+                    language: fileInfo.language,
+                    name: pathUtils.getFileName(filePath)
                 }
-                for (const related of group) {
-                    if (related !== term) {
-                        this.synonyms.get(term).add(related);
+            );
+            
+            fileCount++;
+            if (onProgress && fileCount % 50 === 0) {
+                onProgress(50 + (fileCount / totalFiles) * 25, 
+                    `Indexing files: ${fileCount}/${totalFiles}`);
+            }
+        }
+        
+        // Index symbols
+        let symbolCount = 0;
+        if (codeIndex?.symbols) {
+            for (const [key, symbol] of codeIndex.symbols) {
+                if (!key.includes('@')) continue;
+                
+                const content = [
+                    symbol.name,
+                    symbol.summary || '',
+                    symbol.signature || '',
+                    symbol.params || ''
+                ].join(' ');
+                
+                this.addDocument(
+                    `symbol:${key}`,
+                    content,
+                    'symbol',
+                    {
+                        name: symbol.name,
+                        type: symbol.type,
+                        file: symbol.file,
+                        line: symbol.line,
+                        signature: symbol.signature
                     }
-                }
-            }
-        }
-    }
-    
-    /**
-     * Get synonyms for a term
-     */
-    getSynonyms(term) {
-        const lower = term.toLowerCase();
-        return this.synonyms.get(lower) || new Set();
-    }
-    
-    /**
-     * Expand query with synonyms
-     */
-    expandQuery(query) {
-        const terms = extractTerms(query, { minLength: 2 });
-        const expanded = new Set(terms.keys());
-        
-        if (this.options.enableSynonyms) {
-            for (const term of terms.keys()) {
-                const syns = this.getSynonyms(term);
-                for (const syn of syns) {
-                    expanded.add(syn);
-                }
+                );
+                
+                symbolCount++;
             }
         }
         
-        return Array.from(expanded);
+        if (onProgress) onProgress(80, 'Indexing summaries...');
+        
+        // Index summaries
+        let summaryCount = 0;
+        if (codeIndex?.summaries) {
+            for (const [key, summaryInfo] of codeIndex.summaries) {
+                if (!summaryInfo.summary) continue;
+                
+                this.addDocument(
+                    `summary:${key}`,
+                    summaryInfo.summary,
+                    'summary',
+                    {
+                        name: summaryInfo.name,
+                        file: summaryInfo.file,
+                        symbolKey: key
+                    }
+                );
+                
+                summaryCount++;
+            }
+        }
+        
+        // Index file summaries
+        if (codeIndex?.fileSummaries) {
+            for (const [filePath, summary] of codeIndex.fileSummaries) {
+                if (!summary) continue;
+                
+                this.addDocument(
+                    `filesummary:${filePath}`,
+                    summary,
+                    'summary',
+                    {
+                        path: filePath,
+                        name: pathUtils.getFileName(filePath)
+                    }
+                );
+                
+                summaryCount++;
+            }
+        }
+        
+        this.stats.lastUpdated = new Date();
+        
+        const elapsed = Date.now() - startTime;
+        log(`EnhancedInvertedIndex built in ${elapsed}ms:`);
+        log(`  - ${fileCount} files`);
+        log(`  - ${symbolCount} symbols`);
+        log(`  - ${summaryCount} summaries`);
+        log(`  - ${this.index.size} unique terms`);
+        
+        if (onProgress) onProgress(100, 'Index complete');
+        
+        return this.getStats();
+    }
+    
+    /**
+     * Extract terms using learned vocabulary
+     */
+    extractTerms(text, options = {}) {
+        const {
+            minLength = this.options.minTermLength,
+            maxLength = this.options.maxTermLength
+        } = options;
+        
+        const termFreq = new Map();
+        if (!text || typeof text !== 'string') return termFreq;
+        
+        // Tokenize
+        let normalized = text
+            .replace(/([a-z])([A-Z])/g, '$1 $2')
+            .replace(/_/g, ' ')
+            .replace(/[^a-zA-Z0-9\s]/g, ' ')
+            .toLowerCase();
+        
+        const words = normalized.split(/\s+/);
+        
+        for (const word of words) {
+            if (word.length < minLength || word.length > maxLength) continue;
+            
+            // Skip bootstrap stop words
+            if (BOOTSTRAP_STOP_WORDS.has(word)) continue;
+            
+            // Skip learned stop words (if vocabulary is built)
+            if (this.keywordLearner.isStopWord(word)) continue;
+            
+            // Apply simple stemming
+            const stemmed = this._simpleStem(word);
+            if (stemmed.length < minLength) continue;
+            
+            termFreq.set(stemmed, (termFreq.get(stemmed) || 0) + 1);
+        }
+        
+        return termFreq;
+    }
+    
+    /**
+     * Simple porter-like stemming
+     */
+    _simpleStem(word) {
+        if (word.length < 4) return word;
+        
+        // Handle -ing
+        if (word.endsWith('ing') && word.length > 4) {
+            let stem = word.slice(0, -3);
+            if (stem.length > 2 && stem[stem.length - 1] === stem[stem.length - 2]) {
+                return stem.slice(0, -1);
+            }
+            if (stem.length >= 3) return stem;
+        }
+        
+        // Handle -ed
+        if (word.endsWith('ed') && word.length > 4) {
+            if (word.endsWith('ied')) return word.slice(0, -3) + 'y';
+            let stem = word.slice(0, -2);
+            if (stem.length > 2 && stem[stem.length - 1] === stem[stem.length - 2]) {
+                return stem.slice(0, -1);
+            }
+            return stem.length >= 2 ? stem : word;
+        }
+        
+        // Handle plurals
+        if (word.endsWith('ies') && word.length > 4) return word.slice(0, -3) + 'y';
+        if (word.endsWith('es') && word.length > 4) {
+            if (/[xsz]es$/.test(word) || /[sc]hes$/.test(word)) {
+                return word.slice(0, -2);
+            }
+        }
+        if (word.endsWith('s') && !word.endsWith('ss') && word.length > 3) {
+            return word.slice(0, -1);
+        }
+        
+        return word;
     }
     
     /**
      * Add a document to the index
      */
     addDocument(docId, content, docType, metadata = {}) {
-        // Extract terms based on document type
-        let termFreq;
-        if (docType === 'code' || docType === 'file') {
-            termFreq = extractCodeTerms(content, metadata.language);
-        } else {
-            termFreq = extractTerms(content, { minLength: this.options.minTermLength });
-        }
+        const termFreq = this.extractTerms(content);
         
         // Apply boost based on document type
         let boost = 1.0;
         if (docType === 'summary') boost = this.options.boostSummaries;
         else if (docType === 'symbol') boost = this.options.boostSymbols;
         else if (docType === 'comment') boost = this.options.boostComments;
+        
+        // Apply learned term weights
+        for (const [term, freq] of termFreq) {
+            const learnedWeight = this.keywordLearner.getTermWeight(term);
+            if (learnedWeight > 0) {
+                // Boost by learned importance (normalized)
+                termFreq.set(term, freq * (1 + Math.log(1 + learnedWeight) * 0.1));
+            }
+        }
         
         // Store document metadata
         this.documents.set(docId, {
@@ -408,199 +360,42 @@ class InvertedIndex {
     }
     
     /**
-     * Remove a document from the index
+     * Expand query using learned synonyms
      */
-    removeDocument(docId) {
-        const terms = this.docTerms.get(docId);
-        if (!terms) return;
+    expandQuery(query) {
+        const baseTerms = Array.from(this.extractTerms(query).keys());
         
-        // Remove from each posting list
-        for (const term of terms) {
-            const postings = this.index.get(term);
-            if (postings) {
-                const filtered = postings.filter(p => p.docId !== docId);
-                if (filtered.length > 0) {
-                    this.index.set(term, filtered);
-                } else {
-                    this.index.delete(term);
-                }
-            }
+        if (!this.options.enableLearnedSynonyms) {
+            return baseTerms;
         }
         
-        // Remove document metadata
-        this.documents.delete(docId);
-        this.docTerms.delete(docId);
-        
-        // Update stats
-        this.stats.totalDocuments--;
-        this.stats.uniqueTerms = this.index.size;
+        // Use keyword learner for expansion
+        return this.keywordLearner.expandQuery(query);
     }
     
     /**
-     * Build index from codebase
+     * Get learned synonyms for a term
      */
-    buildFromCodebase(contextFiles, codeIndex, options = {}) {
-        const { log = console.log, showProgress = () => {} } = options;
-        const startTime = Date.now();
-        
-        this.clear();
-        
-        log('Building inverted index...');
-        
-        // Index file contents
-        let fileCount = 0;
-        for (const [filePath, fileInfo] of contextFiles) {
-            showProgress(`Indexing ${fileCount + 1}/${contextFiles.size}: ${filePath}`);
-            
-            // Index file content
-            this.addDocument(
-                `file:${filePath}`,
-                fileInfo.content,
-                'file',
-                {
-                    path: filePath,
-                    language: fileInfo.language,
-                    name: filePath.split('/').pop()
-                }
-            );
-            
-            fileCount++;
-        }
-        
-        // Index symbols (functions, classes, etc.)
-        let symbolCount = 0;
-        for (const [key, symbol] of codeIndex.symbols) {
-            if (!key.includes('@')) continue;  // Skip non-qualified keys
-            
-            // Index symbol name and any summary
-            const content = [
-                symbol.name,
-                symbol.summary || '',
-                symbol.signature || '',
-                symbol.params || ''
-            ].join(' ');
-            
-            this.addDocument(
-                `symbol:${key}`,
-                content,
-                'symbol',
-                {
-                    name: symbol.name,
-                    type: symbol.type,
-                    file: symbol.file,
-                    line: symbol.line,
-                    signature: symbol.signature
-                }
-            );
-            
-            symbolCount++;
-        }
-        
-        // Index function summaries (from LLM)
-        let summaryCount = 0;
-        for (const [key, summaryInfo] of codeIndex.summaries) {
-            if (!summaryInfo.summary) continue;
-            
-            this.addDocument(
-                `summary:${key}`,
-                summaryInfo.summary,
-                'summary',
-                {
-                    name: summaryInfo.name,
-                    file: summaryInfo.file,
-                    symbolKey: key
-                }
-            );
-            
-            summaryCount++;
-        }
-        
-        // Index file summaries
-        for (const [filePath, summary] of codeIndex.fileSummaries) {
-            if (!summary) continue;
-            
-            this.addDocument(
-                `filesummary:${filePath}`,
-                summary,
-                'summary',
-                {
-                    path: filePath,
-                    name: filePath.split('/').pop()
-                }
-            );
-            
-            summaryCount++;
-        }
-        
-        // Build concept clusters
-        this._buildConceptClusters();
-        
-        this.stats.lastUpdated = new Date();
-        
-        const elapsed = Date.now() - startTime;
-        log(`Inverted index built in ${elapsed}ms:`);
-        log(`  - ${fileCount} files`);
-        log(`  - ${symbolCount} symbols`);
-        log(`  - ${summaryCount} summaries`);
-        log(`  - ${this.index.size} unique terms`);
-        
-        return this.stats;
-    }
-    
-    /**
-     * Build concept clusters from indexed terms
-     */
-    _buildConceptClusters() {
-        // Group terms that frequently co-occur
-        const cooccurrence = new Map();
-        
-        for (const [docId, terms] of this.docTerms) {
-            const termArray = Array.from(terms);
-            for (let i = 0; i < termArray.length; i++) {
-                for (let j = i + 1; j < termArray.length; j++) {
-                    const pair = [termArray[i], termArray[j]].sort().join('|');
-                    cooccurrence.set(pair, (cooccurrence.get(pair) || 0) + 1);
-                }
-            }
-        }
-        
-        // Find strongly related term pairs
-        for (const [pair, count] of cooccurrence) {
-            if (count >= 3) {  // Appears together in at least 3 docs
-                const [term1, term2] = pair.split('|');
-                
-                if (!this.concepts.has(term1)) {
-                    this.concepts.set(term1, new Set());
-                }
-                this.concepts.get(term1).add(term2);
-                
-                if (!this.concepts.has(term2)) {
-                    this.concepts.set(term2, new Set());
-                }
-                this.concepts.get(term2).add(term1);
-            }
-        }
+    getSynonyms(term) {
+        return this.keywordLearner.getSynonyms(term);
     }
     
     /**
      * Search the index
-     * @param {string} query - Search query
-     * @param {Object} options - Search options
-     * @returns {Array} Ranked results
      */
     search(query, options = {}) {
         const {
             maxResults = 50,
             minScore = 0.1,
-            docTypes = null,        // Filter by document type
+            docTypes = null,
             expandSynonyms = true,
-            includeContext = true
+            useLearnedWeights = true
         } = options;
         
         // Extract and expand query terms
-        const queryTerms = expandSynonyms ? 
-            this.expandQuery(query) : 
-            Array.from(extractTerms(query, { minLength: 2 }).keys());
+        const queryTerms = expandSynonyms 
+            ? this.expandQuery(query)
+            : Array.from(this.extractTerms(query).keys());
         
         if (queryTerms.length === 0) {
             return [];
@@ -608,21 +403,28 @@ class InvertedIndex {
         
         // Collect matching documents with scores
         const docScores = new Map();
-        const docMatches = new Map();  // Track which terms matched
+        const docMatches = new Map();
         
         for (const term of queryTerms) {
             const postings = this.index.get(term);
             if (!postings) continue;
             
+            // Get learned weight for this term
+            const termWeight = useLearnedWeights 
+                ? (this.keywordLearner.getTermWeight(term) || 1.0)
+                : 1.0;
+            
             for (const posting of postings) {
-                // Filter by document type if specified
                 if (docTypes && !docTypes.includes(posting.docType)) continue;
                 
-                // Calculate TF-IDF score
-                const tfidf = posting.tfidf(
+                // Calculate TF-IDF score with learned weight
+                let tfidf = posting.tfidf(
                     this.stats.totalDocuments,
                     postings.length
                 );
+                
+                // Apply learned term weight
+                tfidf *= (1 + Math.log(1 + termWeight) * 0.1);
                 
                 // Accumulate score
                 const currentScore = docScores.get(posting.docId) || 0;
@@ -644,7 +446,7 @@ class InvertedIndex {
             const docMeta = this.documents.get(docId);
             const matchedTerms = docMatches.get(docId);
             
-            // Boost score based on how many query terms matched
+            // Boost score based on term coverage
             const coverageBoost = matchedTerms.size / queryTerms.length;
             const finalScore = score * (1 + coverageBoost);
             
@@ -657,177 +459,90 @@ class InvertedIndex {
             });
         }
         
-        // Sort by score descending
         results.sort((a, b) => b.score - a.score);
-        
-        // Limit results
         return results.slice(0, maxResults);
     }
     
     /**
-     * Search for files containing query terms
+     * Search files only
      */
     searchFiles(query, options = {}) {
-        return this.search(query, {
-            ...options,
-            docTypes: ['file', 'code']
-        });
+        return this.search(query, { ...options, docTypes: ['file', 'code'] });
     }
     
     /**
-     * Search for functions/symbols matching query
+     * Search symbols only
      */
     searchSymbols(query, options = {}) {
-        return this.search(query, {
-            ...options,
-            docTypes: ['symbol', 'function']
-        });
+        return this.search(query, { ...options, docTypes: ['symbol', 'function'] });
     }
     
     /**
-     * Search summaries (best for concept queries)
+     * Search summaries only
      */
     searchSummaries(query, options = {}) {
-        return this.search(query, {
-            ...options,
-            docTypes: ['summary']
-        });
+        return this.search(query, { ...options, docTypes: ['summary'] });
     }
     
     /**
-     * Search for code related to a concept
-     * Combines summary search with file search
-     */
-    searchConcept(concept, options = {}) {
-        const { maxResults = 30 } = options;
-        
-        // First search summaries to understand what functions handle this concept
-        const summaryResults = this.searchSummaries(concept, { maxResults: 20 });
-        
-        // Then search files for direct mentions
-        const fileResults = this.searchFiles(concept, { maxResults: 20 });
-        
-        // Merge and deduplicate
-        const seen = new Set();
-        const merged = [];
-        
-        // Summaries first (better semantic match)
-        for (const r of summaryResults) {
-            const file = r.file || r.path;
-            if (file && !seen.has(file)) {
-                seen.add(file);
-                merged.push({
-                    ...r,
-                    matchType: 'summary',
-                    file
-                });
-            }
-        }
-        
-        // Then files
-        for (const r of fileResults) {
-            const file = r.path;
-            if (file && !seen.has(file)) {
-                seen.add(file);
-                merged.push({
-                    ...r,
-                    matchType: 'content',
-                    file
-                });
-            }
-        }
-        
-        return merged.slice(0, maxResults);
-    }
-    
-    /**
-     * Get related terms for a query (for query expansion/suggestions)
-     */
-    getRelatedTerms(query, maxTerms = 10) {
-        const queryTerms = Array.from(extractTerms(query, { minLength: 2 }).keys());
-        const related = new Map();
-        
-        for (const term of queryTerms) {
-            // Add synonyms
-            const syns = this.getSynonyms(term);
-            for (const syn of syns) {
-                related.set(syn, (related.get(syn) || 0) + 2);
-            }
-            
-            // Add co-occurring terms
-            const coterms = this.concepts.get(term);
-            if (coterms) {
-                for (const coterm of coterms) {
-                    if (!queryTerms.includes(coterm)) {
-                        related.set(coterm, (related.get(coterm) || 0) + 1);
-                    }
-                }
-            }
-        }
-        
-        // Sort by relevance
-        const sorted = Array.from(related.entries())
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, maxTerms)
-            .map(([term]) => term);
-        
-        return sorted;
-    }
-    
-    /**
-     * Suggest completions for a partial query
+     * Get related terms (autocomplete)
      */
     suggestCompletions(prefix, maxSuggestions = 10) {
-        const prefixLower = prefix.toLowerCase();
+        // Combine index terms with learned vocabulary
         const suggestions = [];
+        const prefixLower = prefix.toLowerCase();
         
+        // From learned vocabulary (weighted by importance)
+        const learned = this.keywordLearner.getRelatedTerms(prefixLower, maxSuggestions);
+        for (const item of learned) {
+            suggestions.push({
+                term: item.term,
+                score: item.weight,
+                source: 'learned'
+            });
+        }
+        
+        // From index (by document count)
         for (const term of this.index.keys()) {
-            if (term.startsWith(prefixLower)) {
+            if (term.startsWith(prefixLower) && !suggestions.find(s => s.term === term)) {
                 const postings = this.index.get(term);
                 suggestions.push({
                     term,
-                    docCount: postings.length,
-                    score: postings.reduce((sum, p) => sum + p.frequency, 0)
+                    score: postings.length,
+                    source: 'index'
                 });
             }
         }
         
-        // Sort by document count (more common terms first)
-        suggestions.sort((a, b) => b.docCount - a.docCount);
-        
+        suggestions.sort((a, b) => b.score - a.score);
         return suggestions.slice(0, maxSuggestions);
     }
     
     /**
-     * Get index statistics
+     * Get statistics
      */
     getStats() {
         return {
             ...this.stats,
-            memoryEstimate: this._estimateMemory()
+            learnedVocabularySize: this.keywordLearner.vocabulary.size,
+            learnedSynonymClusters: this.keywordLearner.synonymClusters.size,
+            learnedStopWords: this.keywordLearner.learnedStopWords.size,
+            domainConcepts: this.keywordLearner.domainConcepts.size
         };
     }
     
     /**
-     * Estimate memory usage
+     * Get domain concepts (for debugging/analysis)
      */
-    _estimateMemory() {
-        let bytes = 0;
-        
-        // Index entries
-        for (const [term, postings] of this.index) {
-            bytes += term.length * 2;  // String
-            bytes += postings.length * 100;  // Approximate posting size
-        }
-        
-        // Documents
-        bytes += this.documents.size * 200;  // Approximate doc metadata
-        
-        return {
-            bytes,
-            kb: Math.round(bytes / 1024),
-            mb: Math.round(bytes / (1024 * 1024) * 100) / 100
-        };
+    getDomainConcepts() {
+        return this.keywordLearner.getDomainConcepts();
+    }
+    
+    /**
+     * Get top terms (for debugging/analysis)
+     */
+    getTopTerms(n = 50) {
+        return this.keywordLearner.getTopTerms(n);
     }
     
     /**
@@ -837,7 +552,7 @@ class InvertedIndex {
         this.index.clear();
         this.documents.clear();
         this.docTerms.clear();
-        this.concepts.clear();
+        this.keywordLearner.clear();
         
         this.stats = {
             totalDocuments: 0,
@@ -851,11 +566,11 @@ class InvertedIndex {
     }
     
     /**
-     * Export index for persistence
+     * Export for persistence
      */
     export() {
         return {
-            version: '1.0',
+            version: '2.0',
             stats: this.stats,
             index: Array.from(this.index.entries()).map(([term, postings]) => [
                 term,
@@ -867,20 +582,19 @@ class InvertedIndex {
                 }))
             ]),
             documents: Array.from(this.documents.entries()),
-            concepts: Array.from(this.concepts.entries()).map(([k, v]) => [k, Array.from(v)])
+            learnedVocabulary: this.keywordLearner.export()
         };
     }
     
     /**
-     * Import index from persistence
+     * Import from persistence
      */
     import(data) {
-        if (!data || data.version !== '1.0') {
+        if (!data || !data.version) {
             throw new Error('Invalid index data format');
         }
         
         this.clear();
-        
         this.stats = data.stats;
         
         for (const [term, postings] of data.index) {
@@ -893,8 +607,9 @@ class InvertedIndex {
             this.documents.set(docId, meta);
         }
         
-        for (const [term, related] of data.concepts) {
-            this.concepts.set(term, new Set(related));
+        // Import learned vocabulary
+        if (data.learnedVocabulary) {
+            this.keywordLearner.import(data.learnedVocabulary);
         }
         
         // Rebuild docTerms
@@ -914,9 +629,8 @@ class InvertedIndex {
 // ============================================================
 
 module.exports = {
-    InvertedIndex,
+    InvertedIndex: EnhancedInvertedIndex,  // Backward compatible alias
+    EnhancedInvertedIndex,
     Posting,
-    extractTerms,
-    extractCodeTerms,
-    STOP_WORDS
+    BOOTSTRAP_STOP_WORDS
 };
