@@ -7,6 +7,8 @@ const PARTICIPANT_ID = 'astracode.chat';
 // Global grep index - persists across queries
 let grepIndex = null;
 let indexedWorkspace = null;
+let lastSearchResults = null;  // Store last search results for chaining
+let lastSearchTerm = null;     // Store last search term
 
 function activate(context) {
     const outputChannel = vscode.window.createOutputChannel('AstraCode');
@@ -72,6 +74,12 @@ function activate(context) {
         }
 
         try {
+            // Check for command chaining (e.g., "/find FEDIN then /translate then /fediso")
+            const chainMatch = query.match(/^(.+?)\s+then\s+\/(\w+)(.*)$/i);
+            if (chainMatch) {
+                return await handleChainedCommands(request.command, query, response, outputChannel, workspaceRoot, token);
+            }
+            
             // Route to command handlers
             switch (request.command) {
                 case 'find':
@@ -126,6 +134,35 @@ function showHelp(response) {
 | \`/rebuild\` | Force rebuild index | \`@astra /rebuild\` |
 | \`/help\` | Show this help | \`@astra /help\` |
 
+## Specifying Files
+
+You can specify files directly with any command:
+
+\`\`\`
+@astra /translate files: FEDIN.tal, FEDOUT.tal
+@astra /describe files: payment-validator.c
+@astra /fediso files: wire-msg.tal, fed-parse.tal
+\`\`\`
+
+## Command Chaining
+
+Run multiple operations in sequence:
+
+\`\`\`
+@astra /find account validation then /translate then /fediso
+@astra /find FEDIN then /describe then /requirements
+\`\`\`
+
+## Using Previous Results
+
+Commands without arguments use the last \`/find\` results:
+
+\`\`\`
+@astra /find FEDIN              # Find code first
+@astra /translate               # Translate what was found
+@astra /fediso                  # Apply ISO uplift to same code
+\`\`\`
+
 ## General Queries
 
 Without a command, AstraCode answers code questions:
@@ -134,11 +171,15 @@ Without a command, AstraCode answers code questions:
 - \`@astra explain partition pruning\`
 - \`@astra find usages of validateTransaction\`
 
-## Tips
+## Workflow Example
 
-- Use \`/clear\` to start fresh with no accumulated context
-- Use \`/find\` first to locate relevant code, then \`/describe\` or \`/translate\`
-- For Fed wire uplift: \`/find FEDIN\` → \`/describe\` → \`/fediso\`
+\`\`\`
+@astra /find account validation      # Step 1: Find relevant code
+@astra /describe                     # Step 2: Understand it
+@astra /requirements                 # Step 3: Extract requirements
+@astra /translate                    # Step 4: Convert to Java
+@astra /fediso                       # Step 5: Apply ISO 20022 mapping
+\`\`\`
 `);
 }
 
@@ -180,6 +221,10 @@ async function handleFindCommand(query, response, outputChannel, workspaceRoot, 
         return true;
     }).slice(0, 50);
     
+    // Save for chaining
+    lastSearchResults = results;
+    lastSearchTerm = searchTerm;
+    
     if (results.length === 0) {
         response.markdown(`No matches found for: \`${searchTerm}\`\n\nTry:\n- Different spelling\n- Partial term\n- \`@astra /rebuild\` to refresh index`);
         return;
@@ -187,6 +232,7 @@ async function handleFindCommand(query, response, outputChannel, workspaceRoot, 
     
     // Format results
     response.markdown(`## 🔍 Found ${results.length} matches for \`${searchTerm}\`\n\n`);
+    response.markdown(`💡 *Tip: Use \`@astra /translate\` or \`@astra /describe\` to work with these results*\n\n`);
     
     const byFile = groupByFile(results);
     for (const [file, fileResults] of byFile) {
@@ -205,16 +251,32 @@ async function handleFindCommand(query, response, outputChannel, workspaceRoot, 
  * /describe - Describe functionality of code
  */
 async function handleDescribeCommand(query, response, outputChannel, workspaceRoot, token) {
-    const searchTerm = query.trim();
-    if (!searchTerm) {
-        response.markdown('**Usage:** `@astra /describe <function or module>`\n\n**Examples:**\n- `@astra /describe FEDIN-PARSE`\n- `@astra /describe payment validation`');
+    // Check for "files:" syntax
+    const filesMatch = query.match(/files?:\s*(.+)/i);
+    let results;
+    let searchTerm;
+    
+    if (filesMatch) {
+        // Load specific files
+        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
+        results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
+        searchTerm = fileNames.join(', ');
+    } else if (query.trim()) {
+        // Search by term
+        searchTerm = query.trim();
+        response.progress(`Analyzing: ${searchTerm}...`);
+        results = searchCode(searchTerm, 40);
+    } else if (lastSearchResults && lastSearchResults.length > 0) {
+        // Use last results
+        results = lastSearchResults;
+        searchTerm = lastSearchTerm || 'previous search';
+        response.markdown(`*Using results from previous search: \`${searchTerm}\`*\n\n`);
+    } else {
+        response.markdown('**Usage:** `@astra /describe <function or module>`\n\n**Examples:**\n- `@astra /describe FEDIN-PARSE`\n- `@astra /describe files: payment.tal, validate.tal`\n- First run `/find`, then `/describe` to use those results');
         return;
     }
     
-    response.progress(`Analyzing: ${searchTerm}...`);
-    const results = searchCode(searchTerm, 40);
-    
-    if (results.length === 0) {
+    if (!results || results.length === 0) {
         response.markdown(`No code found for: \`${searchTerm}\``);
         return;
     }
@@ -247,13 +309,33 @@ Provide a clear description of this code's functionality.`;
  * /translate - Translate TAL to Java
  */
 async function handleTranslateCommand(query, response, outputChannel, workspaceRoot, token) {
-    const searchTerm = query.trim() || 'PROC';
+    // Check for "files:" syntax
+    const filesMatch = query.match(/files?:\s*(.+)/i);
+    let results;
+    let searchTerm;
     
-    response.progress(`Finding TAL code: ${searchTerm}...`);
-    const results = searchCode(searchTerm, 30);
+    if (filesMatch) {
+        // Load specific files
+        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
+        results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
+        searchTerm = fileNames.join(', ');
+    } else if (query.trim()) {
+        // Search by term
+        searchTerm = query.trim();
+        response.progress(`Finding TAL code: ${searchTerm}...`);
+        results = searchCode(searchTerm, 30);
+    } else if (lastSearchResults && lastSearchResults.length > 0) {
+        // Use last results
+        results = lastSearchResults;
+        searchTerm = lastSearchTerm || 'previous search';
+        response.markdown(`*Translating results from previous search: \`${searchTerm}\`*\n\n`);
+    } else {
+        response.markdown('**Usage:** `@astra /translate <term or files>`\n\n**Examples:**\n- `@astra /translate PROC-VALIDATE`\n- `@astra /translate files: FEDIN.tal, FEDOUT.tal`\n- First run `/find FEDIN`, then `/translate` to translate those results');
+        return;
+    }
     
-    if (results.length === 0) {
-        response.markdown(`No code found for: \`${searchTerm}\`\n\nTry:\n- \`@astra /translate PROC-NAME\`\n- \`@astra /translate FEDIN\``);
+    if (!results || results.length === 0) {
+        response.markdown(`No code found for: \`${searchTerm}\``);
         return;
     }
     
@@ -299,33 +381,75 @@ Translate this TAL code to Java. Preserve all business logic.`;
  * /fediso - Uplift to Fed ISO 20022
  */
 async function handleFedIsoCommand(query, response, outputChannel, workspaceRoot, token) {
-    const searchTerm = query.trim() || 'FEDIN FED wire';
+    // Check for "files:" syntax
+    const filesMatch = query.match(/files?:\s*(.+)/i);
+    let results;
+    let searchTerm;
     
-    response.progress(`Finding Fed wire code: ${searchTerm}...`);
-    
-    // Search for Fed-related terms
-    const fedTerms = ['FEDIN', 'FEDOUT', 'FED', 'wire', 'transfer', searchTerm];
-    let results = [];
-    
-    for (const term of fedTerms) {
-        const termResults = grepIndex.searchLiteral(term, { 
-            caseSensitive: false, 
-            maxResults: 15 
-        });
-        results.push(...termResults.results);
+    if (filesMatch) {
+        // Load specific files
+        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
+        results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
+        searchTerm = fileNames.join(', ');
+    } else if (query.trim()) {
+        // Search by term
+        searchTerm = query.trim();
+        response.progress(`Finding Fed wire code: ${searchTerm}...`);
+        
+        // Search for Fed-related terms plus user's term
+        const fedTerms = ['FEDIN', 'FEDOUT', 'FED', 'wire', 'transfer', ...searchTerm.split(/\s+/)];
+        results = [];
+        
+        for (const term of fedTerms) {
+            if (term.length < 3) continue;
+            const termResults = grepIndex.searchLiteral(term, { 
+                caseSensitive: false, 
+                maxResults: 15 
+            });
+            results.push(...termResults.results);
+        }
+        
+        // Dedupe
+        const seen = new Set();
+        results = results.filter(r => {
+            const key = `${r.file}:${r.line}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        }).slice(0, 40);
+    } else if (lastSearchResults && lastSearchResults.length > 0) {
+        // Use last results
+        results = lastSearchResults;
+        searchTerm = lastSearchTerm || 'previous search';
+        response.markdown(`*Applying Fed ISO 20022 uplift to results from: \`${searchTerm}\`*\n\n`);
+    } else {
+        // Default: search for common Fed terms
+        response.progress(`Finding Fed wire code...`);
+        searchTerm = 'FEDIN FEDOUT wire';
+        
+        const fedTerms = ['FEDIN', 'FEDOUT', 'FED', 'wire', 'transfer'];
+        results = [];
+        
+        for (const term of fedTerms) {
+            const termResults = grepIndex.searchLiteral(term, { 
+                caseSensitive: false, 
+                maxResults: 15 
+            });
+            results.push(...termResults.results);
+        }
+        
+        // Dedupe
+        const seen = new Set();
+        results = results.filter(r => {
+            const key = `${r.file}:${r.line}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        }).slice(0, 40);
     }
     
-    // Dedupe
-    const seen = new Set();
-    results = results.filter(r => {
-        const key = `${r.file}:${r.line}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-    }).slice(0, 40);
-    
-    if (results.length === 0) {
-        response.markdown(`No Fed wire code found.\n\nTry:\n- \`@astra /find FEDIN\`\n- \`@astra /fediso wire message\``);
+    if (!results || results.length === 0) {
+        response.markdown(`No Fed wire code found.\n\nTry:\n- \`@astra /find FEDIN\` then \`@astra /fediso\`\n- \`@astra /fediso files: wire-msg.tal\``);
         return;
     }
     
@@ -375,16 +499,32 @@ Analyze this code and provide ISO 20022 (pacs.008) uplift guidance with Java imp
  * /requirements or /extract - Extract business requirements
  */
 async function handleRequirementsCommand(query, response, outputChannel, workspaceRoot, token) {
-    const searchTerm = query.trim();
-    if (!searchTerm) {
-        response.markdown('**Usage:** `@astra /requirements <topic>`\n\n**Examples:**\n- `@astra /requirements wire transfer validation`\n- `@astra /extract payment processing`');
+    // Check for "files:" syntax
+    const filesMatch = query.match(/files?:\s*(.+)/i);
+    let results;
+    let searchTerm;
+    
+    if (filesMatch) {
+        // Load specific files
+        const fileNames = filesMatch[1].split(/[,\s]+/).filter(f => f.length > 0);
+        results = await loadSpecificFiles(fileNames, workspaceRoot, outputChannel);
+        searchTerm = fileNames.join(', ');
+    } else if (query.trim()) {
+        // Search by term
+        searchTerm = query.trim();
+        response.progress(`Extracting requirements for: ${searchTerm}...`);
+        results = searchCode(searchTerm, 50);
+    } else if (lastSearchResults && lastSearchResults.length > 0) {
+        // Use last results
+        results = lastSearchResults;
+        searchTerm = lastSearchTerm || 'previous search';
+        response.markdown(`*Extracting requirements from previous search: \`${searchTerm}\`*\n\n`);
+    } else {
+        response.markdown('**Usage:** `@astra /requirements <topic>`\n\n**Examples:**\n- `@astra /requirements wire transfer validation`\n- `@astra /requirements files: payment.tal`\n- First run `/find`, then `/requirements` to extract from those results');
         return;
     }
     
-    response.progress(`Extracting requirements for: ${searchTerm}...`);
-    const results = searchCode(searchTerm, 50);
-    
-    if (results.length === 0) {
+    if (!results || results.length === 0) {
         response.markdown(`No code found for: \`${searchTerm}\``);
         return;
     }
@@ -475,6 +615,106 @@ Answer the question based on the code above.`;
 // ============================================================
 // HELPER FUNCTIONS
 // ============================================================
+
+/**
+ * Load specific files by name
+ */
+async function loadSpecificFiles(fileNames, workspaceRoot, outputChannel) {
+    const results = [];
+    
+    for (const fileName of fileNames) {
+        // Search for files matching the name
+        const searchName = fileName.replace(/^\/+/, '').trim();
+        outputChannel.appendLine(`Looking for file: ${searchName}`);
+        
+        // Check index for matching files
+        for (const [filePath, content] of grepIndex.files) {
+            if (filePath.toLowerCase().includes(searchName.toLowerCase()) ||
+                path.basename(filePath).toLowerCase() === searchName.toLowerCase()) {
+                
+                // Add file contents as results
+                const lines = content.split('\n');
+                const previewLines = Math.min(lines.length, 100);
+                
+                results.push({
+                    file: filePath,
+                    line: 1,
+                    matchLine: lines.slice(0, previewLines).join('\n'),
+                    context: {
+                        before: [],
+                        after: lines.slice(previewLines, previewLines + 20)
+                    }
+                });
+                
+                outputChannel.appendLine(`Found: ${filePath}`);
+                break;
+            }
+        }
+    }
+    
+    return results;
+}
+
+/**
+ * Handle chained commands (e.g., "/find FEDIN then /translate then /fediso")
+ */
+async function handleChainedCommands(initialCommand, query, response, outputChannel, workspaceRoot, token) {
+    // Parse the chain
+    const parts = query.split(/\s+then\s+/i);
+    const commands = [];
+    
+    // First part is the initial search term (for /find) or the full query
+    let firstPart = parts[0].trim();
+    if (initialCommand === 'find') {
+        commands.push({ cmd: 'find', arg: firstPart });
+    } else {
+        commands.push({ cmd: initialCommand || 'find', arg: firstPart });
+    }
+    
+    // Remaining parts are chained commands
+    for (let i = 1; i < parts.length; i++) {
+        const part = parts[i].trim();
+        const cmdMatch = part.match(/^\/?(\w+)\s*(.*)?$/);
+        if (cmdMatch) {
+            commands.push({ cmd: cmdMatch[1].toLowerCase(), arg: cmdMatch[2]?.trim() || '' });
+        }
+    }
+    
+    outputChannel.appendLine(`Chained commands: ${JSON.stringify(commands)}`);
+    response.markdown(`## 🔗 Running chained commands\n\n`);
+    
+    // Execute each command in sequence
+    for (let i = 0; i < commands.length; i++) {
+        const { cmd, arg } = commands[i];
+        response.markdown(`### Step ${i + 1}: /${cmd} ${arg}\n\n`);
+        
+        switch (cmd) {
+            case 'find':
+                await handleFindCommand(arg, response, outputChannel, workspaceRoot, token);
+                break;
+            case 'describe':
+                await handleDescribeCommand(arg, response, outputChannel, workspaceRoot, token);
+                break;
+            case 'translate':
+                await handleTranslateCommand(arg, response, outputChannel, workspaceRoot, token);
+                break;
+            case 'fediso':
+                await handleFedIsoCommand(arg, response, outputChannel, workspaceRoot, token);
+                break;
+            case 'requirements':
+            case 'extract':
+                await handleRequirementsCommand(arg, response, outputChannel, workspaceRoot, token);
+                break;
+            default:
+                response.markdown(`Unknown command: /${cmd}\n\n`);
+        }
+        
+        // Add separator between commands
+        if (i < commands.length - 1) {
+            response.markdown(`\n---\n\n`);
+        }
+    }
+}
 
 /**
  * Search code using grep index
@@ -763,6 +1003,8 @@ function formatResultsForLLM(results, workspaceRoot) {
 function deactivate() {
     grepIndex = null;
     indexedWorkspace = null;
+    lastSearchResults = null;
+    lastSearchTerm = null;
 }
 
 module.exports = { activate, deactivate };
