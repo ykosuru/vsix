@@ -1,15 +1,21 @@
 {
   "name": "astracode-copilot",
   "displayName": "AstraCode for Copilot Chat",
-  "description": "Code search with function call indexing for GitHub Copilot Chat",
+  "description": "Code search with function call tracking for GitHub Copilot Chat",
   "version": "0.2.0",
   "publisher": "astracode",
   "engines": {
     "vscode": "^1.90.0"
   },
+  "extensionDependencies": [
+    "github.copilot-chat"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "categories": [
     "Programming Languages",
-    "Other"
+    "Chat"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -19,7 +25,21 @@
         "name": "astra",
         "fullName": "AstraCode",
         "description": "Search code with function call tracking - answers 'who calls X?' queries",
-        "isSticky": false
+        "isSticky": false,
+        "commands": [
+          {
+            "name": "clear",
+            "description": "Clear index and start fresh (no accumulated context)"
+          },
+          {
+            "name": "rebuild",
+            "description": "Force rebuild the code index"
+          },
+          {
+            "name": "stats",
+            "description": "Show index statistics"
+          }
+        ]
       }
     ]
   }
