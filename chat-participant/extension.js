@@ -107,26 +107,64 @@ function searchPrebuiltIndex(query, maxResults = 50) {
 
 /**
  * Create a GrepIndex-compatible wrapper from pre-built index
+ * Supports both v1 (full content) and v2 (lightweight) formats
  */
-function createIndexFromPrebuilt(prebuilt, outputChannel) {
+async function createIndexFromPrebuilt(prebuilt, workspaceRoot, outputChannel) {
     outputChannel.appendLine('Creating index from pre-built data...');
     
-    // Build context files map from pre-built index
     const contextFiles = new Map();
     
-    for (const [filepath, fileData] of Object.entries(prebuilt.files || {})) {
-        // Reconstruct content from line index
-        const content = fileData.content
-            ? fileData.content.map(l => l.content).join('\n')
-            : '';
+    // Check index version
+    const isLightweight = prebuilt.type === 'lightweight' || prebuilt.version === '2.0';
+    
+    if (isLightweight) {
+        outputChannel.appendLine('Lightweight index detected - loading files from disk...');
         
-        contextFiles.set(filepath, {
-            content: content,
-            language: fileData.ext?.slice(1) || 'txt'
-        });
+        // For lightweight index, read code files from disk
+        for (const [filepath, fileData] of Object.entries(prebuilt.files || {})) {
+            try {
+                const uri = vscode.Uri.file(filepath);
+                const content = await vscode.workspace.fs.readFile(uri);
+                const text = Buffer.from(content).toString('utf8');
+                
+                contextFiles.set(filepath, {
+                    content: text,
+                    language: fileData.ext?.slice(1) || 'txt'
+                });
+            } catch (e) {
+                // File might have moved/deleted - skip it
+                outputChannel.appendLine(`  Skipped (not found): ${path.basename(filepath)}`);
+            }
+        }
+        
+        // For documents, use the stored text
+        for (const [filepath, docData] of Object.entries(prebuilt.documents || {})) {
+            if (docData.text) {
+                contextFiles.set(filepath, {
+                    content: docData.text,
+                    language: docData.type || 'txt'
+                });
+            }
+        }
+    } else {
+        // v1 format - reconstruct from stored line data
+        outputChannel.appendLine('Full index detected - using stored content...');
+        
+        for (const [filepath, fileData] of Object.entries(prebuilt.files || {})) {
+            const content = fileData.content
+                ? fileData.content.map(l => l.content).join('\n')
+                : '';
+            
+            contextFiles.set(filepath, {
+                content: content,
+                language: fileData.ext?.slice(1) || 'txt'
+            });
+        }
     }
     
-    // Create GrepIndex with the content
+    outputChannel.appendLine(`Loaded ${contextFiles.size} files`);
+    
+    // Create GrepIndex
     const index = new GrepIndex({
         contextLines: 3,
         maxResults: 100,
@@ -136,10 +174,6 @@ function createIndexFromPrebuilt(prebuilt, outputChannel) {
     index.build(contextFiles, {
         log: (msg) => outputChannel.appendLine(msg)
     });
-    
-    // Store pre-built stats
-    index._prebuiltStats = prebuilt.stats;
-    index._prebuiltCreated = prebuilt.created;
     
     return index;
 }
@@ -351,8 +385,8 @@ function activate(context) {
             
             if (hasPrebuilt) {
                 response.progress('Using pre-built index...');
-                // Build a minimal GrepIndex wrapper for compatibility
-                grepIndex = createIndexFromPrebuilt(prebuiltIndex, outputChannel);
+                // Build a GrepIndex from pre-built data
+                grepIndex = await createIndexFromPrebuilt(prebuiltIndex, workspaceRoot, outputChannel);
             } else {
                 response.progress('Building code index (no .astra-index.json found)...');
                 await buildIndex(workspaceRoot, outputChannel);
