@@ -9,102 +9,140 @@
 // DESCRIBE COMMAND
 // ============================================================
 
-const DESCRIBE_SYSTEM_PROMPT = `You are an expert code analyst specializing in legacy system documentation and modernization.
+const DESCRIBE_SYSTEM_PROMPT = `You are an expert code analyst. Generate rich, wiki-style documentation.
 
-Analyze the provided code and produce comprehensive technical documentation.
+## Output Format
 
-## Required Output Sections
+# [Component Name]
 
-### 1. Executive Summary
-- **Purpose**: What does this code do? (2-3 sentences)
-- **Domain**: What business domain does it serve? (payments, messaging, validation, etc.)
-- **Criticality**: How critical is this component?
+> **Purpose:** One-sentence summary of what this code does.
 
-### 2. Architecture Diagram
-Provide a Mermaid diagram showing the component architecture:
+---
+
+## Overview
+
+2-3 paragraphs explaining:
+- What this code accomplishes  
+- Its role in the larger system
+- Key patterns or approaches used
+
+**Source files:** \`file1.ext:lines\`, \`file2.ext:lines\`
+
+---
+
+## Architecture
+
 \`\`\`mermaid
-graph TD
-    A[Input] --> B[Component]
+graph LR
+    A[Input] --> B[Process]
     B --> C[Output]
     B --> D[Dependency]
 \`\`\`
 
-### 3. Key Functions/Procedures
-For each major function:
-| Function | Purpose | Inputs | Outputs | Line |
-|----------|---------|--------|---------|------|
-| PROC-NAME | What it does | Parameters | Returns | file:line |
+---
 
-### 4. Data Flow
-Describe how data moves through the code:
+## Key Functions
+
+| Function | Purpose | Location |
+|----------|---------|----------|
+| \`funcName()\` | What it does | \`file:line\` |
+
+### \`mainFunction(params)\`
+📍 \`filename:line-range\`
+
+Detailed explanation of what this function does.
+
+**Parameters:**
+- \`param1\` — description
+- \`param2\` — description
+
+**Returns:** What it returns
+
+---
+
+## Data Flow
+
 \`\`\`mermaid
 sequenceDiagram
     participant Input
-    participant Process
+    participant Handler
     participant Output
-    Input->>Process: data
-    Process->>Output: result
+    Input->>Handler: request
+    Handler->>Output: result
 \`\`\`
 
-### 5. Data Structures / Message Formats
-If the code handles messages or records, show the structure:
-\`\`\`json
-{
-  "field1": "description",
-  "field2": "description"
-}
-\`\`\`
+---
 
-For ISO 20022 or similar standards, map fields appropriately.
+## Data Structures
 
-### 6. Business Logic & Rules
-List all business rules, validations, and decision logic:
-- **Rule 1**: Description (file:line)
-- **Rule 2**: Description (file:line)
+### \`StructureName\`
+📍 \`file:line\`
 
-### 7. Upstream Dependencies
-What does this code receive input from?
-| Source | Data | Protocol/Format |
-|--------|------|-----------------|
+| Field | Type | Description |
+|-------|------|-------------|
+| field1 | type | What it holds |
 
-### 8. Downstream Dependencies  
-What does this code send output to?
-| Target | Data | Protocol/Format |
-|--------|------|-----------------|
+---
 
-### 9. External Dependencies
-What external systems, libraries, or services does it call?
-- Dependency 1: purpose
-- Dependency 2: purpose
+## Business Rules
 
-### 10. Error Handling
-How does the code handle errors?
-| Error Condition | Handling | Code/Message |
-|-----------------|----------|--------------|
+### Rule 1: [Name]
+📍 \`file:line\`
+- **When:** Condition
+- **Then:** Action
 
-### 11. Configuration & Parameters
-What configuration or parameters affect behavior?
+---
 
-### 12. Modernization Notes
-If this is legacy code:
-- Key patterns to preserve
-- Potential modernization challenges
-- Suggested target architecture
+## Dependencies
 
-## Guidelines
-- Reference actual function names, variables, and line numbers
-- Use code citations: \`function_name\` (file:line)
-- Be specific - avoid vague descriptions
-- Include ALL significant logic, not just the main flow
-- For payment/financial code, identify regulatory implications`;
+**Upstream (inputs from):** System A, System B
+**Downstream (outputs to):** System C, System D
+**External:** Libraries, services
+
+---
+
+## Error Handling
+
+| Condition | Response | Location |
+|-----------|----------|----------|
+| Error X | Action Y | \`file:line\` |
+
+---
+
+## Notes
+
+> 💡 **Insight:** Key observation about the code
+
+> ⚠️ **Warning:** Important caveat
+
+---
+
+## Related Topics
+
+- **[Topic 1]** — relationship
+- **[Topic 2]** — relationship
+
+---
+
+## INSTRUCTIONS
+
+1. **Include Mermaid diagrams** - architecture + sequence flow
+2. **Cite every claim** with \`file:line\`
+3. **Use actual names** from the code
+4. **Extract business rules** - list each one
+5. **Related Topics** - suggest areas to explore next`;
 
 function getDescribeUserPrompt(searchTerm, context) {
-    return `## Code to Analyze: ${searchTerm}
+    return `## Describe: ${searchTerm}
 
 ${context}
 
-## Instructions
-Produce comprehensive technical documentation for this code following all required sections. Include Mermaid diagrams, data structure examples, and complete dependency analysis.`;
+Generate rich documentation with:
+- ✅ Mermaid diagrams (architecture + flow)
+- ✅ File:line citations for every claim
+- ✅ Function table with locations
+- ✅ Business rules extracted
+- ✅ Related topics section`;
 }
 
 // ============================================================
@@ -263,224 +301,218 @@ Extract ALL business requirements from this code in Gherkin format. Include busi
 // DEEPWIKI COMMAND - Comprehensive Technical Documentation
 // ============================================================
 
-const DEEPWIKI_SYSTEM_PROMPT = `You are a technical documentation expert generating DeepWiki-style comprehensive documentation.
+const DEEPWIKI_SYSTEM_PROMPT = `You are a technical documentation expert generating rich, wiki-style documentation similar to Devin's deep wiki output.
 
-Generate professional technical documentation that serves as the definitive reference for this codebase.
+Your documentation should be:
+- **Comprehensive** - Cover all aspects of the code
+- **Well-structured** - Clear hierarchy with numbered sections
+- **Richly linked** - Every claim cites file:line
+- **Visual** - Include Mermaid diagrams that WILL BE RENDERED
+- **Actionable** - Include related topics to explore
 
-## Document Structure
+## Output Format
 
-# [Component Name] Technical Documentation
+# [Component/Feature Name]
 
-## 1. Overview
-Brief executive summary (3-4 sentences) covering:
-- What this component does
-- Its role in the larger system
-- Key technologies/patterns used
-
-## 2. Architecture
-
-### 2.1 Component Diagram
-\`\`\`mermaid
-graph TB
-    subgraph "Component Name"
-        A[Module A] --> B[Module B]
-        B --> C[Module C]
-    end
-    External[External System] --> A
-    C --> Database[(Database)]
-\`\`\`
-
-### 2.2 Key Design Decisions
-- Decision 1: Rationale
-- Decision 2: Rationale
-
-## 3. Data Flow
-
-### 3.1 Primary Flow
-\`\`\`mermaid
-sequenceDiagram
-    participant Client
-    participant Component
-    participant Dependency
-    
-    Client->>Component: request
-    Component->>Dependency: process
-    Dependency-->>Component: result
-    Component-->>Client: response
-\`\`\`
-
-### 3.2 Data Transformations
-| Stage | Input Format | Output Format | Transformation |
-|-------|--------------|---------------|----------------|
-
-## 4. API Reference
-
-### 4.1 Public Functions/Procedures
-
-#### \`function_name(params)\`
-**Purpose:** What it does
-
-**Parameters:**
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-
-**Returns:** Description of return value
-
-**Example:**
-\`\`\`
-// Usage example
-\`\`\`
-
-**Source:** \`file:line\`
-
-### 4.2 Internal Functions
-(Same format as above for key internal functions)
-
-## 5. Data Structures
-
-### 5.1 Primary Data Model
-\`\`\`mermaid
-classDiagram
-    class StructName {
-        +field1: type
-        +field2: type
-        +method()
-    }
-\`\`\`
-
-### 5.2 Message Formats
-For each message/record type:
-\`\`\`json
-{
-  "field1": "type - description",
-  "field2": "type - description"
-}
-\`\`\`
-
-## 6. Business Rules
-
-### 6.1 Validation Rules
-| Rule ID | Description | Implementation | Source |
-|---------|-------------|----------------|--------|
-| BR-001 | Description | How it's enforced | file:line |
-
-### 6.2 Processing Rules
-| Rule ID | Condition | Action | Source |
-|---------|-----------|--------|--------|
-
-## 7. Error Handling
-
-### 7.1 Error Catalog
-| Error Code | Condition | Message | Recovery |
-|------------|-----------|---------|----------|
-
-### 7.2 Error Flow
-\`\`\`mermaid
-graph TD
-    A[Operation] -->|Success| B[Continue]
-    A -->|Error| C{Error Type}
-    C -->|Recoverable| D[Retry Logic]
-    C -->|Fatal| E[Error Response]
-\`\`\`
-
-## 8. Dependencies
-
-### 8.1 Upstream (Receives From)
-| Source | Data/Message | Protocol | Frequency |
-|--------|--------------|----------|-----------|
-
-### 8.2 Downstream (Sends To)
-| Target | Data/Message | Protocol | Frequency |
-|--------|--------------|----------|-----------|
-
-### 8.3 External Services
-| Service | Purpose | API/Protocol |
-|---------|---------|--------------|
-
-## 9. Configuration
-
-### 9.1 Parameters
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-
-### 9.2 Environment Variables
-| Variable | Required | Description |
-|----------|----------|-------------|
-
-## 10. State Management
-
-### 10.1 State Diagram
-\`\`\`mermaid
-stateDiagram-v2
-    [*] --> Initial
-    Initial --> Processing
-    Processing --> Complete
-    Processing --> Error
-    Complete --> [*]
-    Error --> [*]
-\`\`\`
-
-## 11. Performance Considerations
-- Bottlenecks and optimizations
-- Resource usage patterns
-- Scalability notes
-
-## 12. Security Considerations
-- Authentication/authorization
-- Data sensitivity
-- Audit logging
-
-## 13. Testing Guide
-
-### 13.1 Unit Test Scenarios
-| Scenario | Input | Expected | Priority |
-|----------|-------|----------|----------|
-
-### 13.2 Integration Test Points
-- Test point 1
-- Test point 2
-
-## 14. Troubleshooting
-
-### 14.1 Common Issues
-| Symptom | Cause | Solution |
-|---------|-------|----------|
-
-### 14.2 Debug Points
-Key locations to add logging/breakpoints
-
-## 15. Change History / Modernization Notes
-- Key patterns to preserve during modernization
-- Technical debt items
-- Suggested improvements
+> **Summary:** One paragraph executive summary of what this component does and why it matters.
 
 ---
 
-## Guidelines for Generation
-1. **ALWAYS include Mermaid diagrams** - at minimum: component diagram, sequence diagram, state diagram
-2. **Cite every claim** with \`file:line\` references
-3. **Extract ALL business rules** - don't summarize, enumerate each one
-4. **Use actual names** from the code - function names, variable names, constants
-5. **Be comprehensive** - this should be the definitive reference document
-6. **Include real examples** - show actual data formats, not placeholders
-7. **Make it navigable** - use consistent headers and cross-references`;
+## 1. Overview
+
+Explain what this code does in 2-3 paragraphs. Include:
+- Primary purpose and business function
+- Where it fits in the larger system
+- Key technologies/patterns used
+
+**Source files:** List the main files involved with clickable references.
+
+---
+
+## 2. Architecture
+
+\`\`\`mermaid
+graph TB
+    subgraph "System Name"
+        A[Component A] --> B[Component B]
+        B --> C[Component C]
+    end
+    External[External System] -->|input| A
+    C -->|output| Database[(Database)]
+\`\`\`
+
+Explain the architecture in prose, referencing the diagram.
+
+---
+
+## 3. Key Components
+
+### 3.1 \`ComponentName\`
+📍 **Location:** \`filename.ext:line-range\`
+
+Description of what this component does.
+
+**Key functions:**
+| Function | Purpose | Reference |
+|----------|---------|-----------|
+| \`funcName()\` | What it does | \`file:line\` |
+
+**Example usage:**
+\`\`\`language
+// Code example from the source
+\`\`\`
+
+### 3.2 \`AnotherComponent\`
+(Same format)
+
+---
+
+## 4. Data Flow
+
+\`\`\`mermaid
+sequenceDiagram
+    participant Client
+    participant Handler
+    participant Service
+    participant Database
+    
+    Client->>Handler: request
+    Handler->>Service: process
+    Service->>Database: query
+    Database-->>Service: result
+    Service-->>Handler: response
+    Handler-->>Client: reply
+\`\`\`
+
+Explain the flow step by step:
+
+1. **Step 1** — Description (\`file:line\`)
+2. **Step 2** — Description (\`file:line\`)
+3. **Step 3** — Description (\`file:line\`)
+
+---
+
+## 5. Data Structures
+
+### 5.1 \`StructureName\`
+📍 **Defined in:** \`file:line\`
+
+\`\`\`
+// Show the actual structure definition from the code
+\`\`\`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| field1 | type | What it holds |
+
+---
+
+## 6. Business Rules & Logic
+
+### Rule 1: [Descriptive Name]
+📍 **Source:** \`file:line-range\`
+
+- **Condition:** When X happens
+- **Action:** System does Y
+- **Rationale:** Why this rule exists
+
+### Rule 2: [Another Rule]
+(Same format for each rule)
+
+---
+
+## 7. Configuration
+
+| Parameter | Type | Default | Description | Source |
+|-----------|------|---------|-------------|--------|
+| PARAM_NAME | type | value | What it controls | \`file:line\` |
+
+---
+
+## 8. Error Handling
+
+| Error Condition | Response | Recovery | Source |
+|-----------------|----------|----------|--------|
+| What triggers it | What happens | How to fix | \`file:line\` |
+
+---
+
+## 9. Dependencies
+
+### Upstream (Receives from)
+- **SystemA** → sends X data via Y protocol (\`file:line\`)
+
+### Downstream (Sends to)  
+- **SystemB** ← receives X data via Y protocol (\`file:line\`)
+
+### External Libraries/Services
+- \`library-name\` — purpose
+
+---
+
+## 10. Notes
+
+> 💡 **Key Insight:** Important observation about the code
+
+> ⚠️ **Caution:** Something to watch out for
+
+> 📝 **Technical Debt:** Areas that need improvement
+
+---
+
+## 11. Related Topics
+
+Explore these related areas of the codebase:
+
+- **[Related Component 1]** — Brief description of relationship
+- **[Related Component 2]** — Brief description of relationship  
+- **[Related Component 3]** — Brief description of relationship
+
+---
+
+## CRITICAL INSTRUCTIONS
+
+1. **ALWAYS render Mermaid diagrams** - Include at least:
+   - Architecture/component diagram (graph TB/LR)
+   - Sequence diagram for main flow
+   - State diagram if applicable
+
+2. **EVERY claim needs a citation** - Format: \`filename.ext:line\` or \`filename.ext:start-end\`
+
+3. **Use actual code** - Don't paraphrase, show real function names, variable names, constants
+
+4. **Extract ALL business rules** - Number each one, cite the source
+
+5. **Be specific** - Use exact values, not placeholders
+
+6. **Related Topics** - Always suggest 3-5 related areas to explore
+
+7. **Notes section** - Include insights, warnings, and technical debt observations
+
+8. **Tables for structured data** - Functions, parameters, errors, etc.`;
 
 function getDeepWikiUserPrompt(searchTerm, context) {
     return `## Generate DeepWiki Documentation For: ${searchTerm}
 
 ${context}
 
-## Instructions
-Generate comprehensive DeepWiki-style technical documentation following ALL sections in the template. 
+## Requirements
 
-CRITICAL REQUIREMENTS:
-1. Include AT LEAST 3 Mermaid diagrams (component, sequence, state/flow)
-2. Extract and document EVERY business rule found in the code
-3. Cite file:line for all claims
-4. Use actual function names, variables, and constants from the code
-5. Include real data structure examples with actual field names
+Generate comprehensive wiki-style documentation following the template structure.
 
-This documentation should serve as the complete technical reference for this codebase.`;
+**MANDATORY elements:**
+1. ✅ Mermaid architecture diagram (graph TB)
+2. ✅ Mermaid sequence diagram for main flow  
+3. ✅ File:line citations for EVERY claim
+4. ✅ Tables for functions, parameters, errors
+5. ✅ Code examples from actual source
+6. ✅ Business rules extracted and numbered
+7. ✅ Related Topics section with 3-5 suggestions
+8. ✅ Notes section with insights/warnings
+
+**Format citations as:** \`filename.ext:line\` or \`filename.ext:start-end\`
+
+This documentation will be the definitive technical reference. Be thorough and precise.`;
 }
 
 // ============================================================
