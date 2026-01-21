@@ -28,16 +28,44 @@
         "isSticky": false,
         "commands": [
           {
+            "name": "find",
+            "description": "Search for code by keyword"
+          },
+          {
+            "name": "describe",
+            "description": "Describe functionality of code"
+          },
+          {
+            "name": "translate",
+            "description": "Translate TAL to Java"
+          },
+          {
+            "name": "fediso",
+            "description": "Uplift to Fed ISO 20022"
+          },
+          {
+            "name": "requirements",
+            "description": "Extract business requirements from code"
+          },
+          {
+            "name": "extract",
+            "description": "Alias for /requirements"
+          },
+          {
+            "name": "stats",
+            "description": "Show index statistics"
+          },
+          {
             "name": "clear",
-            "description": "Clear index and start fresh (no accumulated context)"
+            "description": "Clear index (fresh start, no accumulated context)"
           },
           {
             "name": "rebuild",
             "description": "Force rebuild the code index"
           },
           {
-            "name": "stats",
-            "description": "Show index statistics"
+            "name": "help",
+            "description": "Show help and usage"
           }
         ]
       }
