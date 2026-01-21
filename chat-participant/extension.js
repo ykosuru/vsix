@@ -361,9 +361,6 @@ async function handleFindCommand(query, response, outputChannel, workspaceRoot, 
     }
 }
 
-// Legacy source file extensions for filtering
-const LEGACY_SOURCE_EXTENSIONS = ['.tal', '.cbl', '.cob', '.cobol', '.pco', '.pli', '.cpy'];
-
 /**
  * Unified input parsing for all commands
  * Syntax:
@@ -405,10 +402,10 @@ function parseCommandInput(query) {
 }
 
 /**
- * Get results from history item, with optional filtering to legacy source
+ * Get results from history item
  * Returns { results, searchTerm, error } 
  */
-function getHistoryResults(historyId, filterLegacy = true) {
+function getHistoryResults(historyId) {
     const historyItem = queryHistory.find(h => h.id === historyId);
     
     if (!historyItem) {
@@ -419,32 +416,7 @@ function getHistoryResults(historyId, filterLegacy = true) {
         return { results: null, searchTerm: null, error: `History item #${historyId} has no cached results. Try a fresh search.` };
     }
     
-    let results = historyItem.cachedResults;
-    const searchTerm = historyItem.query;
-    
-    if (filterLegacy) {
-        const filtered = filterToLegacySource(results);
-        if (filtered.length === 0) {
-            const fileNames = [...new Set(results.map(r => path.basename(r.file)))].slice(0, 5).join(', ');
-            return { 
-                results: null, 
-                searchTerm, 
-                error: `History #${historyId} has no legacy source files (TAL, COBOL, etc).\n\nFound: ${fileNames}\n\nTry a fresh search with \`<topic>\`.` 
-            };
-        }
-        results = filtered;
-    }
-    
-    return { results, searchTerm, error: null };
-}
-
-/**
- * Filter results to only include legacy source files
- */
-function filterToLegacySource(results) {
-    return results.filter(r => 
-        LEGACY_SOURCE_EXTENSIONS.some(ext => r.file.toLowerCase().endsWith(ext))
-    );
+    return { results: historyItem.cachedResults, searchTerm: historyItem.query, error: null };
 }
 
 /**
@@ -465,7 +437,7 @@ async function handleDescribeCommand(query, response, outputChannel, workspaceRo
             
         case 'history':
             // #N - use history item
-            const historyData = getHistoryResults(input.value, true);
+            const historyData = getHistoryResults(input.value);
             if (historyData.error) {
                 response.markdown(`❌ ${historyData.error}`);
                 return;
@@ -476,7 +448,7 @@ async function handleDescribeCommand(query, response, outputChannel, workspaceRo
             break;
             
         case 'search':
-            // Fresh search
+            // Fresh search within current context
             searchTerm = input.value;
             response.progress(`Analyzing: ${searchTerm}...`);
             results = searchCode(searchTerm, 40);
@@ -487,7 +459,7 @@ async function handleDescribeCommand(query, response, outputChannel, workspaceRo
             // Show usage
             response.markdown('**Usage:** `@astra /describe <topic>`\n\n');
             response.markdown('**Syntax:**\n');
-            response.markdown('- `/describe FEDIN-PARSE` — Fresh search\n');
+            response.markdown('- `/describe FEDIN-PARSE` — Search current context\n');
             response.markdown('- `/describe #5` — Use results from history item #5\n');
             response.markdown('- `/describe #file payment.tal, validate.cbl` — Specific files\n');
             if (queryHistory.length > 0) {
@@ -533,7 +505,7 @@ async function handleTranslateCommand(query, response, outputChannel, workspaceR
             
         case 'history':
             // #N - use history item (filter to legacy source)
-            const historyData = getHistoryResults(input.value, true);
+            const historyData = getHistoryResults(input.value);
             if (historyData.error) {
                 response.markdown(`❌ ${historyData.error}`);
                 return;
@@ -544,9 +516,9 @@ async function handleTranslateCommand(query, response, outputChannel, workspaceR
             break;
             
         case 'search':
-            // Fresh search
+            // Fresh search within current context
             searchTerm = input.value;
-            response.progress(`Finding TAL code: ${searchTerm}...`);
+            response.progress(`Finding code: ${searchTerm}...`);
             results = searchCode(searchTerm, 30);
             break;
             
@@ -673,7 +645,7 @@ async function handleDomainCommand(domainKeyOrQuery, additionalQuery, response, 
             
         case 'history':
             // #N - use history item (filter to legacy source)
-            const historyData = getHistoryResults(input.value, true);
+            const historyData = getHistoryResults(input.value);
             if (historyData.error) {
                 response.markdown(`❌ ${historyData.error}`);
                 return;
@@ -684,7 +656,7 @@ async function handleDomainCommand(domainKeyOrQuery, additionalQuery, response, 
             break;
             
         case 'search':
-            // Fresh search with domain terms
+            // Fresh search with domain terms within current context
             searchTerm = input.value;
             response.progress(`Finding code for ${domainPrompt.name}: ${searchTerm}...`);
             
@@ -764,7 +736,7 @@ async function handleRequirementsCommand(query, response, outputChannel, workspa
             
         case 'history':
             // #N - use history item (filter to legacy source)
-            const historyData = getHistoryResults(input.value, true);
+            const historyData = getHistoryResults(input.value);
             if (historyData.error) {
                 response.markdown(`❌ ${historyData.error}`);
                 return;
@@ -775,7 +747,7 @@ async function handleRequirementsCommand(query, response, outputChannel, workspa
             break;
             
         case 'search':
-            // Fresh search
+            // Fresh search within current context
             searchTerm = input.value;
             response.progress(`Extracting requirements for: ${searchTerm}...`);
             results = searchCode(searchTerm, 50);
