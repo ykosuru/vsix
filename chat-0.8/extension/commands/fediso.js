@@ -181,7 +181,6 @@ Or chain: \`@astra /requirements OFAC /fediso\``);
     }
     
     const fileCount = files?.length || 0;
-    const hasAttachments = attachedDocNames.length > 0;
     const docInfo = hasAttachments ? ' + specs' : '';
     
     // Show files being used
