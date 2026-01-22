@@ -44,7 +44,17 @@ async function handle(ctx) {
         return;
     }
     
-    response.markdown(`📄 **Generating documentation from ${files.length} files** (${totalLines.toLocaleString()} lines)\n\n`);
+    // Show files being used
+    let filesUsed = `📄 **Generating documentation from ${files.length} files** (${totalLines.toLocaleString()} lines)\n\n`;
+    filesUsed += `<details><summary>📂 Files analyzed</summary>\n\n`;
+    for (const f of files.slice(0, 25)) {
+        filesUsed += `- \`${f.path}\`\n`;
+    }
+    if (files.length > 25) {
+        filesUsed += `- *...and ${files.length - 25} more*\n`;
+    }
+    filesUsed += `\n</details>\n\n`;
+    response.markdown(filesUsed);
     
     const userPrompt = `Generate comprehensive wiki documentation for: ${query}
 
