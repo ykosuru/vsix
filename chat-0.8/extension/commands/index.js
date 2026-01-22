@@ -17,17 +17,17 @@ const commands = {
     describe: describe.handle,
     translate: translate.handle,
     fediso: fediso.handle,
+    iso: fediso.handle,  // alias
     requirements: requirements.handle,
-    extract: requirements.handle,
+    reqs: requirements.handle,  // alias
     deepwiki: deepwiki.handle,
     wiki: deepwiki.handle,
     general: general.handle
 };
 
-// Commands that benefit from workspace context
 const PIPELINE_COMMANDS = [
-    'find', 'describe', 'translate', 'fediso', 
-    'requirements', 'extract', 'deepwiki', 'wiki'
+    'find', 'describe', 'translate', 'fediso', 'iso',
+    'requirements', 'reqs', 'deepwiki', 'wiki'
 ];
 
 function getHandler(command) {
