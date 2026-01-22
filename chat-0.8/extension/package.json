@@ -1,0 +1,42 @@
+{
+  "name": "astracode",
+  "displayName": "AstraCode",
+  "description": "AI-powered code analysis using GitHub Copilot",
+  "version": "0.8.0",
+  "publisher": "astracode",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "astracode.chat",
+        "name": "astra",
+        "description": "AI-powered code analysis",
+        "isSticky": true,
+        "commands": [
+          { "name": "find", "description": "Search for code" },
+          { "name": "describe", "description": "Describe code functionality" },
+          { "name": "deepwiki", "description": "Generate wiki documentation" },
+          { "name": "translate", "description": "Translate legacy code" },
+          { "name": "requirements", "description": "Extract business requirements" },
+          { "name": "help", "description": "Show help" },
+          { "name": "stats", "description": "Show workspace info" }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "AstraCode",
+      "properties": {
+        "astracode.preferredModel": {
+          "type": "string",
+          "default": "gpt-4o",
+          "description": "Preferred Copilot model (e.g., gpt-4o, claude-sonnet-4)"
+        }
+      }
+    }
+  }
+}
