@@ -39,7 +39,17 @@ async function handle(ctx) {
         return;
     }
     
-    response.markdown(`🔍 **Found ${files.length} files matching "${query}"**\n\n`);
+    // Show files found
+    let filesUsed = `🔍 **Found ${files.length} files matching "${query}"**\n\n`;
+    filesUsed += `<details><summary>📂 Files found</summary>\n\n`;
+    for (const f of files.slice(0, 25)) {
+        filesUsed += `- \`${f.path}\`\n`;
+    }
+    if (files.length > 25) {
+        filesUsed += `- *...and ${files.length - 25} more*\n`;
+    }
+    filesUsed += `\n</details>\n\n`;
+    response.markdown(filesUsed);
     
     const userPrompt = `Summarize the search results for: ${query}
 
