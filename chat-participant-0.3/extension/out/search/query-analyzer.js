@@ -83,6 +83,7 @@ function analyzeQuery(query) {
  */
 function executeSearch(index, strategy, options = {}) {
     const { log = () => {}, maxResults = 50 } = options;
+    const { dedupeAndRank } = require('./search-utils');
     let results = [];
     
     // Function-specific search
@@ -90,20 +91,20 @@ function executeSearch(index, strategy, options = {}) {
         log(`Searching for function: ${strategy.functionName}`);
         
         if (strategy.isUsageSearch) {
-            const usageResults = index.searchSymbolUsages(strategy.functionName, { maxResults });
+            const usageResults = index.searchSymbolUsages(strategy.functionName, { maxResults: maxResults * 2 });
             results = usageResults.results;
         } else if (strategy.isCallSearch) {
-            const callResults = index.searchFunctionCalls(strategy.functionName, { maxResults });
+            const callResults = index.searchFunctionCalls(strategy.functionName, { maxResults: maxResults * 2 });
             results = callResults.results;
         } else {
             // Try call search first, fall back to literal
-            const callResults = index.searchFunctionCalls(strategy.functionName, { maxResults: 30 });
+            const callResults = index.searchFunctionCalls(strategy.functionName, { maxResults: 50 });
             if (callResults.results.length > 0) {
                 results = callResults.results;
             } else {
                 const literalResults = index.searchLiteral(strategy.functionName, { 
                     wholeWord: true, 
-                    maxResults 
+                    maxResults: maxResults * 2
                 });
                 results = literalResults.results;
             }
@@ -118,26 +119,22 @@ function executeSearch(index, strategy, options = {}) {
         for (const keyword of strategy.keywords.slice(0, 5)) {
             const literalResults = index.searchLiteral(keyword, { 
                 caseSensitive: false, 
-                maxResults: 20 
+                maxResults: 30 
             });
             results.push(...literalResults.results);
             
-            if (results.length >= maxResults) break;
+            if (results.length >= maxResults * 2) break;
         }
         
-        // Dedupe
-        const seen = new Set();
-        results = results.filter(r => {
-            const key = `${r.file}:${r.line}`;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-        
-        log(`Found ${results.length} results after dedup`);
+        log(`Found ${results.length} raw results`);
     }
     
-    return results.slice(0, maxResults);
+    // Rank results (prioritizes Java/TAL, filters docs)
+    const searchTerm = strategy.functionName || strategy.keywords.join(' ');
+    results = dedupeAndRank(results, searchTerm, maxResults);
+    log(`After ranking: ${results.length} results`);
+    
+    return results;
 }
 
 module.exports = {
