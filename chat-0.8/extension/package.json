@@ -1,8 +1,8 @@
 {
   "name": "astracode",
   "displayName": "AstraCode",
-  "description": "AI-powered code analysis using GitHub Copilot",
-  "version": "0.8.0",
+  "description": "AI-powered legacy code analysis and ISO 20022 modernization",
+  "version": "0.8.1",
   "publisher": "astracode",
   "engines": {
     "vscode": "^1.85.0"
@@ -15,16 +15,17 @@
       {
         "id": "astracode.chat",
         "name": "astra",
-        "description": "AI-powered code analysis",
+        "description": "Legacy code analysis and ISO 20022 modernization",
         "isSticky": true,
         "commands": [
-          { "name": "find", "description": "Search for code" },
-          { "name": "describe", "description": "Describe code functionality" },
+          { "name": "requirements", "description": "Extract business requirements (WHAT)" },
+          { "name": "fediso", "description": "Map to ISO 20022 standards" },
           { "name": "deepwiki", "description": "Generate wiki documentation" },
+          { "name": "describe", "description": "Describe code functionality" },
+          { "name": "find", "description": "Search for code" },
           { "name": "translate", "description": "Translate legacy code" },
-          { "name": "requirements", "description": "Extract business requirements" },
-          { "name": "help", "description": "Show help" },
-          { "name": "stats", "description": "Show workspace info" }
+          { "name": "stats", "description": "Show workspace statistics" },
+          { "name": "help", "description": "Show help" }
         ]
       }
     ],
@@ -34,7 +35,7 @@
         "astracode.preferredModel": {
           "type": "string",
           "default": "gpt-4o",
-          "description": "Preferred Copilot model (e.g., gpt-4o, claude-sonnet-4)"
+          "description": "Preferred Copilot model"
         }
       }
     }
