@@ -3,15 +3,15 @@
  */
 
 const { streamResponse } = require('../llm/copilot');
+const { getWorkspaceContext } = require('../llm/workspace-search');
 
-const systemPrompt = `You are a code search expert. Find relevant code in the workspace.
-For each match, show:
-- File path
-- Line number
-- Code snippet with context
-- Brief explanation of relevance
+const systemPrompt = `You are a code search expert. Summarize the search results.
+For each relevant file, show:
+- File path and key line numbers
+- Brief description of what the code does
+- Code snippet showing the most relevant part
 
-Group results by file. Prioritize source code over documentation.`;
+Group results by functionality. Prioritize source code over documentation.`;
 
 async function handle(ctx) {
     const { query, response, outputChannel, token } = ctx;
@@ -26,17 +26,33 @@ async function handle(ctx) {
         return;
     }
     
-    const userPrompt = `Search the codebase for: ${query}
+    response.progress('Searching workspace...');
+    const { context, files, totalLines, searchTerms } = await getWorkspaceContext(query, {
+        maxFiles: 15,
+        maxLinesPerFile: 200
+    });
+    
+    if (!context || files.length === 0) {
+        response.markdown(`⚠️ **No matches found for:** "${query}"
 
-Find all relevant occurrences and show:
-1. File path and line number
-2. Code snippet (3-5 lines of context)
-3. Brief note on what this code does
+**Searched for:** ${searchTerms?.join(', ') || query}`);
+        return;
+    }
+    
+    response.markdown(`🔍 **Found ${files.length} files matching "${query}"**\n\n`);
+    
+    const userPrompt = `Summarize the search results for: ${query}
 
-Prioritize:
-- Source files (.c, .h, .java, .py) over docs
-- Function definitions over references
-- Key implementation files over tests`;
+## Files Found
+${context}
+
+For each relevant file:
+1. Show the file path
+2. Identify the most relevant lines/functions
+3. Briefly explain what the code does
+4. Show a key code snippet
+
+Focus on the most relevant matches.`;
 
     await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
 }
