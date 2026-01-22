@@ -224,6 +224,7 @@ function generateSearchVariations(topic) {
 
 /**
  * Deduplicate and rank results by relevance
+ * ONLY returns Java/TAL files when available - completely excludes docs
  * @param {Array} results - Raw results
  * @param {string} topic - Original search topic
  * @param {number} maxResults - Max results to return
@@ -234,41 +235,83 @@ function dedupeAndRank(results, topic, maxResults) {
     const topicLower = topic.toLowerCase();
     const keywords = topicLower.split(/\s+/);
     
+    // PRIMARY: Java and TAL only
+    const primaryCode = new Set(['.java', '.tal']);
+    
+    // SECONDARY: Other source code
+    const secondaryCode = new Set([
+        '.cbl', '.cob', '.cobol', '.pli',
+        '.c', '.cpp', '.h', '.hpp', '.cs',
+        '.py', '.js', '.ts', '.tsx', '.jsx',
+        '.go', '.rs', '.rb', '.php', '.swift', '.kt', '.scala',
+        '.sql', '.pl', '.pm'
+    ]);
+    
+    // EXCLUDE: Never return these when code exists
+    const docExtensions = new Set([
+        '.md', '.txt', '.json', '.yaml', '.yml', '.xml',
+        '.html', '.css', '.svg', '.ini', '.cfg', '.conf',
+        '.properties', '.toml', '.gitignore', '.env'
+    ]);
+    
+    // Separate results by file type
+    const primaryResults = [];
+    const secondaryResults = [];
+    const docResults = [];
+    
     for (const result of results) {
         const key = `${result.file}:${result.line}`;
         
         if (!seen.has(key)) {
+            seen.set(key, true);
+            
+            const ext = '.' + (result.file.split('.').pop() || '').toLowerCase();
+            const matchLine = (result.matchLine || '').toLowerCase();
+            
             // Calculate relevance score
             let score = 0;
-            const matchLine = (result.matchLine || '').toLowerCase();
-            const context = result.context ? 
-                [...(result.context.before || []), ...(result.context.after || [])].join(' ').toLowerCase() : '';
-            
-            // Exact match in line
             if (matchLine.includes(topicLower)) score += 10;
-            
-            // Keyword matches
             for (const kw of keywords) {
                 if (matchLine.includes(kw)) score += 3;
-                if (context.includes(kw)) score += 1;
             }
             
-            // Function/class definition bonus
-            if (/^\s*(function|class|def|proc|interface|struct)\s/i.test(result.matchLine)) {
-                score += 5;
-            }
+            // Definition bonus
+            if (/^\s*(PROC|SUBPROC)\s+\w+/i.test(result.matchLine)) score += 25;
+            if (/^\s*(public|private|protected)\s+/i.test(result.matchLine)) score += 20;
+            if (/^\s*(class|interface|function|def)\s+/i.test(result.matchLine)) score += 15;
             
-            // Error handling bonus (for deepwiki)
-            if (/error|exception|throw|catch|fail/i.test(matchLine)) {
-                score += 2;
-            }
+            const scored = { ...result, score, ext };
             
-            seen.set(key, { ...result, score });
+            // Categorize by file type
+            if (primaryCode.has(ext)) {
+                primaryResults.push(scored);
+            } else if (secondaryCode.has(ext)) {
+                secondaryResults.push(scored);
+            } else if (!docExtensions.has(ext)) {
+                // Unknown extension - treat as secondary
+                secondaryResults.push(scored);
+            } else {
+                docResults.push(scored);
+            }
         }
     }
     
-    // Sort by score descending
-    return Array.from(seen.values())
+    // Return ONLY primary (Java/TAL) if available
+    if (primaryResults.length > 0) {
+        return primaryResults
+            .sort((a, b) => b.score - a.score)
+            .slice(0, maxResults);
+    }
+    
+    // Fall back to secondary code if no Java/TAL
+    if (secondaryResults.length > 0) {
+        return secondaryResults
+            .sort((a, b) => b.score - a.score)
+            .slice(0, maxResults);
+    }
+    
+    // Only return docs if no code at all
+    return docResults
         .sort((a, b) => b.score - a.score)
         .slice(0, maxResults);
 }
