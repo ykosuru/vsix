@@ -2,12 +2,12 @@
  * /describe command handler - Describe functionality of code
  */
 
-const { formatResultsForLLM, formatFileReferences, extractKeywords, dedupeAndLimit } = require('../search/search-utils');
+const { formatResultsForLLM, formatFileReferences, extractKeywords, dedupeAndRank } = require('../search/search-utils');
 const { streamResponse } = require('../llm/copilot');
 const prompts = require('../prompts/describe');
 
 /**
- * Search code using grep index
+ * Search code using grep index with ranking
  */
 function searchCode(grepIndex, searchTerm, maxResults = 30) {
     const keywords = extractKeywords(searchTerm);
@@ -16,12 +16,12 @@ function searchCode(grepIndex, searchTerm, maxResults = 30) {
     for (const keyword of keywords.slice(0, 5)) {
         const literalResults = grepIndex.searchLiteral(keyword, { 
             caseSensitive: false, 
-            maxResults: Math.floor(maxResults / keywords.length) + 10
+            maxResults: Math.floor(maxResults / keywords.length) + 20
         });
         results.push(...literalResults.results);
     }
     
-    return dedupeAndLimit(results, maxResults);
+    return dedupeAndRank(results, searchTerm, maxResults);
 }
 
 /**
