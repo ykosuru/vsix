@@ -2,7 +2,7 @@
  * /fediso command handler - Uplift to Fed ISO 20022
  */
 
-const { formatResultsForLLM, formatFileReferences, dedupeAndLimit } = require('../search/search-utils');
+const { formatResultsForLLM, formatFileReferences, dedupeAndRank } = require('../search/search-utils');
 const { streamResponse } = require('../llm/copilot');
 const prompts = require('../prompts/fediso');
 
@@ -24,13 +24,13 @@ async function handle(ctx) {
     for (const term of fedTerms) {
         const termResults = grepIndex.searchLiteral(term, { 
             caseSensitive: false, 
-            maxResults: 15 
+            maxResults: 25 
         });
         results.push(...termResults.results);
     }
     
-    // Dedupe and limit
-    results = dedupeAndLimit(results, 40);
+    // Dedupe and rank (prioritizes Java/TAL over docs)
+    results = dedupeAndRank(results, searchTerm, 40);
     
     if (results.length === 0) {
         response.markdown(`No Fed wire code found.\n\nTry:\n- \`@astra /find FEDIN\`\n- \`@astra /fediso wire message\``);
