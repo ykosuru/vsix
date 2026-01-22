@@ -15,12 +15,16 @@
   "search": {
     "maxResults": 50,
     "maxKeywords": 5,
-    "maxFilesPerQuery": 5000
+    "maxFilesPerQuery": 5000,
+    "priorityExtensions": [".java", ".tal"],
+    "codeExtensions": [".java", ".tal", ".cbl", ".cob", ".cobol", ".pli", ".c", ".cpp", ".h", ".hpp", ".cs", ".py", ".js", ".ts", ".go", ".rs", ".rb", ".sql"],
+    "excludeFromResults": [".md", ".json", ".yaml", ".yml", ".xml", ".txt", ".html", ".css"]
   },
   "fileExtensions": [
-    "ts", "tsx", "js", "jsx", "py", "java", "c", "cpp", "h", "hpp",
+    "java", "tal",
+    "ts", "tsx", "js", "jsx", "py", "c", "cpp", "h", "hpp",
     "cs", "go", "rs", "rb", "php", "swift", "kt", "scala", "sql",
-    "tal", "cbl", "cob", "cobol", "pli", "md", "json", "yaml", "yml"
+    "cbl", "cob", "cobol", "pli", "md", "json", "yaml", "yml"
   ],
   "excludePattern": "**/node_modules/**",
   "llm": {
