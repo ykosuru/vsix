@@ -3,6 +3,7 @@
  */
 
 const { streamResponse } = require('../llm/copilot');
+const { getWorkspaceContext } = require('../llm/workspace-search');
 
 const systemPrompt = `You are a code translation expert specializing in legacy modernization.
 Translate code while:
@@ -19,11 +20,27 @@ async function handle(ctx) {
 
 **Examples:**
 - \`@astra /translate PROC-VALIDATE to Java\`
-- \`@astra /translate legacy_payment_check\``);
+- \`@astra /translate legacy_check to Python\``);
         return;
     }
     
-    const userPrompt = `Translate this code to modern equivalent: ${query}
+    response.progress('Searching workspace...');
+    const { context, files } = await getWorkspaceContext(query, {
+        maxFiles: 10,
+        maxLinesPerFile: 300
+    });
+    
+    if (!context || files.length === 0) {
+        response.markdown(`⚠️ **No matching files found for:** "${query}"`);
+        return;
+    }
+    
+    response.markdown(`📄 **Found ${files.length} files**\n\n`);
+    
+    const userPrompt = `Translate this code: ${query}
+
+## Source Code
+${context}
 
 Provide:
 1. Original code analysis
