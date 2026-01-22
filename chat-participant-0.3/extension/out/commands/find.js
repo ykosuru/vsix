@@ -3,7 +3,7 @@
  */
 
 const path = require('path');
-const { dedupeAndLimit, groupByFile, formatSnippet, extractKeywords } = require('../search/search-utils');
+const { dedupeAndRank, groupByFile, formatSnippet, extractKeywords } = require('../search/search-utils');
 
 /**
  * Handle /find command
@@ -28,13 +28,13 @@ async function handle(ctx) {
     for (const keyword of keywords) {
         const literalResults = grepIndex.searchLiteral(keyword, { 
             caseSensitive: false, 
-            maxResults: 30 
+            maxResults: 50 
         });
         results.push(...literalResults.results);
     }
     
-    // Dedupe and limit
-    results = dedupeAndLimit(results, 50);
+    // Dedupe and rank (prioritizes code over docs)
+    results = dedupeAndRank(results, searchTerm, 50);
     
     if (results.length === 0) {
         response.markdown(`No matches found for: \`${searchTerm}\`\n\nTry:\n- Different spelling\n- Partial term\n- \`@astra /rebuild\` to refresh index`);
