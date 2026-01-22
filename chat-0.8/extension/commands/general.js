@@ -35,8 +35,17 @@ async function handle(ctx) {
         return;
     }
     
-    // Show what we found
-    response.markdown(`📄 **Found ${files.length} files** (${totalLines.toLocaleString()} lines)\n\n`);
+    // Show files being used
+    let filesUsed = `📄 **Found ${files.length} files** (${totalLines.toLocaleString()} lines)\n\n`;
+    filesUsed += `<details><summary>📂 Files analyzed</summary>\n\n`;
+    for (const f of files.slice(0, 25)) {
+        filesUsed += `- \`${f.path}\`\n`;
+    }
+    if (files.length > 25) {
+        filesUsed += `- *...and ${files.length - 25} more*\n`;
+    }
+    filesUsed += `\n</details>\n\n`;
+    response.markdown(filesUsed);
     
     const userPrompt = `Question: ${query}
 
@@ -46,10 +55,6 @@ ${context}
 Based on the code above, please answer the question. Reference specific files and line numbers.`;
 
     await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
-    
-    // Show sources
-    const sources = files.slice(0, 8).map(f => `\`${f.path}\``).join(', ');
-    response.markdown(`\n\n---\n**Sources:** ${sources}`);
 }
 
 module.exports = { handle };
