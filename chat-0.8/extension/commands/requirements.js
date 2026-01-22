@@ -1,8 +1,9 @@
 /**
- * /requirements command - extract business requirements as Gherkin
+ * /requirements command - extract business requirements
  */
 
 const { streamResponse } = require('../llm/copilot');
+const { getWorkspaceContext } = require('../llm/workspace-search');
 
 const systemPrompt = `You are a requirements analyst. Extract business requirements from code as Gherkin scenarios.
 
@@ -22,17 +23,33 @@ async function handle(ctx) {
         response.markdown(`**Usage:** \`@astra /requirements <feature>\`
 
 **Examples:**
-- \`@astra /requirements user login\`
 - \`@astra /requirements partition pruning\`
-- \`@astra /requirements data validation\``);
+- \`@astra /requirements user validation\`
+- \`@astra /requirements error handling\``);
         return;
     }
     
+    response.progress('Searching workspace...');
+    const { context, files, totalLines } = await getWorkspaceContext(query, {
+        maxFiles: 15,
+        maxLinesPerFile: 400
+    });
+    
+    if (!context || files.length === 0) {
+        response.markdown(`⚠️ **No matching files found for:** "${query}"`);
+        return;
+    }
+    
+    response.markdown(`📄 **Extracting requirements from ${files.length} files**\n\n`);
+    
     const userPrompt = `Extract business requirements for: ${query}
 
-Analyze the code and generate Gherkin scenarios that capture:
+## Source Code
+${context}
+
+Generate Gherkin scenarios that capture:
 1. Happy path scenarios
-2. Edge cases
+2. Edge cases  
 3. Error handling scenarios
 4. Validation rules
 
