@@ -14,8 +14,8 @@ let outputChannel = null;
 
 /**
  * Parse command chain from query
- * "@astra /requirements OFAC screening /fediso" 
- * → [{ command: 'requirements', query: 'OFAC screening' }, { command: 'fediso', query: '' }]
+ * "@astra /requirements OFAC screening /fediso /gencode" 
+ * → [{ command: 'requirements', query: 'OFAC screening' }, { command: 'fediso', query: '' }, { command: 'gencode', query: '' }]
  */
 function parseCommandChain(command, prompt) {
     const chain = [];
@@ -24,24 +24,27 @@ function parseCommandChain(command, prompt) {
     let currentCmd = command || '';
     let remaining = prompt || '';
     
-    // Check if prompt contains additional /commands
-    const pipeMatch = remaining.match(/^(.+?)\s+(\/\w+)(.*)$/);
+    // Split by /command patterns
+    // Match: "some query /nextcmd more stuff /anothercmd"
+    const parts = remaining.split(/\s+(\/\w+)/);
     
-    if (pipeMatch) {
-        // Found a pipe: "/requirements OFAC screening /fediso"
-        const query = pipeMatch[1].trim();
-        const nextCmd = pipeMatch[2].slice(1); // remove leading /
-        const rest = pipeMatch[3].trim();
-        
-        chain.push({ command: currentCmd, query });
-        
-        // Parse remaining chain
-        if (hasCommand(nextCmd)) {
-            chain.push({ command: nextCmd, query: rest });
-        }
+    if (parts.length === 1) {
+        // No pipes, single command
+        chain.push({ command: currentCmd, query: remaining.trim() });
     } else {
-        // Single command
-        chain.push({ command: currentCmd, query: remaining });
+        // First part is the query for the first command
+        const firstQuery = parts[0].trim();
+        chain.push({ command: currentCmd, query: firstQuery });
+        
+        // Process remaining parts in pairs: ['/cmd', 'query', '/cmd2', 'query2', ...]
+        for (let i = 1; i < parts.length; i += 2) {
+            const cmd = parts[i].slice(1); // Remove leading /
+            const query = (parts[i + 1] || '').trim();
+            
+            if (hasCommand(cmd)) {
+                chain.push({ command: cmd, query });
+            }
+        }
     }
     
     return chain;
@@ -95,7 +98,8 @@ async function handleRequest(request, chatContext, response, token, channel, get
             workspaceRoot,
             token,
             request,
-            previousOutput,  // Output from previous command in chain
+            chatContext,       // Pass chat history for accessing previous responses
+            previousOutput,    // Output from previous command in chain
             isPiped,
             context: null,
             contextStats: null
