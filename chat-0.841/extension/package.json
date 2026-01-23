@@ -4,6 +4,7 @@
   "description": "AI-powered legacy modernization, ISO 20022 migration, and Java code generation",
   "version": "0.8.4",
   "publisher": "astracode",
+  "icon": "assets/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
