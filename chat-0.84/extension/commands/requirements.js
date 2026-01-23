@@ -71,7 +71,7 @@ Extracts BUSINESS requirements from legacy code for building a NEW system.
 **Input Sources (can combine):**
 - 🔍 Query → searches workspace code
 - 📎 Attachments → attached files (PDFs, docs, code)
-- 🔗 Piped → from \`/conf.r\` Confluence pages
+- 🔗 Piped → from \`/conf.r\` or \`/history\`
 
 **Examples:**
 \`\`\`
@@ -88,13 +88,11 @@ Extracts BUSINESS requirements from legacy code for building a NEW system.
 **From Confluence:**
 \`\`\`
 @astra /conf.r Design Spec /requirements
-@astra /conf.r API Docs /requirements /fediso /gencode
 \`\`\`
 
-**Combined (Confluence + Attachments + Workspace):**
+**From Chat History:**
 \`\`\`
-[Attach: iso-spec.pdf]
-@astra /conf.r Design Spec /requirements wire-transfer
+@astra /history 5 /requirements
 \`\`\``);
         return;
     }
@@ -270,6 +268,11 @@ REMEMBER: Output must be understandable by business stakeholders and implementab
     
     // Set content for piping to next command (e.g., /fediso)
     ctx.pipedContent = generatedContent;
+    
+    // Debug logging
+    if (outputChannel) {
+        outputChannel.appendLine(`[AstraCode] /requirements: Generated ${generatedContent?.length || 0} chars for piping`);
+    }
     
     // Suggest next step only if not being piped
     if (!ctx.isPiped) {
