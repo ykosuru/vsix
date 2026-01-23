@@ -1,0 +1,263 @@
+/**
+ * AstraCode Chat Participant
+ * 
+ * Supports command chaining with pipe syntax:
+ *   @astra /requirements OFAC screening /fediso
+ *   @astra /describe payment flow /deepwiki
+ */
+
+const vscode = require('vscode');
+const { getHandler, PIPELINE_COMMANDS, hasCommand } = require('./commands');
+const { streamResponse } = require('./llm/copilot');
+
+let outputChannel = null;
+
+/**
+ * Parse command chain from query
+ * "@astra /requirements OFAC screening /fediso /gencode" 
+ * → [{ command: 'requirements', query: 'OFAC screening' }, { command: 'fediso', query: '' }, { command: 'gencode', query: '' }]
+ */
+function parseCommandChain(command, prompt) {
+    const chain = [];
+    
+    // First command from request.command
+    let currentCmd = command || '';
+    let remaining = prompt || '';
+    
+    // Split by /command patterns
+    const parts = remaining.split(/\s+(\/\w+)/);
+    
+    if (parts.length === 1) {
+        // No pipes, single command
+        chain.push({ command: currentCmd, query: remaining.trim() });
+    } else {
+        // First part is the query for the first command
+        const firstQuery = parts[0].trim();
+        chain.push({ command: currentCmd, query: firstQuery });
+        
+        // Process remaining parts in pairs
+        for (let i = 1; i < parts.length; i += 2) {
+            const cmd = parts[i].slice(1); // Remove leading /
+            const query = (parts[i + 1] || '').trim();
+            
+            if (hasCommand(cmd)) {
+                chain.push({ command: cmd, query });
+            }
+        }
+    }
+    
+    return chain;
+}
+
+/**
+ * Main request handler
+ */
+async function handleRequest(request, chatContext, response, token, channel, getWorkspaceRoot, confluenceAuth) {
+    if (channel) {
+        outputChannel = channel;
+    }
+    
+    const command = request.command || '';
+    const prompt = request.prompt || '';
+    
+    // Parse for command chaining
+    const chain = parseCommandChain(command, prompt);
+    
+    log(`Request: ${chain.map(c => `/${c.command || 'general'} ${c.query.slice(0, 20)}`).join(' → ')}`);
+    
+    const workspaceRoot = getWorkspaceRoot ? getWorkspaceRoot() : getDefaultWorkspaceRoot();
+    
+    // Handle utility commands (no chaining)
+    if (chain.length === 1 && chain[0].command === 'help') {
+        const handler = getHandler('help');
+        return handler({ query: chain[0].query, response, outputChannel });
+    }
+    
+    if (chain.length === 1 && chain[0].command === 'stats') {
+        response.progress('Scanning workspace...');
+        return showWorkspaceStats(response, workspaceRoot);
+    }
+    
+    // Execute command chain
+    let previousOutput = null;
+    let pipedContent = '';  // Content passed between piped commands
+    let sourceConfig = null; // Source configuration from /sources
+    
+    for (let i = 0; i < chain.length; i++) {
+        const { command: cmd, query } = chain[i];
+        const isLast = i === chain.length - 1;
+        const isPiped = i > 0;
+        
+        if (isPiped) {
+            response.markdown(`\n\n---\n## 🔗 Piping to /${cmd}\n\n`);
+        }
+        
+        const ctx = {
+            query: isPiped ? query : (query || chain[0].query), // Piped commands use their own query only
+            response,
+            outputChannel,
+            workspaceRoot,
+            token,
+            request,
+            chatContext,       // Pass chat history for accessing previous responses
+            confluenceAuth,    // Pass Confluence auth for /conf.r and /conf.w
+            previousOutput,    // Metadata from previous command
+            pipedContent,      // Actual content from previous command
+            sourceConfig,      // Source configuration from /sources
+            isPiped,
+            context: null,
+            contextStats: null
+        };
+        
+        const handler = getHandler(cmd);
+        
+        // Run the command
+        await handler(ctx);
+        
+        // Capture content for piping to next command
+        if (!isLast) {
+            previousOutput = { 
+                command: cmd, 
+                query: ctx.query
+            };
+            // Content set by command for piping
+            pipedContent = ctx.pipedContent || '';
+            // Source config from /sources command
+            if (ctx.sourceConfig) {
+                sourceConfig = ctx.sourceConfig;
+            }
+            
+            // Debug logging
+            if (outputChannel) {
+                outputChannel.appendLine(`[AstraCode] Piping from /${cmd}: ${pipedContent.length} chars captured`);
+            }
+        }
+    }
+}
+
+/**
+ * Show workspace statistics
+ */
+async function showWorkspaceStats(response, workspaceRoot) {
+    const fs = require('fs');
+    const path = require('path');
+    
+    const stats = {
+        totalFiles: 0,
+        totalLines: 0,
+        totalBytes: 0,
+        languages: {}
+    };
+    
+    const EXT_TO_LANG = {
+        '.c': 'C', '.h': 'C Header', '.cpp': 'C++', '.hpp': 'C++ Header',
+        '.java': 'Java', '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
+        '.go': 'Go', '.rs': 'Rust', '.rb': 'Ruby', '.php': 'PHP',
+        '.swift': 'Swift', '.kt': 'Kotlin', '.scala': 'Scala', '.sql': 'SQL',
+        '.sh': 'Shell', '.tal': 'TAL', '.cbl': 'COBOL', '.cob': 'COBOL',
+        '.md': 'Markdown', '.json': 'JSON', '.yaml': 'YAML', '.yml': 'YAML'
+    };
+    
+    const SKIP_DIRS = new Set([
+        'node_modules', '.git', 'dist', 'build', 'target', 'out',
+        '.idea', '.vscode', '__pycache__', '.next', 'vendor'
+    ]);
+    
+    function scanDir(dirPath, depth = 0) {
+        if (depth > 10) return;
+        
+        let entries;
+        try {
+            entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        } catch (e) { return; }
+        
+        for (const entry of entries) {
+            if (entry.name.startsWith('.')) continue;
+            
+            const fullPath = path.join(dirPath, entry.name);
+            
+            if (entry.isDirectory()) {
+                if (!SKIP_DIRS.has(entry.name)) {
+                    scanDir(fullPath, depth + 1);
+                }
+            } else if (entry.isFile()) {
+                const ext = path.extname(entry.name).toLowerCase();
+                const lang = EXT_TO_LANG[ext];
+                
+                if (lang) {
+                    try {
+                        const stat = fs.statSync(fullPath);
+                        if (stat.size > 1000000) continue;
+                        
+                        const content = fs.readFileSync(fullPath, 'utf8');
+                        const lines = content.split('\n').length;
+                        
+                        stats.totalFiles++;
+                        stats.totalLines += lines;
+                        stats.totalBytes += stat.size;
+                        
+                        if (!stats.languages[lang]) {
+                            stats.languages[lang] = { files: 0, lines: 0 };
+                        }
+                        stats.languages[lang].files++;
+                        stats.languages[lang].lines += lines;
+                    } catch (e) {}
+                }
+            }
+        }
+    }
+    
+    const folders = vscode.workspace.workspaceFolders || [];
+    if (folders.length === 0 && workspaceRoot) {
+        scanDir(workspaceRoot);
+    } else {
+        for (const folder of folders) {
+            scanDir(folder.uri.fsPath);
+        }
+    }
+    
+    const sortedLangs = Object.entries(stats.languages)
+        .sort((a, b) => b[1].lines - a[1].lines);
+    
+    const sizeKB = (stats.totalBytes / 1024).toFixed(1);
+    const sizeMB = (stats.totalBytes / (1024 * 1024)).toFixed(2);
+    const sizeStr = stats.totalBytes > 1024 * 1024 ? `${sizeMB} MB` : `${sizeKB} KB`;
+    
+    let md = `## 📊 Workspace Statistics
+
+**Root:** \`${workspaceRoot || 'No workspace'}\`
+
+| Metric | Value |
+|--------|-------|
+| **Total Files** | ${stats.totalFiles.toLocaleString()} |
+| **Total Lines** | ${stats.totalLines.toLocaleString()} |
+| **Total Size** | ${sizeStr} |
+
+### Languages
+
+| Language | Files | Lines |
+|----------|------:|------:|
+`;
+    
+    for (const [lang, data] of sortedLangs.slice(0, 15)) {
+        md += `| ${lang} | ${data.files.toLocaleString()} | ${data.lines.toLocaleString()} |\n`;
+    }
+    
+    response.markdown(md);
+}
+
+function getDefaultWorkspaceRoot() {
+    const folders = vscode.workspace.workspaceFolders;
+    return folders && folders.length > 0 ? folders[0].uri.fsPath : null;
+}
+
+function log(msg) {
+    if (outputChannel) {
+        outputChannel.appendLine(`[AstraCode] ${msg}`);
+    }
+    console.log(`[AstraCode] ${msg}`);
+}
+
+function clearIndex() {}
+
+module.exports = { handleRequest, clearIndex };
