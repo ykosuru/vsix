@@ -73,7 +73,7 @@ function activate(context) {
         }
     );
     
-    participant.iconPath = new vscode.ThemeIcon('search');
+    participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'assets', 'icon.png');
     
     context.subscriptions.push(
         participant, 
