@@ -37,7 +37,7 @@ Then publish back:
 | \`/find\` | Search for code | \`@astra /find partprune\` |
 | \`/translate\` | Translate legacy code | \`@astra /translate PROC_NAME\` |
 | \`/stats\` | Workspace statistics | \`@astra /stats\` |
-| \`/history N\` | Use last N responses as context | \`@astra /history 5 /requirements\` |
+| \`/history N\` | Use last N responses as context | \`@astra /history 3 clarify the API\` |
 | \`/clear\` | Clear context help | \`@astra /clear\` |
 
 ## ⚙️ Code Generation Settings
