@@ -18,7 +18,7 @@ AI-powered legacy modernization, ISO 20022 migration, and Java code generation f
 | `/deepwiki` | Generate documentation | `@astra /deepwiki .` (entire repo) |
 | `/conf.r` | Read Confluence page(s) | `@astra /conf.r Page1, Page2` |
 | `/conf.w` | Write to Confluence | `@astra /conf.w My Page Title` |
-| `/history` | Use previous responses | `@astra /history 5 /requirements` |
+| `/history` | Use previous responses / ask follow-up | `@astra /history 3 clarify the API` |
 | `/describe` | Explain code | `@astra /describe function_name` |
 | `/find` | Search code | `@astra /find partprune` |
 | `/translate` | Translate legacy code | `@astra /translate PROC_NAME` |
@@ -108,6 +108,12 @@ Configure in **VS Code Settings** → search "astracode":
 ```
 @astra how does payment validation work?
 @astra what about error handling?
+
+# Ask follow-up questions
+@astra /history 2 clarify the payload structure
+@astra /history 1 what validation rules are used?
+
+# Pipe to commands
 @astra /history 2 /requirements
 ```
 
