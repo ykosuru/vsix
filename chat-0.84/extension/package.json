@@ -31,6 +31,7 @@
           { "name": "translate", "description": "Translate legacy code" },
           { "name": "stats", "description": "Show workspace statistics" },
           { "name": "clear", "description": "Clear context help" },
+          { "name": "history", "description": "Use previous responses as context" },
           { "name": "help", "description": "Show help" }
         ]
       }
