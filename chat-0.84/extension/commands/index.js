@@ -13,6 +13,7 @@ const deepwiki = require('./deepwiki');
 const gencode = require('./gencode');
 const clear = require('./clear');
 const confluence = require('./confluence');
+const history = require('./history');
 
 const commands = {
     help: help.handle,
@@ -29,6 +30,8 @@ const commands = {
     wiki: deepwiki.handle,                  // alias
     clear: clear.handle,
     reset: clear.handle,                    // alias
+    history: history.handle,
+    hist: history.handle,                   // alias
     'conf.r': confluence.handleRead,        // read from Confluence
     'conf.w': confluence.handleWrite,       // write to Confluence
     general: general.handle
@@ -37,7 +40,7 @@ const commands = {
 const PIPELINE_COMMANDS = [
     'find', 'describe', 'translate', 'fediso', 'iso',
     'requirements', 'reqs', 'gencode', 'code',
-    'deepwiki', 'wiki', 'conf.r', 'conf.w'
+    'deepwiki', 'wiki', 'conf.r', 'conf.w', 'history', 'hist'
 ];
 
 function getHandler(command) {
