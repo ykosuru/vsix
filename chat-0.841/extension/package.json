@@ -25,6 +25,7 @@
           { "name": "fediso", "description": "Map to ISO 20022 standards" },
           { "name": "gencode", "description": "Generate Java code" },
           { "name": "deepwiki", "description": "Generate wiki documentation" },
+          { "name": "logic", "description": "Extract business logic from code" },
           { "name": "conf.r", "description": "Read Confluence page(s)" },
           { "name": "conf.w", "description": "Write to Confluence" },
           { "name": "describe", "description": "Describe code functionality" },
