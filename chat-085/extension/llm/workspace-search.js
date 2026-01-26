@@ -16,6 +16,13 @@ const SKIP_DIRS = new Set([
     '.vscode', '__pycache__', '.next', 'vendor', 'coverage', 'bin', 'obj'
 ]);
 
+// Important pattern files for Java projects
+const PATTERN_FILES = [
+    'Service.java', 'ServiceImpl.java', 'Handler.java', 'Controller.java',
+    'Processor.java', 'Validator.java', 'Mapper.java', 'Repository.java',
+    'Entity.java', 'Model.java', 'Exception.java'
+];
+
 /**
  * Search workspace and return context string for prompt
  */
@@ -34,19 +41,40 @@ async function getWorkspaceContext(query, options = {}) {
     
     console.log(`[AstraCode] Searching for: ${terms.join(', ')}`);
     
+    // Get directory structure first (important for understanding project)
+    const structure = getProjectStructure(workspaceRoot);
+    
     // Find matching files
     const matches = await searchFiles(workspaceRoot, terms, maxFiles * 3);
     
-    console.log(`[AstraCode] Found ${matches.length} matching files`);
+    // Also find pattern files (services, models, etc.)
+    const patternFiles = await findPatternFiles(workspaceRoot, terms);
+    
+    // Merge and dedupe
+    const allMatches = [...matches];
+    for (const pf of patternFiles) {
+        if (!allMatches.find(m => m.path === pf.path)) {
+            allMatches.push(pf);
+        }
+    }
+    
+    console.log(`[AstraCode] Found ${allMatches.length} matching files (${patternFiles.length} pattern files)`);
     
     // Score and sort files
-    const scoredFiles = scoreFiles(matches, terms);
+    const scoredFiles = scoreFiles(allMatches, terms);
     const topFiles = scoredFiles.slice(0, maxFiles);
     
-    // Build context string
+    // Build context string with structure first
     let context = '';
     let totalLines = 0;
     const includedFiles = [];
+    
+    // Add project structure overview
+    if (structure.length > 0) {
+        context += `## Project Structure\n\`\`\`\n${structure.join('\n')}\n\`\`\`\n\n`;
+    }
+    
+    context += `## Relevant Source Files\n\n`;
     
     for (const file of topFiles) {
         if (totalLines >= maxTotalLines) break;
@@ -86,6 +114,102 @@ async function getWorkspaceContext(query, options = {}) {
         totalLines,
         searchTerms: terms
     };
+}
+
+/**
+ * Get project directory structure (key folders)
+ */
+function getProjectStructure(rootPath, depth = 2) {
+    const result = [];
+    
+    function scan(dirPath, currentDepth, prefix = '') {
+        if (currentDepth > depth) return;
+        
+        let entries;
+        try {
+            entries = fs.readdirSync(dirPath, { withFileTypes: true })
+                .filter(e => !e.name.startsWith('.') && !SKIP_DIRS.has(e.name))
+                .sort((a, b) => {
+                    // Directories first
+                    if (a.isDirectory() && !b.isDirectory()) return -1;
+                    if (!a.isDirectory() && b.isDirectory()) return 1;
+                    return a.name.localeCompare(b.name);
+                });
+        } catch (e) {
+            return;
+        }
+        
+        for (const entry of entries.slice(0, 20)) {
+            const isLast = entries.indexOf(entry) === entries.length - 1;
+            const connector = isLast ? '└── ' : '├── ';
+            const nextPrefix = prefix + (isLast ? '    ' : '│   ');
+            
+            if (entry.isDirectory()) {
+                result.push(`${prefix}${connector}${entry.name}/`);
+                scan(path.join(dirPath, entry.name), currentDepth + 1, nextPrefix);
+            } else {
+                result.push(`${prefix}${connector}${entry.name}`);
+            }
+        }
+    }
+    
+    scan(rootPath, 0);
+    return result.slice(0, 50); // Limit structure output
+}
+
+/**
+ * Find pattern files (services, models, controllers)
+ */
+async function findPatternFiles(rootPath, terms) {
+    const results = [];
+    const seenPaths = new Set();
+    
+    function scanForPatterns(dirPath, depth = 0) {
+        if (depth > 6 || results.length >= 20) return;
+        
+        let entries;
+        try {
+            entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        } catch (e) {
+            return;
+        }
+        
+        for (const entry of entries) {
+            if (entry.name.startsWith('.')) continue;
+            
+            const fullPath = path.join(dirPath, entry.name);
+            
+            if (entry.isDirectory()) {
+                if (!SKIP_DIRS.has(entry.name)) {
+                    // Prioritize certain directories
+                    const dirName = entry.name.toLowerCase();
+                    if (['service', 'model', 'domain', 'handler', 'processor', 'api', 'controller'].includes(dirName)) {
+                        scanForPatterns(fullPath, depth); // Don't increment depth
+                    } else {
+                        scanForPatterns(fullPath, depth + 1);
+                    }
+                }
+            } else if (entry.isFile() && !seenPaths.has(fullPath)) {
+                const name = entry.name;
+                
+                // Check if it's a pattern file
+                for (const pattern of PATTERN_FILES) {
+                    if (name.endsWith(pattern)) {
+                        seenPaths.add(fullPath);
+                        results.push({ 
+                            path: fullPath, 
+                            matchedTerm: pattern.replace('.java', ''),
+                            isPattern: true
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    scanForPatterns(rootPath);
+    return results;
 }
 
 /**
@@ -202,6 +326,20 @@ function scoreFiles(files, terms) {
         // Boost source files
         if (pathLower.includes('/src/')) score += 15;
         if (!pathLower.includes('test')) score += 10;
+        
+        // Boost pattern files (services, models, etc.)
+        if (file.isPattern) score += 25;
+        
+        // Boost key directories
+        if (pathLower.includes('/service/')) score += 20;
+        if (pathLower.includes('/model/')) score += 20;
+        if (pathLower.includes('/domain/')) score += 20;
+        if (pathLower.includes('/handler/')) score += 15;
+        if (pathLower.includes('/api/')) score += 15;
+        
+        // Boost implementations and interfaces
+        if (name.endsWith('impl.java')) score += 15;
+        if (name.endsWith('service.java')) score += 15;
         
         // Penalize docs
         if (pathLower.includes('readme') || pathLower.includes('/docs/')) {
