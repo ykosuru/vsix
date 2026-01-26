@@ -22,20 +22,20 @@
         "isSticky": true,
         "commands": [
           { "name": "requirements", "description": "Extract business requirements" },
-          { "name": "fediso", "description": "Map to ISO 20022 standards" },
-          { "name": "gencode", "description": "Generate Java code" },
-          { "name": "deepwiki", "description": "Generate wiki documentation" },
           { "name": "logic", "description": "Extract business logic from code" },
+          { "name": "fediso", "description": "Map to ISO 20022 standards" },
+          { "name": "gencode", "description": "Generate Java code (/source llm|h|w|a)" },
+          { "name": "augment", "description": "Enhance code iteratively (/source h|w|a)" },
+          { "name": "deepwiki", "description": "Generate wiki documentation" },
+          { "name": "jira", "description": "Format content as Jira issue" },
           { "name": "conf.r", "description": "Read Confluence page(s)" },
           { "name": "conf.w", "description": "Write to Confluence" },
           { "name": "describe", "description": "Describe code functionality" },
           { "name": "find", "description": "Search for code" },
           { "name": "translate", "description": "Translate legacy code" },
-          { "name": "stats", "description": "Show workspace statistics" },
-          { "name": "clear", "description": "Clear context help" },
           { "name": "history", "description": "Use previous responses as context" },
           { "name": "sources", "description": "Configure input sources (Quick Pick)" },
-          { "name": "jira", "description": "Format content as Jira issue" },
+          { "name": "clear", "description": "Clear context help" },
           { "name": "help", "description": "Show help" }
         ]
       }
