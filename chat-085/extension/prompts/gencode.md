@@ -1,4 +1,3 @@
-[Uploading gencode.md…]()
 # Code Generation System Prompt
 
 ## Critical Requirement
