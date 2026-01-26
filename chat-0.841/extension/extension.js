@@ -14,7 +14,7 @@ let lastSourceConfig = null;  // Store last selected sources
 
 function activate(context) {
     const outputChannel = vscode.window.createOutputChannel('AstraCode');
-    outputChannel.appendLine('AstraCode activated (v0.8.4 - OAuth support)');
+    outputChannel.appendLine('AstraCode activated (v0.8.5)');
     
     // Initialize Confluence auth
     confluenceAuth = new ConfluenceAuth(context);
