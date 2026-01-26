@@ -128,21 +128,38 @@ Edit \`prompts/jira.md\` in the extension folder.
 
 `);
     
-    const systemPrompt = `You are an expert at writing Jira issues. 
+    // The system prompt emphasizes completeness and following the format
+    const systemPrompt = `You are an expert Business Analyst writing Jira issues.
+
+CRITICAL INSTRUCTIONS:
+1. **CAPTURE EVERY REQUIREMENT** - Do not skip, summarize, or omit ANY requirement from the input
+2. **Follow the exact format** specified below - use the same headers and structure
+3. **Be comprehensive** - Include all scenarios, edge cases, business rules, and technical details
+4. **Maintain traceability** - Number requirements (REQ-001, REQ-002) so they can be traced to acceptance criteria
+
 ${basePrompt}
 
-Format the content as a Jira **${issueType.toUpperCase()}**.
-${issueType === 'bug' ? 'Include: Steps to Reproduce, Expected vs Actual behavior, Severity' : ''}
-${issueType === 'epic' ? 'Include: Business Value, Child Stories breakdown, Timeline estimate' : ''}
-${issueType === 'spike' ? 'Include: Research Questions, Time-box recommendation, Expected Deliverables' : ''}
+You are formatting this as a Jira **${issueType.toUpperCase()}**.
+${issueType === 'bug' ? '\nAdditional sections for BUG:\n- Steps to Reproduce (numbered steps)\n- Expected Behavior\n- Actual Behavior\n- Severity: Critical/Major/Minor/Trivial\n- Environment details' : ''}
+${issueType === 'epic' ? '\nAdditional sections for EPIC:\n- Business Value statement\n- Child Stories breakdown (list potential stories)\n- Timeline estimate\n- Success Metrics' : ''}
+${issueType === 'spike' ? '\nAdditional sections for SPIKE:\n- Research Questions (numbered)\n- Time-box: [X days/hours]\n- Expected Deliverables\n- Decision Criteria' : ''}
 `;
 
-    const userPrompt = `Format this content as a Jira ${issueType}:
+    const userPrompt = `Analyze the following content and create a comprehensive Jira ${issueType}.
 
-## Input Content
-${inputContent.slice(0, 50000)}
+IMPORTANT: 
+- Extract and list EVERY requirement, scenario, and business rule
+- Do not summarize or skip any details
+- Follow the exact output format from the instructions
+- Number all requirements for traceability
 
-Provide a well-structured Jira ${issueType} with all required fields.`;
+## Input Content to Analyze
+
+${inputContent.slice(0, 80000)}
+
+---
+
+Create the Jira ${issueType} now, ensuring ALL requirements from the input are captured.`;
 
     const generatedContent = await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
     
