@@ -16,6 +16,7 @@ const confluence = require('./confluence');
 const history = require('./history');
 const sources = require('./sources');
 const jira = require('./jira');
+const logic = require('./logic');
 
 const commands = {
     help: help.handle,
@@ -37,6 +38,7 @@ const commands = {
     sources: sources.handle,
     src: sources.handle,                    // alias
     jira: jira.handle,
+    logic: logic.handle,
     'conf.r': confluence.handleRead,        // read from Confluence
     'conf.w': confluence.handleWrite,       // write to Confluence
     general: general.handle
@@ -46,7 +48,7 @@ const PIPELINE_COMMANDS = [
     'find', 'describe', 'translate', 'fediso', 'iso',
     'requirements', 'reqs', 'gencode', 'code',
     'deepwiki', 'wiki', 'conf.r', 'conf.w', 'history', 'hist',
-    'sources', 'src', 'jira'
+    'sources', 'src', 'jira', 'logic'
 ];
 
 function getHandler(command) {
