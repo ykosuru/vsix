@@ -7,84 +7,168 @@ function handle(ctx) {
     
     response.markdown(`# 🔍 AstraCode Help
 
-## 🚀 Iterative Code Generation Workflow
+## ⚡ Quick Reference Card
+
+| I want to... | Command |
+|--------------|---------|
+| Generate fresh code | \`/gencode /source llm /spec NAME ...\` |
+| Generate from requirements | \`/requirements ... /gencode\` |
+| Enhance existing code | \`/augment add ...\` |
+| Learn from workspace | \`/augment /source h,w learn from ...\` |
+| Analyze attachments only | \`/requirements /source a\` |
+| Extract business logic | \`/logic ...\` |
+| Create Jira ticket | \`/jira epic\` or \`/jira story\` |
+
+---
+
+## 📥 The /source Modifier
+
+Control where commands get their input data.
+
+### Source Options
+
+| Option | Meaning | Example |
+|--------|---------|---------|
+| \`llm\` | Pure LLM - no context | \`/source llm\` |
+| \`h\` | History - previous response | \`/source h\` |
+| \`w\` | Workspace - search codebase | \`/source w\` |
+| \`a\` | Attachments - attached files | \`/source a\` |
+
+### Combining Sources
 
 \`\`\`
-@astra /gencode /source llm pacs.008 credit transfer service
-@astra /augment add input validation
-@astra /augment /source h,w learn exception handling from MT103
-@astra /augment add logging and metrics
+/source h,w      ← History + Workspace
+/source h,a      ← History + Attachments  
+/source w,a      ← Workspace + Attachments
+/source h,w,a    ← All three
+\`\`\`
+
+### Command Defaults
+
+| Command | Default | What It Means |
+|---------|---------|---------------|
+| \`/gencode\` | \`h\` | Uses previous response as input |
+| \`/augment\` | \`h\` | Enhances previous code |
+| \`/requirements\` | \`w,a\` | Searches workspace + reads attachments |
+| \`/logic\` | \`w,a\` | Searches workspace + reads attachments |
+
+### Important: Piped Content Overrides /source
+
+When you chain commands, piped content **always** takes priority:
+
+\`\`\`
+@astra /requirements OFAC /gencode
+        ↑                   ↑
+        │                   └── Uses /requirements output (piped)
+        └── Searches workspace (default)
+\`\`\`
+
+So \`/gencode\` receives the requirements even without \`/source h\`.
+
+---
+
+## 🚀 Workflows
+
+### Fresh Code Generation
+\`\`\`
+@astra /gencode /source llm /spec pacs008 credit transfer service
+@astra /augment add validation
+@astra /augment add exception handling
+@astra /augment /source h,w learn retry patterns from MT103
 @astra /jira epic
 \`\`\`
 
-## 📥 Source Modifier
-
-Use \`/source\` to control where commands get input:
-
-| Source | Meaning |
-|--------|---------|
-| \`llm\` | Pure LLM (no context) |
-| \`h\` | History (previous response) - **default** |
-| \`w\` | Workspace search |
-| \`a\` | Attachments |
-
-**Combine sources:** \`/source h,w\` or \`/source h,w,a\`
-
-## Commands
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| \`/gencode\` | Generate Java code | \`@astra /gencode /source llm pacs.008\` |
-| \`/augment\` | Enhance code iteratively | \`@astra /augment add retry logic\` |
-| \`/requirements\` | Extract business requirements | \`@astra /requirements OFAC\` |
-| \`/logic\` | Extract business logic | \`@astra /logic MT103\` |
-| \`/fediso\` | Map to ISO 20022 | \`@astra /fediso wire transfer\` |
-| \`/deepwiki\` | Generate documentation | \`@astra /deepwiki query optimizer\` |
-| \`/jira\` | Format as Jira issue | \`@astra /jira epic\` |
-| \`/conf.r\` | Read Confluence page(s) | \`@astra /conf.r Page1, Page2\` |
-| \`/conf.w\` | Write to Confluence | \`@astra /conf.w Page Title\` |
-| \`/describe\` | Explain how code works | \`@astra /describe function_name\` |
-| \`/find\` | Search for code | \`@astra /find partprune\` |
-| \`/translate\` | Translate legacy code | \`@astra /translate PROC_NAME\` |
-| \`/history N\` | Use last N responses | \`@astra /history 3 clarify\` |
-| \`/sources\` | Configure input sources | \`@astra /sources\` |
-| \`/clear\` | Clear context help | \`@astra /clear\` |
-
-## ⚙️ Code Generation Settings
-
-Configure in **VS Code Settings** (Cmd+,) → search "astracode":
-
-| Setting | Options | Default |
-|---------|---------|---------|
-| \`codegen.framework\` | springboot, quarkus, micronaut | **springboot** |
-| \`codegen.messaging\` | kafka, rabbitmq, activemq, sqs | **kafka** |
-| \`codegen.architecture\` | microservice, lambda, monolith | **microservice** |
-| \`codegen.deployment\` | ocp, kubernetes, aws-lambda, vm | **kubernetes** |
-| \`codegen.persistence\` | jpa, jdbc, mongodb, dynamodb | **jpa** |
-
-## 📚 Confluence Integration
-
-**Option 1: API Token (Simple)**
-\`\`\`json
-{
-  "astracode.confluence.baseUrl": "https://company.atlassian.net/wiki",
-  "astracode.confluence.spaceKey": "DOCS",
-  "astracode.confluence.username": "your.email@company.com",
-  "astracode.confluence.apiToken": "your-api-token"
-}
+### Requirements → ISO → Code Pipeline
+\`\`\`
+@astra /requirements OFAC screening
+@astra /fediso
+@astra /gencode
 \`\`\`
 
-**Option 2: OAuth (Enterprise)**
-1. Register at https://developer.atlassian.com/console/myapps/
-2. Set \`astracode.confluence.clientId\`
-3. Run **Confluence: Sign In** (Cmd+Shift+P)
+### Analyze Attachments Only
+\`\`\`
+[Attach: design-spec.pdf, api-doc.md]
+@astra /requirements /source a payment processing
+\`\`\`
 
-## 🔄 Pipeline Examples
+### Learn from Existing Code
+\`\`\`
+@astra /gencode /source llm payment service
+@astra /augment /source h,w add error handling like PaymentProcessor
+\`\`\`
+
+---
+
+## 📋 Commands Reference
+
+### Code Generation
+
+| Command | /source | Default | Description |
+|---------|:-------:|---------|-------------|
+| \`/gencode\` | ✅ | \`h\` | Generate Java code |
+| \`/augment\` | ✅ | \`h\` | Enhance code iteratively |
+
+### Analysis
+
+| Command | /source | Default | Description |
+|---------|:-------:|---------|-------------|
+| \`/requirements\` | ✅ | \`w,a\` | Extract business requirements |
+| \`/logic\` | ✅ | \`w,a\` | Extract business logic |
+| \`/describe\` | | | Explain code functionality |
+| \`/find\` | | | Search for code |
+| \`/stats\` | | | Workspace/attachment statistics |
+
+### Documentation & Output
+
+| Command | Description |
+|---------|-------------|
+| \`/fediso\` | Map to ISO 20022 |
+| \`/deepwiki\` | Generate documentation |
+| \`/jira\` | Format as Jira ticket |
+| \`/conf.r\` | Read Confluence page(s) |
+| \`/conf.w\` | Write to Confluence |
+
+---
+
+## 📄 Specs (/spec modifier)
+
+Load domain specifications from \`prompts/specs/\`:
+
+\`\`\`
+@astra /gencode /source llm /spec pacs008 credit transfer
+\`\`\`
+
+| Format | Use Case |
+|--------|----------|
+| \`.xsd\` | XML Schema (ISO 20022, SWIFT) |
+| \`.xml\` | XML samples |
+| \`.json\` | JSON schema/samples |
+| \`.md\` | Markdown documentation |
+
+**Add your own:** Drop files in \`prompts/specs/\`
+
+---
+
+## ⚙️ Settings
+
+Configure in **VS Code Settings** → search "astracode":
+
+| Setting | Default | Options |
+|---------|---------|---------|
+| \`codegen.framework\` | springboot | quarkus, micronaut |
+| \`codegen.architecture\` | microservice | hexagonal, monolith |
+| \`codegen.persistence\` | jpa | jdbc, mongodb |
+| \`codegen.messaging\` | kafka | rabbitmq, sqs |
+
+---
+
+## 🔗 Pipeline Examples
 
 \`\`\`
 @astra /requirements OFAC /fediso /gencode
 @astra /conf.r Design Spec /requirements /jira
-@astra /logic MT103 /gencode /augment add validation
+@astra /find MT103 /logic /gencode
+@astra /logic payment /gencode /augment add validation
 \`\`\`
 `);
     
