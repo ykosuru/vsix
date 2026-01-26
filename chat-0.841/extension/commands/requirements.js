@@ -1,20 +1,20 @@
 /**
  * /requirements command - Extract BUSINESS requirements for modernization
  * 
- * Focuses on WHAT the system does, not HOW it's implemented.
- * Supports attached documents (vendor specs, API docs) for comprehensive analysis.
+ * Usage:
+ * @astra /requirements OFAC screening                  - Search workspace (default)
+ * @astra /requirements /source w,a payment validation  - Workspace + attachments
+ * @astra /requirements /source a                       - Attachments only
+ * @astra /conf.r Design /requirements                  - Piped from Confluence
  * 
- * Output sections:
- * - From Code: Requirements extracted from legacy code
- * - From Attached Docs: Requirements from any attached documentation
- * - Merged Requirements: Comprehensive combined view
+ * Focuses on WHAT the system does, not HOW it's implemented.
  */
 
 const vscode = require('vscode');
-const fs = require('fs');
 const path = require('path');
 const { streamResponse } = require('../llm/copilot');
 const { getWorkspaceContext } = require('../llm/workspace-search');
+const { parseModifiers, readAttachments, extractHistoryContent, SOURCE_HELP } = require('../utils/source-parser');
 
 const systemPrompt = `You are a business analyst extracting requirements from legacy systems for modernization to a NEW system.
 
@@ -26,7 +26,7 @@ CRITICAL RULES:
 
 FORMAT:
 
-## From Code Analysis
+## Business Requirements
 
 Feature: <Business Capability>
   # <Business context - why this exists>
@@ -37,52 +37,64 @@ Feature: <Business Capability>
     Then <business result>
     # Business Rule: <rule in plain language>
 
-## From Documentation (if provided)
-<Requirements found in attached specs/docs>
+## Data Requirements
+- Input data needed
+- Output data produced
+- Data transformations
 
-## Merged Requirements
-<Comprehensive list combining both sources, removing duplicates>
+## Integration Points
+- External systems interactions (in business terms)
+- Message/event flows
+
+## Business Rules Summary
+- BR-001: <rule>
+- BR-002: <rule>
 
 TERMINOLOGY TRANSLATION:
 - Queue/MQ → "message channel" or "integration point"  
 - Database/Table → "data store" or "record"
 - Procedure/Module → omit entirely
 - File names → omit entirely
-- Technical params → translate to business meaning
-
-Example transformations:
-- "OFAC-REQUEST-QUEUE" → "sanctions screening service"
-- "MQOFAC process" → "compliance screening"
-- "ISN field" → "transaction identifier"
-- "XML payload" → "transaction details"`;
+- Technical params → translate to business meaning`;
 
 async function handle(ctx) {
-    const { query, response, outputChannel, token, request, isPiped, previousOutput, pipedContent: ctxPipedContent } = ctx;
+    const { query, response, outputChannel, token, request, chatContext, pipedContent: ctxPipedContent, previousOutput } = ctx;
     
-    // Check for piped content from previous command (e.g., /conf.r)
+    // Parse /source modifier (default: workspace search)
+    const { sources, cleanQuery } = parseModifiers(query, { llm: false, h: false, w: true, a: true });
+    
+    // Check for piped content
     const pipedContent = ctxPipedContent || '';
     const hasPipedContent = pipedContent.length > 100;
     
-    if (!query.trim() && !hasPipedContent) {
-        response.markdown(`**Usage:** \`@astra /requirements <business area>\`
+    if (!cleanQuery.trim() && !hasPipedContent && !sources.a) {
+        response.markdown(`# /requirements - Extract Business Requirements
 
-Extracts BUSINESS requirements from legacy code for building a NEW system.
+**Usage:** \`@astra /requirements [/source <s>] <business area>\`
 
-**Input Sources (can combine):**
-- 🔍 Query → searches workspace code
-- 📎 Attachments → attached files (PDFs, docs, code)
-- 🔗 Piped → from \`/conf.r\` or \`/history\`
+Extracts BUSINESS requirements from legacy code. Focuses on WHAT the system does, not HOW.
 
-**Examples:**
+## Source Options (default: \`w,a\`)
+
+| Source | When to Use |
+|--------|-------------|
+| \`w\` | Search workspace for legacy code |
+| \`a\` | Analyze attached documents |
+| \`w,a\` | Both workspace + attachments **(default)** |
+| \`h,w\` | Continue previous + workspace |
+
+## Examples
+
+**Search workspace:**
 \`\`\`
 @astra /requirements OFAC screening
-@astra /requirements OFAC /fediso /gencode
+@astra /requirements payment validation
 \`\`\`
 
-**With Attachments:**
+**Attachments only:**
 \`\`\`
-[Attach: vendor-api.pdf, spec.docx]
-@astra /requirements payment processing
+[Attach: design-spec.pdf, api-doc.md]
+@astra /requirements /source a payment processing
 \`\`\`
 
 **From Confluence:**
@@ -90,12 +102,26 @@ Extracts BUSINESS requirements from legacy code for building a NEW system.
 @astra /conf.r Design Spec /requirements
 \`\`\`
 
-**From Chat History:**
+**Continue analysis:**
 \`\`\`
-@astra /history 5 /requirements
-\`\`\``);
+@astra /requirements /source h,w continue with edge cases
+\`\`\`
+
+## Output Format
+
+- Gherkin scenarios (Given/When/Then)
+- Numbered business rules (BR-001, BR-002...)
+- Data requirements
+- Integration points
+
+## Pipelines
+
+\`\`\`
+@astra /requirements OFAC /fediso /gencode
+@astra /requirements payment /jira epic
+\`\`\`
+`);
         
-        // Add configure sources button
         response.button({
             command: 'astracode.configureSources',
             title: '⚙️ Configure Input Sources'
@@ -103,189 +129,141 @@ Extracts BUSINESS requirements from legacy code for building a NEW system.
         return;
     }
     
-    // Check for attached documents
-    let attachedDocs = '';
-    let hasAttachments = false;
-    let attachedDocNames = [];
+    // Gather sources
+    const sourcesUsed = [];
+    let workspaceContent = '';
+    let workspaceFiles = [];
+    let attachmentContent = '';
+    let attachmentNames = [];
+    let historyContent = '';
     
-    if (request && request.references && request.references.length > 0) {
-        hasAttachments = true;
-        response.progress('Reading attached documents...');
-        
-        for (const ref of request.references) {
-            try {
-                let content = '';
-                let fileName = '';
-                
-                if (ref.id && typeof ref.id === 'string') {
-                    // File reference
-                    const uri = vscode.Uri.parse(ref.id);
-                    const fileContent = await vscode.workspace.fs.readFile(uri);
-                    content = Buffer.from(fileContent).toString('utf8');
-                    fileName = path.basename(uri.fsPath);
-                } else if (ref.value && typeof ref.value === 'string') {
-                    // Direct content
-                    content = ref.value;
-                    fileName = 'attached-content';
-                }
-                
-                if (content) {
-                    attachedDocNames.push(fileName);
-                    // Limit size
-                    const maxChars = 50000;
-                    if (content.length > maxChars) {
-                        content = content.slice(0, maxChars) + '\n... [truncated]';
-                    }
-                    attachedDocs += `\n### Document: ${fileName}\n${content}\n`;
-                }
-            } catch (e) {
-                outputChannel?.appendLine(`[AstraCode] Error reading attachment: ${e.message}`);
-            }
+    // Piped content takes priority
+    if (hasPipedContent) {
+        sourcesUsed.push(`🔗 Piped${previousOutput ? ` from /${previousOutput.command}` : ''}`);
+    }
+    
+    // History
+    if (sources.h) {
+        historyContent = extractHistoryContent(chatContext, 1);
+        if (historyContent.length > 50) {
+            sourcesUsed.push('📜 History');
         }
     }
     
-    // Search workspace for code if query provided
-    // - Standalone: search with query
-    // - Piped: optionally augment piped content with workspace code
-    let context = '';
-    let files = [];
-    
-    if (query.trim()) {
-        response.progress('Analyzing legacy code...');
-        const searchResult = await getWorkspaceContext(query, {
+    // Workspace search
+    if (sources.w && cleanQuery.trim()) {
+        response.progress('Searching workspace...');
+        const result = await getWorkspaceContext(cleanQuery, {
             maxFiles: 20,
             maxLinesPerFile: 350
         });
-        context = searchResult.context;
-        files = searchResult.files || [];
+        workspaceContent = result.context || '';
+        workspaceFiles = result.files || [];
+        if (workspaceFiles.length > 0) {
+            sourcesUsed.push(`🔍 Workspace (${workspaceFiles.length} files)`);
+        }
     }
     
-    if (!context && !attachedDocs && !hasPipedContent) {
+    // Attachments
+    if (sources.a) {
+        const { content, names } = await readAttachments(request?.references, outputChannel);
+        attachmentContent = content;
+        attachmentNames = names;
+        if (names.length > 0) {
+            sourcesUsed.push(`📎 Attachments (${names.length})`);
+        }
+    }
+    
+    // Check we have something
+    const hasContent = hasPipedContent || historyContent || workspaceContent || attachmentContent;
+    if (!hasContent) {
         response.markdown(`⚠️ **No content found.**
-        
-Provide a query, attach files, or pipe from \`/conf.r\`:
-\`\`\`
-@astra /conf.r Design Spec /requirements
-\`\`\``);
+
+Provide a query to search workspace, attach files, or pipe from another command.
+`);
         return;
     }
     
-    const fileCount = files?.length || 0;
-    const pipedFrom = hasPipedContent && previousOutput ? previousOutput.command : null;
+    // Show sources
+    response.markdown(`**📥 Sources:** ${sourcesUsed.join(', ') || 'None'}\n\n`);
     
-    // Show all input sources being used
-    let sourcesUsed = '**📥 Input Sources:**\n\n';
-    let sourceCount = 0;
-    
-    if (hasPipedContent) {
-        sourcesUsed += `- 🔗 **Piped content** ${pipedFrom ? `from \`/${pipedFrom}\`` : ''}\n`;
-        sourceCount++;
-    }
-    
-    if (fileCount > 0) {
-        sourcesUsed += `- 🔍 **Workspace code** (${fileCount} files)\n`;
-        sourceCount++;
-    }
-    
-    if (hasAttachments) {
-        sourcesUsed += `- 📎 **Attached files** (${attachedDocNames.length})\n`;
-        sourceCount++;
-    }
-    
-    sourcesUsed += '\n';
-    
-    // Collapsible details for each source
-    if (files && files.length > 0) {
-        sourcesUsed += `<details><summary>📂 Source files (${files.length})</summary>\n\n`;
-        for (const f of files.slice(0, 25)) {
-            sourcesUsed += `- \`${f.path}\`\n`;
+    // Show file details
+    if (workspaceFiles.length > 0) {
+        let details = `<details><summary>📂 Workspace files (${workspaceFiles.length})</summary>\n\n`;
+        for (const f of workspaceFiles.slice(0, 20)) {
+            details += `- \`${f.path}\`\n`;
         }
-        if (files.length > 25) {
-            sourcesUsed += `- *...and ${files.length - 25} more*\n`;
-        }
-        sourcesUsed += `\n</details>\n\n`;
+        details += `\n</details>\n\n`;
+        response.markdown(details);
     }
     
-    if (attachedDocNames && attachedDocNames.length > 0) {
-        sourcesUsed += `<details><summary>📎 Attached documents (${attachedDocNames.length})</summary>\n\n`;
-        for (const name of attachedDocNames) {
-            sourcesUsed += `- \`${name}\`\n`;
+    if (attachmentNames.length > 0) {
+        let details = `<details><summary>📎 Attachments (${attachmentNames.length})</summary>\n\n`;
+        for (const name of attachmentNames) {
+            details += `- \`${name}\`\n`;
         }
-        sourcesUsed += `\n</details>\n\n`;
+        details += `\n</details>\n\n`;
+        response.markdown(details);
     }
     
-    response.markdown(sourcesUsed);
-    
-    let userPrompt = `Extract BUSINESS REQUIREMENTS for: ${query || 'the provided content'}
+    // Build prompt
+    let userPrompt = `Extract BUSINESS REQUIREMENTS for: ${cleanQuery || 'the provided content'}
 
 This analysis is for building a NEW system. Focus on WHAT business rules exist, not how they're currently implemented.
 
 `;
 
-    // Add piped content (e.g., from /conf.r)
     if (hasPipedContent) {
-        userPrompt += `## Source Document${pipedFrom ? ` (from /${pipedFrom})` : ''}
-(Extract business requirements from this content)
-
+        userPrompt += `## Source Content (piped)
 ${pipedContent.slice(0, 50000)}
 
 `;
     }
+    
+    if (historyContent) {
+        userPrompt += `## Previous Context
+${historyContent.slice(0, 30000)}
 
-    if (context) {
+`;
+    }
+
+    if (workspaceContent) {
         userPrompt += `## Legacy Source Code
 (Analyze for business rules - DO NOT reference file names or implementation details in output)
 
-${context}
+${workspaceContent}
 
 `;
     }
 
-    if (attachedDocs) {
+    if (attachmentContent) {
         userPrompt += `## Attached Documentation
-(Vendor specs, API docs, or other reference materials)
-
-${attachedDocs}
+${attachmentContent}
 
 `;
     }
 
-    userPrompt += `Generate requirements in THREE sections:
-
-## From Code Analysis
-Gherkin scenarios capturing business rules found in the code.
+    userPrompt += `Generate comprehensive business requirements:
+- Use Gherkin scenarios for testable requirements
+- Number business rules (BR-001, BR-002...)
+- Include data and integration requirements
 - NO file names, procedure names, or technical details
 - Use business language only
 
-${hasAttachments ? `## From Documentation
-Requirements/capabilities described in the attached docs.
-- API capabilities, data formats, integration points
-- Translate technical specs to business requirements
-
-## Merged Requirements  
-Comprehensive list combining both sources:
-- Deduplicate overlapping requirements
-- Note any gaps (in code but not docs, or vice versa)
-- Prioritize by business importance` : ''}
-
-REMEMBER: Output must be understandable by business stakeholders and implementable in ANY technology.`;
+REMEMBER: Output must be understandable by business stakeholders.`;
 
     const generatedContent = await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
     
-    // Set content for piping to next command (e.g., /fediso)
+    // Set for piping
     ctx.pipedContent = generatedContent;
     
-    // Debug logging
-    if (outputChannel) {
-        outputChannel.appendLine(`[AstraCode] /requirements: Generated ${generatedContent?.length || 0} chars for piping`);
-    }
-    
-    // Suggest next step only if not being piped
+    // Suggest next steps
     if (!ctx.isPiped) {
         response.markdown(`\n\n---
 **Next steps:**
-- \`@astra /fediso ${query || ''}\` → Map to ISO 20022
-- \`@astra /requirements ${query || ''} /fediso /gencode\` → Full pipeline`);
+- \`@astra /fediso\` → Map to ISO 20022
+- \`@astra /logic ${cleanQuery || ''}\` → Extract business logic
+- \`@astra /gencode\` → Generate code`);
     }
 }
 
