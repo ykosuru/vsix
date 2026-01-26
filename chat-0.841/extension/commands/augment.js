@@ -153,37 +153,68 @@ async function handle(ctx) {
     const { sources, cleanQuery } = parseSourceModifier(query);
     
     if (!cleanQuery.trim() && !pipedContent) {
-        response.markdown(`**Usage:** \`@astra /augment [/source <sources>] <instruction>\`
+        response.markdown(`# /augment - Enhance Code Iteratively
 
-**Enhance previously generated code.**
+**Usage:** \`@astra /augment [/source <s>] <instruction>\`
 
-**Sources:**
-| Source | Meaning |
-|--------|---------|
-| \`llm\` | Pure LLM enhancement (instruction only) |
-| \`h\` | History (previous response) - **default** |
-| \`w\` | Workspace (search for reference code) |
-| \`a\` | Attachments (use as reference) |
+Enhance previously generated code without starting over.
 
-**Examples:**
+## Source Options (default: \`h\`)
+
+| Source | When to Use |
+|--------|-------------|
+| \`h\` | Enhance previous output **(default)** |
+| \`h,w\` | Previous + learn from workspace |
+| \`h,a\` | Previous + learn from attachments |
+| \`h,w,a\` | All sources |
+
+## Common Instructions
+
+| Instruction | What It Does |
+|-------------|--------------|
+| \`add validation\` | Input validation, null checks |
+| \`add exception handling\` | Try/catch, error recovery |
+| \`add logging\` | SLF4J logging statements |
+| \`add retry logic\` | Retry with backoff |
+| \`add metrics\` | Counters, timers |
+| \`refactor to X\` | Architecture changes |
+| \`make production ready\` | All of the above |
+
+## Examples
+
+**Basic enhancement:**
 \`\`\`
 @astra /augment add exception handling
-@astra /augment refactor to clean architecture
-@astra /augment /source h,w add MT103 validation patterns
-@astra /augment /source h,a add retry logic like attachment
-@astra /augment make production ready
+@astra /augment add logging and metrics
 \`\`\`
 
-**Workflow:**
+**Learn from workspace:**
 \`\`\`
-@astra /gencode /source llm pacs.008 service
-@astra /augment add validation
-@astra /augment /source h,w learn error handling from MT103
-@astra /augment add logging and metrics
+@astra /augment /source h,w add validation like MT103Handler
+@astra /augment /source h,w learn retry pattern from PaymentService
+\`\`\`
+
+**Learn from attachment:**
+\`\`\`
+[Attach: RetryHandler.java]
+@astra /augment /source h,a add retry logic like attachment
+\`\`\`
+
+## Typical Workflow
+
+\`\`\`
+@astra /gencode /source llm /spec pacs008 credit transfer
+@astra /augment add input validation
+@astra /augment add exception handling
+@astra /augment /source h,w learn error patterns from MT103
+@astra /augment add logging
+@astra /augment make production ready
 @astra /jira epic
 \`\`\`
 
-**Customize:** Edit \`prompts/augment.md\`
+## Customize
+
+Edit \`prompts/augment.md\` to change enhancement guidelines.
 `);
         return;
     }
