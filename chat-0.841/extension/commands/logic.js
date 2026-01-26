@@ -2,9 +2,10 @@
  * /logic command - Extract business logic from code
  * 
  * Usage:
- * @astra /logic MT103              - Extract logic from MT103 code
- * @astra /logic payment validation - Extract validation logic
- * @astra /requirements /logic      - Extract from piped content
+ * @astra /logic MT103                     - Search workspace (default)
+ * @astra /logic /source w,a payment       - Workspace + attachments
+ * @astra /logic /source a                 - Attachments only
+ * @astra /find MT103 /logic               - Piped
  * 
  * Customize output: Edit prompts/logic.md
  */
@@ -14,7 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { streamResponse } = require('../llm/copilot');
 const { getWorkspaceContext } = require('../llm/workspace-search');
-const { getSelectedSources } = require('./sources');
+const { parseModifiers, readAttachments, extractHistoryContent, SOURCE_HELP } = require('../utils/source-parser');
 
 /**
  * Load prompt from file
@@ -24,7 +25,6 @@ function loadPrompt() {
         const promptPath = path.join(__dirname, '..', 'prompts', 'logic.md');
         return fs.readFileSync(promptPath, 'utf8');
     } catch (e) {
-        // Fallback if file not found
         return `Extract all business logic including:
 - Validations and preconditions
 - If/then/else conditions
@@ -36,201 +36,213 @@ function loadPrompt() {
     }
 }
 
-/**
- * Read attached files
- */
-async function readAttachments(references, outputChannel) {
-    let content = '';
-    const attachedNames = [];
-    
-    if (!references || references.length === 0) return { content: '', attachedNames: [] };
-    
-    for (const ref of references) {
-        try {
-            if (ref.id && typeof ref.id === 'string') {
-                const uri = vscode.Uri.parse(ref.id);
-                const data = await vscode.workspace.fs.readFile(uri);
-                const text = Buffer.from(data).toString('utf8');
-                const fileName = uri.path.split('/').pop();
-                
-                const maxChars = 50000;
-                const truncated = text.length > maxChars 
-                    ? text.slice(0, maxChars) + '\n... [truncated]' 
-                    : text;
-                
-                content += `\n### File: ${fileName}\n\`\`\`\n${truncated}\n\`\`\`\n`;
-                attachedNames.push(fileName);
-                outputChannel?.appendLine(`[AstraCode] Read attachment: ${fileName} (${text.length} chars)`);
-            }
-        } catch (e) {
-            outputChannel?.appendLine(`[AstraCode] Error reading attachment: ${e.message}`);
-        }
-    }
-    
-    return { content, attachedNames };
-}
-
 async function handle(ctx) {
-    const { query, response, outputChannel, token, request, pipedContent: ctxPipedContent, sourceConfig } = ctx;
+    const { query, response, outputChannel, token, request, chatContext, pipedContent: ctxPipedContent, previousOutput } = ctx;
+    
+    // Parse /source modifier (default: workspace + attachments)
+    const { sources, cleanQuery } = parseModifiers(query, { llm: false, h: false, w: true, a: true });
     
     // Check for piped content
     const pipedContent = ctxPipedContent || '';
     const hasPipedContent = pipedContent.length > 100;
     
-    // Get source configuration
-    const sources = sourceConfig || getSelectedSources();
-    
-    // Check for attachments
-    const { content: attachedContent, attachedNames } = await readAttachments(
-        request?.references, 
-        outputChannel
-    );
-    const hasAttachments = attachedContent.length > 100;
-    
-    if (!query.trim() && !hasPipedContent && !hasAttachments) {
-        response.markdown(`**Usage:** \`@astra /logic <functionality>\`
+    if (!cleanQuery.trim() && !hasPipedContent && !sources.a) {
+        response.markdown(`# /logic - Extract Business Logic
 
-**Extract business logic from code including:**
-- Validations & preconditions
-- If/then/else conditions
-- Switch/case statements  
-- Calculations & transformations
-- External system interactions
-- Response code handling
-- Exception handling
+**Usage:** \`@astra /logic [/source <s>] <functionality>\`
 
-**Examples:**
+Extracts all business logic from code with file:line references.
+
+## What It Extracts
+
+| Category | Examples |
+|----------|----------|
+| **Validations** | Input checks, preconditions |
+| **Conditionals** | If/then/else, switch/case |
+| **Calculations** | Formulas, transformations |
+| **Data Operations** | Loops, aggregations |
+| **External Calls** | API calls, DB queries |
+| **Response Handling** | Status codes, error responses |
+| **Exceptions** | Try/catch, error recovery |
+
+## Source Options (default: \`w,a\`)
+
+| Source | When to Use |
+|--------|-------------|
+| \`w\` | Search workspace code |
+| \`a\` | Analyze attached files |
+| \`w,a\` | Both **(default)** |
+| \`h,w\` | Continue previous + workspace |
+
+## Examples
+
+**Search workspace:**
 \`\`\`
 @astra /logic MT103 processing
 @astra /logic payment validation
 @astra /logic OFAC screening
 \`\`\`
 
-**With attachments:**
+**Attachments only:**
 \`\`\`
 [Attach: PaymentService.java]
-@astra /logic
+@astra /logic /source a
 \`\`\`
 
-**In pipeline:**
+**Continue analysis:**
 \`\`\`
-@astra /find MT103 /logic
-@astra /requirements OFAC /logic
+@astra /logic /source h,w add edge cases
 \`\`\`
 
-**Customize output:** Edit \`prompts/logic.md\`
+## Pipelines
+
+\`\`\`
+@astra /find MT103 /logic            <- Search then extract
+@astra /logic payment /gencode       <- Extract then generate
+@astra /logic OFAC /jira             <- Create ticket from logic
+\`\`\`
+
+## Customize
+
+Edit \`prompts/logic.md\` to change extraction format.
 `);
         return;
     }
     
-    // Gather content from all sources
-    let allContent = '';
-    let sourcesUsed = [];
+    // Gather sources
+    const sourcesUsed = [];
+    let workspaceContent = '';
+    let workspaceFiles = [];
+    let attachmentContent = '';
+    let attachmentNames = [];
+    let historyContent = '';
     
-    // 1. Piped content
+    // Piped content takes priority
     if (hasPipedContent) {
-        allContent += `## Piped Content\n\n${pipedContent}\n\n`;
-        sourcesUsed.push('🔗 Piped');
+        sourcesUsed.push(`🔗 Piped${previousOutput ? ` from /${previousOutput.command}` : ''}`);
     }
     
-    // 2. Attachments
-    if (hasAttachments) {
-        allContent += `## Attached Files\n\n${attachedContent}\n\n`;
-        sourcesUsed.push(`📎 Attachments (${attachedNames.length})`);
-    }
-    
-    // 3. Workspace search (if enabled and query provided)
-    let files = [];
-    
-    if (sources.workspace !== false && query.trim()) {
-        response.progress('Searching workspace for code...');
-        const result = await getWorkspaceContext(query, {
-            maxFiles: 25,
-            maxLinesPerFile: 500,
-            maxTotalLines: 8000
-        });
-        
-        if (result.context && result.files.length > 0) {
-            allContent += `## Workspace Code\n\n${result.context}\n\n`;
-            files = result.files;
-            sourcesUsed.push(`🔍 Workspace (${files.length} files)`);
+    // History
+    if (sources.h) {
+        historyContent = extractHistoryContent(chatContext, 1);
+        if (historyContent.length > 50) {
+            sourcesUsed.push('📜 History');
         }
     }
     
-    // Check if we have any content
-    if (allContent.length < 100) {
-        response.markdown(`⚠️ **No code found for:** "${query}"
+    // Workspace search
+    if (sources.w && cleanQuery.trim()) {
+        response.progress('Searching workspace...');
+        const result = await getWorkspaceContext(cleanQuery, {
+            maxFiles: 25,
+            maxLinesPerFile: 500
+        });
+        workspaceContent = result.context || '';
+        workspaceFiles = result.files || [];
+        if (workspaceFiles.length > 0) {
+            sourcesUsed.push(`🔍 Workspace (${workspaceFiles.length} files)`);
+        }
+    }
+    
+    // Attachments
+    if (sources.a) {
+        const { content, names } = await readAttachments(request?.references, outputChannel);
+        attachmentContent = content;
+        attachmentNames = names;
+        if (names.length > 0) {
+            sourcesUsed.push(`📎 Attachments (${names.length})`);
+        }
+    }
+    
+    // Check we have something
+    const hasContent = hasPipedContent || historyContent || workspaceContent || attachmentContent;
+    if (!hasContent) {
+        response.markdown(`⚠️ **No content found.**
 
-Try:
-- More specific search terms
-- Attach files directly
-- Pipe from \`/find\`: \`@astra /find ${query} /logic\`
+Provide a query to search workspace, attach files, or pipe from another command.
 `);
         return;
     }
     
-    // Show sources being used
-    response.markdown(`## 🔍 Extracting Business Logic${query ? `: ${query}` : ''}
+    // Show sources
+    response.markdown(`## 🔍 Extracting Business Logic
 
-**📥 Sources:** ${sourcesUsed.join(', ')}
+**Query:** ${cleanQuery || '(from piped content)'}
+**Sources:** ${sourcesUsed.join(', ')}
 
 `);
     
-    // Show files if workspace was used
-    if (files.length > 0) {
-        let filesUsed = `<details><summary>📂 Files analyzed (${files.length})</summary>\n\n`;
-        for (const f of files.slice(0, 25)) {
-            filesUsed += `- \`${f.path}\`\n`;
+    // Show file details
+    if (workspaceFiles.length > 0) {
+        let details = `<details><summary>📂 Workspace files (${workspaceFiles.length})</summary>\n\n`;
+        for (const f of workspaceFiles.slice(0, 20)) {
+            details += `- \`${f.path}\`\n`;
         }
-        if (files.length > 25) {
-            filesUsed += `- *...and ${files.length - 25} more*\n`;
-        }
-        filesUsed += `\n</details>\n\n---\n\n`;
-        response.markdown(filesUsed);
+        details += `\n</details>\n\n`;
+        response.markdown(details);
     }
     
-    // Load prompt and call LLM
+    // Load customizable prompt
     const basePrompt = loadPrompt();
     
-    const systemPrompt = `You are an expert code analyst specializing in extracting business logic from source code.
+    const systemPrompt = `You are an expert code analyst extracting business logic from source code.
 
 ${basePrompt}
 
-CRITICAL INSTRUCTIONS:
-1. Extract EVERY piece of logic - be exhaustive
-2. Include ALL conditional branches (if/else/switch)
-3. Document ALL external system interactions
-4. Capture ALL error/response code handling
-5. Reference specific file:line numbers where possible
-6. Do not skip edge cases or error handling paths`;
+CRITICAL:
+- Extract EVERY piece of logic - be exhaustive
+- Include file:line references where possible
+- Organize by category (validations, conditions, calculations, etc.)
+- Note any external dependencies or integrations`;
 
-    const userPrompt = `Extract ALL business logic from the following code.
+    // Build user prompt
+    let userPrompt = `Extract ALL business logic for: ${cleanQuery || 'the provided code'}
 
-Focus on: ${query || 'all functionality'}
+`;
 
-## Source Code
+    if (hasPipedContent) {
+        userPrompt += `## Source Content (piped)
+${pipedContent.slice(0, 50000)}
 
-${allContent}
+`;
+    }
+    
+    if (historyContent) {
+        userPrompt += `## Previous Context
+${historyContent.slice(0, 30000)}
 
----
+`;
+    }
 
-Analyze the code thoroughly and extract every piece of business logic following the output format.
-Include file and line references where applicable.`;
+    if (workspaceContent) {
+        userPrompt += `## Source Code from Workspace
+${workspaceContent}
+
+`;
+    }
+
+    if (attachmentContent) {
+        userPrompt += `## Attached Code Files
+${attachmentContent}
+
+`;
+    }
+
+    userPrompt += `Extract ALL business logic following the format in the system prompt. Be comprehensive.`;
 
     const generatedContent = await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
     
-    // Set for piping to next command
+    // Set for piping
     ctx.pipedContent = generatedContent;
     
     // Suggest next steps
-    response.markdown(`
-
----
+    if (!ctx.isPiped) {
+        response.markdown(`\n\n---
 **Next steps:**
-- \`@astra /jira\` → Create Jira ticket from logic
-- \`@astra /fediso\` → Map to ISO 20022
-- \`@astra /gencode\` → Generate modern code
-`);
+- \`@astra /gencode\` → Generate equivalent code
+- \`@astra /jira\` → Create Jira ticket
+- \`@astra /fediso\` → Map to ISO 20022`);
+    }
 }
 
 module.exports = { handle };
