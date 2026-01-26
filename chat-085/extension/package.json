@@ -1,0 +1,155 @@
+{
+  "name": "astracode",
+  "displayName": "AstraCode",
+  "description": "AI-powered legacy modernization, ISO 20022 migration, and Java code generation",
+  "version": "0.8.5",
+  "publisher": "astracode",
+  "icon": "assets/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onUri"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "astracode.chat",
+        "name": "astra",
+        "description": "Legacy modernization and code generation",
+        "isSticky": true,
+        "commands": [
+          { "name": "requirements", "description": "Extract business requirements" },
+          { "name": "fediso", "description": "Map to ISO 20022 standards" },
+          { "name": "gencode", "description": "Generate Java code" },
+          { "name": "augment", "description": "Enhance code iteratively" },
+          { "name": "deepwiki", "description": "Generate wiki documentation" },
+          { "name": "logic", "description": "Extract business logic from code" },
+          { "name": "conf.r", "description": "Read Confluence page(s)" },
+          { "name": "conf.w", "description": "Write to Confluence" },
+          { "name": "describe", "description": "Describe code functionality" },
+          { "name": "find", "description": "Search for code" },
+          { "name": "translate", "description": "Translate legacy code" },
+          { "name": "stats", "description": "Show workspace statistics" },
+          { "name": "clear", "description": "Clear context help" },
+          { "name": "history", "description": "Use previous responses as context" },
+          { "name": "sources", "description": "Configure input sources (Quick Pick)" },
+          { "name": "jira", "description": "Format content as Jira issue" },
+          { "name": "help", "description": "Show help" }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "astracode.confluence.signIn",
+        "title": "Confluence: Sign In",
+        "category": "AstraCode"
+      },
+      {
+        "command": "astracode.confluence.signOut",
+        "title": "Confluence: Sign Out",
+        "category": "AstraCode"
+      },
+      {
+        "command": "astracode.configureSources",
+        "title": "Configure Input Sources",
+        "category": "AstraCode",
+        "icon": "$(settings-gear)"
+      }
+    ],
+    "configuration": {
+      "title": "AstraCode",
+      "properties": {
+        "astracode.preferredModel": {
+          "type": "string",
+          "default": "gpt-4o",
+          "description": "Preferred Copilot model for analysis"
+        },
+        "astracode.confluence.clientId": {
+          "type": "string",
+          "default": "",
+          "description": "OAuth 2.0 Client ID from Atlassian Developer Console (for enterprise SSO)"
+        },
+        "astracode.confluence.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Confluence base URL (for API token auth, e.g., https://company.atlassian.net/wiki)"
+        },
+        "astracode.confluence.spaceKey": {
+          "type": "string",
+          "default": "",
+          "description": "Confluence space key for publishing"
+        },
+        "astracode.confluence.username": {
+          "type": "string",
+          "default": "",
+          "description": "Confluence username/email (for API token auth)"
+        },
+        "astracode.confluence.apiToken": {
+          "type": "string",
+          "default": "",
+          "description": "Confluence API token (for simple auth, get from id.atlassian.com)"
+        },
+        "astracode.confluence.parentPageId": {
+          "type": "string",
+          "default": "",
+          "description": "Parent page ID for new pages (optional)"
+        },
+        "astracode.codegen.framework": {
+          "type": "string",
+          "enum": ["springboot", "quarkus", "micronaut", "jakarta"],
+          "default": "springboot",
+          "enumDescriptions": [
+            "Spring Boot 3.x - Most popular enterprise framework",
+            "Quarkus - Kubernetes-native, fast startup",
+            "Micronaut - Low memory footprint, compile-time DI",
+            "Jakarta EE 10 - Standard enterprise Java"
+          ],
+          "description": "Java framework for code generation"
+        },
+        "astracode.codegen.messaging": {
+          "type": "string",
+          "enum": ["kafka", "rabbitmq", "activemq", "jms", "sqs", "none"],
+          "default": "kafka",
+          "description": "Messaging platform for async communication"
+        },
+        "astracode.codegen.architecture": {
+          "type": "string",
+          "enum": ["microservice", "lambda", "monolith", "hexagonal"],
+          "default": "microservice",
+          "description": "Application architecture pattern"
+        },
+        "astracode.codegen.deployment": {
+          "type": "string",
+          "enum": ["ocp", "kubernetes", "aws-lambda", "aws-ecs", "vm", "docker"],
+          "default": "kubernetes",
+          "description": "Target deployment platform"
+        },
+        "astracode.codegen.persistence": {
+          "type": "string",
+          "enum": ["jpa", "jdbc", "r2dbc", "mongodb", "dynamodb"],
+          "default": "jpa",
+          "description": "Database persistence approach"
+        },
+        "astracode.codegen.javaVersion": {
+          "type": "string",
+          "enum": ["17", "21", "11"],
+          "default": "17",
+          "description": "Target Java version"
+        },
+        "astracode.codegen.includeTests": {
+          "type": "boolean",
+          "default": true,
+          "description": "Generate JUnit 5 test stubs"
+        },
+        "astracode.codegen.includeDocker": {
+          "type": "boolean",
+          "default": true,
+          "description": "Generate Dockerfile and docker-compose.yml"
+        }
+      }
+    }
+  }
+}
