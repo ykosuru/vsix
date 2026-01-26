@@ -456,7 +456,7 @@ ${availableSpecs.length > 0 ? availableSpecs.map(s => `- \`${s.name}\` (${s.ext}
 
 Load domain schemas from \`prompts/specs/\`:
 
-**Available:** ${availableSpecs.length > 0 ? availableSpecs.map(s => \`\\\`${s.name}\\\` (${s.ext})\`).join(', ') : '(none - add .xsd/.xml/.json/.md files)'}
+**Available:** ${availableSpecs.length > 0 ? availableSpecs.map(s => `\`${s.name}\` (${s.ext})`).join(', ') : '(none - add .xsd/.xml/.json/.md files)'}
 
 **Supported formats:** XSD, XML, JSON, Markdown
 
