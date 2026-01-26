@@ -1,16 +1,15 @@
 /**
  * General query handler - searches workspace and includes context
- * Supports follow-up questions using chat history
+ * Respects /sources configuration
  */
 
 const { streamResponse } = require('../llm/copilot');
 const { getWorkspaceContext } = require('../llm/workspace-search');
+const { getSelectedSources } = require('./sources');
 
-const systemPrompt = `You are an expert code analyst. Analyze the provided source code to answer the user's question.
+const systemPrompt = `You are an expert code analyst. Analyze the provided source code and attachments to answer the user's question.
 Reference specific files, functions, and line numbers from the code shown.
-Be thorough but concise. Base your answer ONLY on the code provided below.
-
-If there's previous conversation context, use it to understand follow-up questions.`;
+Be thorough but concise. Base your answer ONLY on the content provided below.`;
 
 /**
  * Extract previous conversation from chat history
@@ -57,24 +56,11 @@ function getPreviousConversation(chatContext, maxTurns = 3) {
     return conversation;
 }
 
-/**
- * Detect if this is a follow-up question
- */
-function isFollowUp(query) {
-    const followUpPatterns = [
-        /^(what|how|why|can you|could you|please|also|and|but)\s/i,
-        /^(explain|tell me|show me|give me)\s(more|that|this|it)/i,
-        /\b(that|this|it|those|these|the same|above|previous)\b/i,
-        /^(yes|no|ok|sure|thanks|thank you)/i,
-        /\?$/,  // Questions
-        /^(more|again|another|different)/i
-    ];
-    
-    return followUpPatterns.some(p => p.test(query.trim()));
-}
-
 async function handle(ctx) {
-    const { query, response, outputChannel, token, chatContext } = ctx;
+    const { query, response, outputChannel, token, chatContext, sourceConfig, request } = ctx;
+    
+    // Get source configuration - from piped /sources or default settings
+    const sources = sourceConfig || getSelectedSources();
     
     if (!query.trim()) {
         response.markdown(`**Ask me about your code!**
@@ -97,29 +83,71 @@ async function handle(ctx) {
         return;
     }
     
-    // Check for previous conversation
-    const previousConversation = getPreviousConversation(chatContext);
-    const hasHistory = previousConversation.length > 100;
-    const seemsLikeFollowUp = isFollowUp(query);
+    // Only use history if enabled in sources
+    let previousConversation = '';
+    let hasHistory = false;
     
-    // Search workspace for relevant files
-    response.progress('Searching workspace...');
-    const { context, files, totalLines } = await getWorkspaceContext(query);
+    if (sources.history) {
+        previousConversation = getPreviousConversation(chatContext, sources.historyCount || 3);
+        hasHistory = previousConversation.length > 100;
+    }
     
-    // If no files found but we have history, still try to answer
-    if ((!context || files.length === 0) && !hasHistory) {
-        response.markdown(`⚠️ **No matching files found for:** "${query}"
+    // Check for attachments
+    let attachedContent = '';
+    if (sources.attachments && request?.references?.length > 0) {
+        for (const ref of request.references) {
+            try {
+                if (ref.id && typeof ref.id === 'string') {
+                    const vscode = require('vscode');
+                    const uri = vscode.Uri.parse(ref.id);
+                    const data = await vscode.workspace.fs.readFile(uri);
+                    const content = Buffer.from(data).toString('utf8');
+                    const fileName = uri.path.split('/').pop();
+                    attachedContent += `\n### Attached: ${fileName}\n\`\`\`\n${content.slice(0, 30000)}\n\`\`\`\n`;
+                }
+            } catch (e) {
+                outputChannel?.appendLine(`[AstraCode] Error reading attachment: ${e.message}`);
+            }
+        }
+    }
+    const hasAttachments = attachedContent.length > 100;
+    
+    // Search workspace for relevant files (if enabled)
+    let context = '';
+    let files = [];
+    let totalLines = 0;
+    
+    if (sources.workspace) {
+        response.progress('Searching workspace...');
+        const result = await getWorkspaceContext(query);
+        context = result.context;
+        files = result.files;
+        totalLines = result.totalLines;
+    }
+    
+    // Check if we have any content
+    if (!context && !hasHistory && !hasAttachments) {
+        response.markdown(`⚠️ **No content found for:** "${query}"
 
 **Try:**
-- More specific terms (e.g., function names, file names)
-- \`@astra /find <term>\` to search for specific code`);
+- Attach files to your message
+- Enable workspace search in \`/sources\`
+- Use \`@astra /find <term>\` to search for specific code`);
         return;
     }
     
-    // Show context being used
+    // Show sources being used
+    const sourcesUsed = [];
+    if (files.length > 0) sourcesUsed.push(`🔍 Workspace (${files.length} files)`);
+    if (hasAttachments) sourcesUsed.push('📎 Attachments');
+    if (hasHistory) sourcesUsed.push('📜 History');
+    
+    if (sourcesUsed.length > 0) {
+        response.markdown(`**📥 Sources:** ${sourcesUsed.join(', ')}\n\n`);
+    }
+    
     if (files && files.length > 0) {
-        let filesUsed = `📄 **Found ${files.length} files** (${totalLines.toLocaleString()} lines)\n\n`;
-        filesUsed += `<details><summary>📂 Files analyzed</summary>\n\n`;
+        let filesUsed = `<details><summary>📂 Files analyzed (${files.length})</summary>\n\n`;
         for (const f of files.slice(0, 25)) {
             filesUsed += `- \`${f.path}\`\n`;
         }
@@ -128,36 +156,24 @@ async function handle(ctx) {
         }
         filesUsed += `\n</details>\n\n`;
         response.markdown(filesUsed);
-    } else if (hasHistory) {
-        response.markdown(`💬 *Using previous conversation context...*\n\n`);
     }
     
-    // Build prompt with conversation history
-    let userPrompt = '';
+    // Build prompt
+    let userPrompt = `## Question\n${query}\n\n`;
     
-    if (hasHistory && seemsLikeFollowUp) {
-        userPrompt = `## Previous Conversation
-${previousConversation}
-
-## Follow-up Question
-${query}
-
-`;
-    } else {
-        userPrompt = `## Question
-${query}
-
-`;
+    if (hasHistory) {
+        userPrompt += `## Previous Conversation\n${previousConversation}\n\n`;
+    }
+    
+    if (hasAttachments) {
+        userPrompt += `## Attached Files\n${attachedContent}\n\n`;
     }
     
     if (context) {
-        userPrompt += `## Source Code Context
-${context}
-
-`;
+        userPrompt += `## Source Code Context\n${context}\n\n`;
     }
     
-    userPrompt += `Based on ${context ? 'the code above' : 'the previous conversation'}, please answer the question.${context ? ' Reference specific files and line numbers.' : ''}`;
+    userPrompt += `Answer the question based on the provided content. Reference specific files and line numbers where applicable.`;
 
     await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
 }
