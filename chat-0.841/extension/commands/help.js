@@ -7,40 +7,47 @@ function handle(ctx) {
     
     response.markdown(`# 🔍 AstraCode Help
 
-## 🚀 Full Modernization Pipeline
+## 🚀 Iterative Code Generation Workflow
 
 \`\`\`
-@astra /requirements OFAC screening /fediso /gencode
+@astra /gencode /source llm pacs.008 credit transfer service
+@astra /augment add input validation
+@astra /augment /source h,w learn exception handling from MT103
+@astra /augment add logging and metrics
+@astra /jira epic
 \`\`\`
 
-**From Confluence:**
-\`\`\`
-@astra /conf.r Design Spec /requirements /fediso /gencode
-\`\`\`
+## 📥 Source Modifier
 
-Then publish back:
-\`\`\`
-@astra /conf.w Generated OFAC Service
-\`\`\`
+Use \`/source\` to control where commands get input:
+
+| Source | Meaning |
+|--------|---------|
+| \`llm\` | Pure LLM (no context) |
+| \`h\` | History (previous response) - **default** |
+| \`w\` | Workspace search |
+| \`a\` | Attachments |
+
+**Combine sources:** \`/source h,w\` or \`/source h,w,a\`
 
 ## Commands
 
 | Command | Description | Example |
 |---------|-------------|---------|
+| \`/gencode\` | Generate Java code | \`@astra /gencode /source llm pacs.008\` |
+| \`/augment\` | Enhance code iteratively | \`@astra /augment add retry logic\` |
 | \`/requirements\` | Extract business requirements | \`@astra /requirements OFAC\` |
-| \`/logic\` | Extract business logic from code | \`@astra /logic MT103\` |
+| \`/logic\` | Extract business logic | \`@astra /logic MT103\` |
 | \`/fediso\` | Map to ISO 20022 | \`@astra /fediso wire transfer\` |
-| \`/gencode\` | Generate Java code | \`@astra /gencode payment service\` |
 | \`/deepwiki\` | Generate documentation | \`@astra /deepwiki query optimizer\` |
-| \`/jira\` | Format as Jira issue | \`@astra /requirements OFAC /jira\` |
+| \`/jira\` | Format as Jira issue | \`@astra /jira epic\` |
 | \`/conf.r\` | Read Confluence page(s) | \`@astra /conf.r Page1, Page2\` |
 | \`/conf.w\` | Write to Confluence | \`@astra /conf.w Page Title\` |
 | \`/describe\` | Explain how code works | \`@astra /describe function_name\` |
 | \`/find\` | Search for code | \`@astra /find partprune\` |
 | \`/translate\` | Translate legacy code | \`@astra /translate PROC_NAME\` |
-| \`/history N\` | Use last N responses as context | \`@astra /history 3 clarify the API\` |
-| \`/sources\` | Configure input sources (Quick Pick) | \`@astra /sources /requirements\` |
-| \`/stats\` | Workspace statistics | \`@astra /stats\` |
+| \`/history N\` | Use last N responses | \`@astra /history 3 clarify\` |
+| \`/sources\` | Configure input sources | \`@astra /sources\` |
 | \`/clear\` | Clear context help | \`@astra /clear\` |
 
 ## ⚙️ Code Generation Settings
@@ -57,15 +64,7 @@ Configure in **VS Code Settings** (Cmd+,) → search "astracode":
 
 ## 📚 Confluence Integration
 
-**Authentication Options:**
-
-**Option 1: OAuth (Enterprise SSO)**
-1. Register app at https://developer.atlassian.com/console/myapps/
-2. Add OAuth 2.0, callback: \`vscode://astracode.astracode/auth/callback\`
-3. Set \`astracode.confluence.clientId\`
-4. Run **Confluence: Sign In** from command palette (Cmd+Shift+P)
-
-**Option 2: API Token (Simple)**
+**Option 1: API Token (Simple)**
 \`\`\`json
 {
   "astracode.confluence.baseUrl": "https://company.atlassian.net/wiki",
@@ -75,23 +74,18 @@ Configure in **VS Code Settings** (Cmd+,) → search "astracode":
 }
 \`\`\`
 
-**Read pages:**
-\`\`\`
-@astra /conf.r Architecture Overview
-@astra /conf.r Page One, Page Two, Page Three
-@astra /conf.r 123456789
-@astra /conf.r https://company.atlassian.net/wiki/spaces/DEV/pages/123456789
-\`\`\`
+**Option 2: OAuth (Enterprise)**
+1. Register at https://developer.atlassian.com/console/myapps/
+2. Set \`astracode.confluence.clientId\`
+3. Run **Confluence: Sign In** (Cmd+Shift+P)
 
-**Write pages:**
-\`\`\`
-@astra /deepwiki partition pruning
-@astra /conf.w Partition Pruning Docs
-\`\`\`
+## 🔄 Pipeline Examples
 
-## 🧹 Clear Attachments
-
-Press **Cmd+L** (Mac) / **Ctrl+L** (Windows) to start a new chat.
+\`\`\`
+@astra /requirements OFAC /fediso /gencode
+@astra /conf.r Design Spec /requirements /jira
+@astra /logic MT103 /gencode /augment add validation
+\`\`\`
 `);
     
     // Add configure sources button
