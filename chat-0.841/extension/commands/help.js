@@ -28,18 +28,19 @@ Then publish back:
 | Command | Description | Example |
 |---------|-------------|---------|
 | \`/requirements\` | Extract business requirements | \`@astra /requirements OFAC\` |
+| \`/logic\` | Extract business logic from code | \`@astra /logic MT103\` |
 | \`/fediso\` | Map to ISO 20022 | \`@astra /fediso wire transfer\` |
 | \`/gencode\` | Generate Java code | \`@astra /gencode payment service\` |
 | \`/deepwiki\` | Generate documentation | \`@astra /deepwiki query optimizer\` |
+| \`/jira\` | Format as Jira issue | \`@astra /requirements OFAC /jira\` |
 | \`/conf.r\` | Read Confluence page(s) | \`@astra /conf.r Page1, Page2\` |
 | \`/conf.w\` | Write to Confluence | \`@astra /conf.w Page Title\` |
 | \`/describe\` | Explain how code works | \`@astra /describe function_name\` |
 | \`/find\` | Search for code | \`@astra /find partprune\` |
 | \`/translate\` | Translate legacy code | \`@astra /translate PROC_NAME\` |
-| \`/stats\` | Workspace statistics | \`@astra /stats\` |
 | \`/history N\` | Use last N responses as context | \`@astra /history 3 clarify the API\` |
 | \`/sources\` | Configure input sources (Quick Pick) | \`@astra /sources /requirements\` |
-| \`/jira\` | Format as Jira issue | \`@astra /requirements OFAC /jira\` |
+| \`/stats\` | Workspace statistics | \`@astra /stats\` |
 | \`/clear\` | Clear context help | \`@astra /clear\` |
 
 ## ⚙️ Code Generation Settings
