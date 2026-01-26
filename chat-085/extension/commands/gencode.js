@@ -376,9 +376,15 @@ ${availableSpecs.length > 0 ? availableSpecs.map(s => `- \`${s.name}\` (${s.ext}
         }
     }
     
+    // Check if we have history
+    const hasHistory = historyContent.length > 100;
+    
+    // AUTO-WORKSPACE FALLBACK: If no history and no explicit /source llm, search workspace
+    const shouldSearchWorkspace = sources.w || (!sources.llm && !usePipedContent && !hasHistory && cleanQuery.trim());
+    
     // Workspace
-    if (sources.w && cleanQuery.trim()) {
-        response.progress('Searching workspace...');
+    if (shouldSearchWorkspace && cleanQuery.trim()) {
+        response.progress('Searching workspace for patterns...');
         const searchResult = await getWorkspaceContext(cleanQuery, {
             maxFiles: 15,
             maxLinesPerFile: 300
@@ -407,7 +413,6 @@ ${availableSpecs.length > 0 ? availableSpecs.map(s => `- \`${s.name}\` (${s.ext}
     }
     
     // Determine what content we have
-    const hasHistory = historyContent.length > 100;
     const hasWorkspace = workspaceContent.length > 100;
     const hasAttachments = attachmentContent.length > 100;
     const hasAnyContext = usePipedContent || hasHistory || hasWorkspace || hasAttachments;
@@ -419,35 +424,37 @@ ${availableSpecs.length > 0 ? availableSpecs.map(s => `- \`${s.name}\` (${s.ext}
 
 **Usage:** \`@astra /gencode [/source <s>] [/spec <n>] <description>\`
 
-## Source Options (default: \`h\`)
+## Source Behavior
 
-| Source | When to Use |
-|--------|-------------|
-| \`llm\` | Fresh generation from scratch |
-| \`h\` | Build on previous requirements/logic **(default)** |
-| \`w\` | Include patterns from workspace |
-| \`a\` | Use attached files as reference |
-| \`h,w\` | Previous output + workspace patterns |
+| Scenario | Sources Used |
+|----------|--------------|
+| Has history | Uses history (default) |
+| No history | **Auto-searches workspace** |
+| Piped content | Uses piped content |
+| \`/source llm\` | Pure LLM (no context) |
+
+## Source Options
+
+| Source | Meaning |
+|--------|---------|
+| \`llm\` | Fresh generation (no context) |
+| \`h\` | Use previous response |
+| \`w\` | Search workspace |
+| \`a\` | Use attachments |
 
 ## Examples
+
+**Direct generation (auto-searches workspace):**
+\`\`\`
+@astra /gencode create pacs.008 implementation
+\`\`\`
 
 **Fresh generation with spec:**
 \`\`\`
 @astra /gencode /source llm /spec pacs008 credit transfer service
 \`\`\`
 
-**Build on previous requirements:**
-\`\`\`
-@astra /requirements OFAC screening
-@astra /gencode                          <- uses requirements above
-\`\`\`
-
-**Learn from workspace:**
-\`\`\`
-@astra /gencode /source h,w pacs.008 based on MT103 patterns
-\`\`\`
-
-**Pipeline:**
+**Pipeline (uses piped requirements):**
 \`\`\`
 @astra /requirements OFAC /fediso /gencode
 \`\`\`
@@ -458,8 +465,6 @@ Load domain schemas from \`prompts/specs/\`:
 
 **Available:** ${availableSpecs.length > 0 ? availableSpecs.map(s => `\`${s.name}\` (${s.ext})`).join(', ') : '(none - add .xsd/.xml/.json/.md files)'}
 
-**Supported formats:** XSD, XML, JSON, Markdown
-
 ## Current Settings
 
 | Setting | Value |
@@ -469,11 +474,6 @@ Load domain schemas from \`prompts/specs/\`:
 | Persistence | \`${settings.persistence}\` |
 
 *Change in VS Code Settings -> search "astracode"*
-
-## Customize
-
-- **Generation rules:** Edit \`prompts/gencode.md\`
-- **Domain specs:** Add files to \`prompts/specs/\`
 `);
         response.button({
             command: 'astracode.configureSources',
@@ -498,7 +498,11 @@ Load domain schemas from \`prompts/specs/\`:
     if (sources.llm) sourcesUsed.push('🤖 LLM only');
     if (usePipedContent) sourcesUsed.push(`🔗 Piped${previousOutput ? ` from /${previousOutput.command}` : ''}`);
     if (hasHistory && !usePipedContent) sourcesUsed.push('📜 History');
-    if (hasWorkspace) sourcesUsed.push(`🔍 Workspace (${workspaceFiles.length} files)`);
+    if (hasWorkspace) {
+        // Show if auto-fallback was used
+        const isAutoFallback = !sources.w && !hasHistory && !usePipedContent;
+        sourcesUsed.push(`🔍 Workspace${isAutoFallback ? ' (auto)' : ''} (${workspaceFiles.length} files)`);
+    }
     if (hasAttachments) sourcesUsed.push(`📎 Attachments (${attachmentNames.length})`);
     
     // Show loaded spec
@@ -555,9 +559,16 @@ ${historyContent.slice(0, 50000)}
         
         if (hasWorkspace) {
             userPrompt += `## Reference Code from Workspace
+
+**IMPORTANT: Follow these existing patterns from the workspace:**
 ${workspaceContent.slice(0, 30000)}
 
-Use the above as reference for patterns and business logic.
+**Requirements:**
+1. Follow the SAME naming conventions used in the workspace
+2. Use the SAME package structure and organization
+3. Integrate with existing services (if any Service interfaces are shown)
+4. Follow the SAME coding style and patterns
+5. Extend existing models/contexts if appropriate
 
 `;
         }
