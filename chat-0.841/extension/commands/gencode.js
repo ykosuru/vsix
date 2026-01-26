@@ -23,36 +23,187 @@
 
 const vscode = require('vscode');
 const path = require('path');
+const fs = require('fs');
 const { streamResponse } = require('../llm/copilot');
 const { getWorkspaceContext } = require('../llm/workspace-search');
 
 /**
- * Parse /source modifier from query
+ * Load base gencode prompt from file
  */
-function parseSourceModifier(query) {
-    const sourceMatch = query.match(/^\/source\s+([a-z,]+)\s*/i);
+function loadBasePrompt() {
+    try {
+        const promptPath = path.join(__dirname, '..', 'prompts', 'gencode.md');
+        return fs.readFileSync(promptPath, 'utf8');
+    } catch (e) {
+        return `Generate complete, production-ready code. No stubs or placeholders.`;
+    }
+}
+
+/**
+ * Load spec file from prompts/specs/ folder
+ * Supports: .md, .xsd, .xml
+ */
+function loadSpec(specName) {
+    // Normalize spec name (remove dots, lowercase)
+    const normalized = specName.toLowerCase().replace(/\./g, '');
     
+    // Try various file patterns and extensions
+    const extensions = ['.md', '.xsd', '.xml', '.json'];
+    const basenames = [normalized, specName, specName.toLowerCase()];
+    
+    for (const base of basenames) {
+        for (const ext of extensions) {
+            try {
+                const specPath = path.join(__dirname, '..', 'prompts', 'specs', base + ext);
+                if (fs.existsSync(specPath)) {
+                    const content = fs.readFileSync(specPath, 'utf8');
+                    const fileType = ext.slice(1); // 'md', 'xsd', 'xml'
+                    return {
+                        name: specName,
+                        content,
+                        type: fileType
+                    };
+                }
+            } catch (e) {
+                // Continue to next candidate
+            }
+        }
+    }
+    
+    return null;
+}
+
+/**
+ * Format spec content based on file type
+ */
+function formatSpecContent(spec) {
+    if (!spec) return '';
+    
+    if (spec.type === 'xsd') {
+        return `## XML Schema (XSD): ${spec.name}
+
+**XSD-to-Java Mapping Rules:**
+| XSD Type | Java Type |
+|----------|-----------|
+| xs:string | String |
+| xs:decimal | BigDecimal |
+| xs:integer | BigInteger |
+| xs:int | int |
+| xs:long | long |
+| xs:boolean | boolean |
+| xs:date | LocalDate |
+| xs:dateTime | LocalDateTime |
+| xs:time | LocalTime |
+
+**Requirements:**
+1. Generate a Java class for EVERY complexType
+2. Generate an enum for EVERY simpleType with enumeration
+3. Add @XmlRootElement, @XmlElement, @XmlType annotations
+4. Add validation: @NotNull for required, @Size for length restrictions, @Pattern for patterns
+5. Implement ALL nested elements as inner classes or references
+6. Use List<T> for maxOccurs="unbounded"
+7. Use Optional<T> or null for minOccurs="0"
+
+\`\`\`xml
+${spec.content}
+\`\`\`
+
+Generate COMPLETE Java classes for every type - no stubs.`;
+    }
+    
+    if (spec.type === 'xml') {
+        return `## XML Sample: ${spec.name}
+
+**Instructions:** Generate Java classes matching this XML structure exactly.
+- Create a class for each element with children
+- Include ALL attributes and child elements
+- Add JAXB annotations for serialization
+- Infer types from values (numbers, dates, strings)
+
+\`\`\`xml
+${spec.content}
+\`\`\`
+
+Generate COMPLETE Java classes - no stubs.`;
+    }
+    
+    if (spec.type === 'json') {
+        return `## JSON Schema/Sample: ${spec.name}
+
+**Instructions:** Generate Java classes matching this JSON structure.
+- Create a class for each object
+- Include ALL fields
+- Add Jackson annotations (@JsonProperty, etc.)
+- Infer appropriate Java types
+
+\`\`\`json
+${spec.content}
+\`\`\`
+
+Generate COMPLETE Java classes - no stubs.`;
+    }
+    
+    // Markdown - return as-is with header
+    return `## Specification: ${spec.name}
+
+${spec.content}`;
+}
+
+/**
+ * List available specs with their types
+ */
+function listAvailableSpecs() {
+    try {
+        const specsDir = path.join(__dirname, '..', 'prompts', 'specs');
+        if (fs.existsSync(specsDir)) {
+            return fs.readdirSync(specsDir)
+                .filter(f => /\.(md|xsd|xml|json)$/.test(f))
+                .map(f => {
+                    const ext = path.extname(f).slice(1);
+                    const name = f.replace(/\.(md|xsd|xml|json)$/, '');
+                    return { name, ext };
+                });
+        }
+    } catch (e) {
+        // Ignore
+    }
+    return [];
+}
+
+/**
+ * Parse /source and /spec modifiers from query
+ */
+function parseModifiers(query) {
+    let cleanQuery = query;
+    let sources = { llm: false, h: true, w: false, a: false };
+    let specName = null;
+    
+    // Parse /source
+    const sourceMatch = cleanQuery.match(/^\/source\s+([a-z,]+)\s*/i);
     if (sourceMatch) {
         const sourceStr = sourceMatch[1].toLowerCase();
-        const cleanQuery = query.slice(sourceMatch[0].length).trim();
+        cleanQuery = cleanQuery.slice(sourceMatch[0].length).trim();
         
         if (sourceStr === 'llm') {
-            return { sources: { llm: true, h: false, w: false, a: false }, cleanQuery };
-        }
-        
-        return {
-            sources: {
+            sources = { llm: true, h: false, w: false, a: false };
+        } else {
+            sources = {
                 llm: false,
                 h: sourceStr.includes('h'),
                 w: sourceStr.includes('w'),
                 a: sourceStr.includes('a')
-            },
-            cleanQuery
-        };
+            };
+        }
     }
     
-    // Default: history only
-    return { sources: { llm: false, h: true, w: false, a: false }, cleanQuery: query };
+    // Parse /spec
+    const specMatch = cleanQuery.match(/^\/spec\s+(\S+)\s*/i);
+    if (specMatch) {
+        specName = specMatch[1];
+        cleanQuery = cleanQuery.slice(specMatch[0].length).trim();
+    }
+    
+    return { sources, specName, cleanQuery };
 }
 
 /**
@@ -172,8 +323,25 @@ async function handle(ctx) {
     
     const settings = getCodeGenSettings();
     
-    // Parse /source modifier
-    const { sources, cleanQuery } = parseSourceModifier(query);
+    // Parse /source and /spec modifiers
+    const { sources, specName, cleanQuery } = parseModifiers(query);
+    
+    // Load spec if requested
+    let loadedSpec = null;
+    if (specName) {
+        loadedSpec = loadSpec(specName);
+        if (!loadedSpec) {
+            const availableSpecs = listAvailableSpecs();
+            response.markdown(`⚠️ **Spec not found:** \`${specName}\`
+
+**Available specs in \`prompts/specs/\`:**
+${availableSpecs.length > 0 ? availableSpecs.map(s => `- \`${s.name}\` (${s.ext})`).join('\n') : '- (none)'}
+
+**To add a spec:** Create \`prompts/specs/${specName}.md\` (or .xsd, .xml, .json)
+`);
+            return;
+        }
+    }
     
     // Check for piped content (from pipeline like /requirements /gencode)
     const pipedContent = ctxPipedContent || '';
@@ -246,40 +414,66 @@ async function handle(ctx) {
     
     // Show help if no input
     if (!cleanQuery.trim() && !hasAnyContext && !sources.llm) {
-        response.markdown(`**Usage:** \`@astra /gencode [/source <sources>] <description>\`
+        const availableSpecs = listAvailableSpecs();
+        response.markdown(`# /gencode - Generate Java Code
 
-**Sources:**
-| Source | Meaning |
-|--------|---------|
-| \`llm\` | Pure LLM generation (no context) |
-| \`h\` | History (previous response) - **default** |
-| \`w\` | Workspace search |
-| \`a\` | Attachments |
+**Usage:** \`@astra /gencode [/source <s>] [/spec <n>] <description>\`
 
-**Examples:**
+## Source Options (default: \`h\`)
+
+| Source | When to Use |
+|--------|-------------|
+| \`llm\` | Fresh generation from scratch |
+| \`h\` | Build on previous requirements/logic **(default)** |
+| \`w\` | Include patterns from workspace |
+| \`a\` | Use attached files as reference |
+| \`h,w\` | Previous output + workspace patterns |
+
+## Examples
+
+**Fresh generation with spec:**
 \`\`\`
-@astra /gencode /source llm pacs.008 credit transfer service
-@astra /gencode pacs.008 service                     ← uses previous response
-@astra /gencode /source h,w pacs.008 with MT103 patterns
-@astra /requirements OFAC /gencode                    ← piped
+@astra /gencode /source llm /spec pacs008 credit transfer service
 \`\`\`
 
-**Current Settings:** (change in VS Code Settings → AstraCode)
+**Build on previous requirements:**
+\`\`\`
+@astra /requirements OFAC screening
+@astra /gencode                          <- uses requirements above
+\`\`\`
+
+**Learn from workspace:**
+\`\`\`
+@astra /gencode /source h,w pacs.008 based on MT103 patterns
+\`\`\`
+
+**Pipeline:**
+\`\`\`
+@astra /requirements OFAC /fediso /gencode
+\`\`\`
+
+## Specs (/spec)
+
+Load domain schemas from \`prompts/specs/\`:
+
+**Available:** ${availableSpecs.length > 0 ? availableSpecs.map(s => \`\\\`${s.name}\\\` (${s.ext})\`).join(', ') : '(none - add .xsd/.xml/.json/.md files)'}
+
+**Supported formats:** XSD, XML, JSON, Markdown
+
+## Current Settings
 
 | Setting | Value |
 |---------|-------|
 | Framework | \`${settings.framework}\` |
-| Messaging | \`${settings.messaging}\` |
 | Architecture | \`${settings.architecture}\` |
-| Deployment | \`${settings.deployment}\` |
 | Persistence | \`${settings.persistence}\` |
 
-**Workflow:**
-\`\`\`
-@astra /gencode /source llm pacs.008 service     ← Fresh generation
-@astra /augment add exception handling            ← Enhance iteratively
-@astra /augment /source h,w learn from MT103      ← Add workspace patterns
-\`\`\`
+*Change in VS Code Settings -> search "astracode"*
+
+## Customize
+
+- **Generation rules:** Edit \`prompts/gencode.md\`
+- **Domain specs:** Add files to \`prompts/specs/\`
 `);
         response.button({
             command: 'astracode.configureSources',
@@ -307,6 +501,11 @@ async function handle(ctx) {
     if (hasWorkspace) sourcesUsed.push(`🔍 Workspace (${workspaceFiles.length} files)`);
     if (hasAttachments) sourcesUsed.push(`📎 Attachments (${attachmentNames.length})`);
     
+    // Show loaded spec
+    if (loadedSpec) {
+        sourcesUsed.push(`📋 Spec: ${loadedSpec.name} (${loadedSpec.type})`);
+    }
+    
     response.markdown(`**📥 Sources:** ${sourcesUsed.join(', ') || 'None'}\n\n`);
     
     // Show file details
@@ -324,11 +523,18 @@ async function handle(ctx) {
     // Build prompt
     let userPrompt = '';
     
+    // Add loaded spec if provided (formatted based on type)
+    if (loadedSpec) {
+        userPrompt += formatSpecContent(loadedSpec);
+        userPrompt += `\n---\n\n`;
+    }
+    
     if (sources.llm) {
-        // Pure LLM - just the instruction
-        userPrompt = `Generate Java code for: ${cleanQuery}
+        // Pure LLM - just the instruction (with spec if provided)
+        userPrompt += `## Request
+Generate Java code for: ${cleanQuery}
 
-Generate complete, production-ready code with no external context.
+${loadedSpec ? 'Implement ALL fields and nested classes from the specification above. Include validation, builders, and proper Java types.' : 'Generate complete, production-ready code.'}
 `;
     } else {
         userPrompt = `Generate Java code for: ${cleanQuery || 'the following requirements'}
@@ -366,24 +572,42 @@ ${attachmentContent}
     
     userPrompt += `Generate complete, production-ready Java code following the configured stack.
 
-Include:
+${loadedSpec ? `**CRITICAL - Specification Implementation Requirements:**
+- Implement ALL classes, fields, and nested types from the specification
+- Use proper Java types: BigDecimal for money/amounts, LocalDate/LocalDateTime for dates
+- Add JSR-380 validation annotations (@NotNull, @Size, @Pattern, @Valid)
+- Add JAXB annotations for XML serialization if needed (@XmlRootElement, @XmlElement, @XmlType)
+- Use Lombok annotations (@Data, @Builder, @NoArgsConstructor, @AllArgsConstructor)
+- Implement ALL enums with proper values
+- Add utility methods for domain-specific validation
+- Include proper equals/hashCode based on business keys
+
+` : ''}Include:
 1. **Package structure** - recommended organization
-2. **Domain/Entity classes** - with proper annotations
-3. **Service layer** - business logic implementation
+2. **Domain/Entity classes** - with ALL fields and proper annotations
+3. **Service layer** - COMPLETE business logic implementation (no stubs)
 4. **Controller/API layer** - REST endpoints or message handlers
 5. **Repository/DAO layer** - data access
 6. **Configuration** - application.yml, security config, etc.
 7. **Build dependencies** - pom.xml or build.gradle snippets
-${settings.includeTests ? '8. **Test stubs** - JUnit 5 test classes' : ''}
+${settings.includeTests ? '8. **Test classes** - JUnit 5 tests with real assertions' : ''}
 ${settings.includeDocker ? '9. **Docker files** - Dockerfile, docker-compose.yml' : ''}
 
-Ensure the code handles:
-- Input validation
-- Error handling with proper exceptions
-- Logging (SLF4J)
-- Transaction management where needed`;
+**CRITICAL - No stubs or placeholders:**
+- Every method must have REAL implementation
+- No TODO comments
+- No empty method bodies
+- No placeholder return values`;
 
-    const systemPrompt = buildSystemPrompt(settings);
+    // Load base prompt and combine with stack-specific prompt
+    const basePrompt = loadBasePrompt();
+    const stackPrompt = buildSystemPrompt(settings);
+    const systemPrompt = `${basePrompt}
+
+---
+
+${stackPrompt}`;
+
     const generatedContent = await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
     
     // Set for piping/augmenting
@@ -395,7 +619,7 @@ Ensure the code handles:
 ---
 **Next steps:**
 - \`@astra /augment add exception handling\`
-- \`@astra /augment /source h,w learn patterns from MT103\`
+- \`@astra /augment /source h,w learn patterns from workspace\`
 - \`@astra /jira\` → Create ticket
 `);
 }
