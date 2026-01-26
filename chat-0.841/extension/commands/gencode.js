@@ -1,6 +1,18 @@
 /**
  * /gencode command - Generate Java code from requirements
  * 
+ * Usage:
+ * @astra /gencode /source llm pacs.008 service     - Pure LLM generation
+ * @astra /gencode /source h pacs.008               - From history (default)
+ * @astra /gencode /source h,w pacs.008             - History + workspace
+ * @astra /requirements OFAC /gencode               - Piped (uses pipe content)
+ * 
+ * Sources:
+ *   llm - Pure LLM (no context, exclusive)
+ *   h   - History (previous response) - DEFAULT
+ *   w   - Workspace search
+ *   a   - Attachments
+ * 
  * Uses VS Code settings for configuration:
  * - astracode.codegen.framework: springboot, quarkus, micronaut
  * - astracode.codegen.messaging: kafka, rabbitmq, activemq, jms
@@ -13,6 +25,35 @@ const vscode = require('vscode');
 const path = require('path');
 const { streamResponse } = require('../llm/copilot');
 const { getWorkspaceContext } = require('../llm/workspace-search');
+
+/**
+ * Parse /source modifier from query
+ */
+function parseSourceModifier(query) {
+    const sourceMatch = query.match(/^\/source\s+([a-z,]+)\s*/i);
+    
+    if (sourceMatch) {
+        const sourceStr = sourceMatch[1].toLowerCase();
+        const cleanQuery = query.slice(sourceMatch[0].length).trim();
+        
+        if (sourceStr === 'llm') {
+            return { sources: { llm: true, h: false, w: false, a: false }, cleanQuery };
+        }
+        
+        return {
+            sources: {
+                llm: false,
+                h: sourceStr.includes('h'),
+                w: sourceStr.includes('w'),
+                a: sourceStr.includes('a')
+            },
+            cleanQuery
+        };
+    }
+    
+    // Default: history only
+    return { sources: { llm: false, h: true, w: false, a: false }, cleanQuery: query };
+}
 
 /**
  * Get code generation settings from VS Code configuration
@@ -131,50 +172,97 @@ async function handle(ctx) {
     
     const settings = getCodeGenSettings();
     
-    // Check for directly piped content from previous command
+    // Parse /source modifier
+    const { sources, cleanQuery } = parseSourceModifier(query);
+    
+    // Check for piped content (from pipeline like /requirements /gencode)
     const pipedContent = ctxPipedContent || '';
     const hasPipedContent = pipedContent.length > 100;
     
-    // Extract previous response from chat history (fallback)
-    let previousResponse = '';
-    if (!hasPipedContent && chatContext && chatContext.history && chatContext.history.length > 0) {
-        // Look for the most recent assistant response
-        for (let i = chatContext.history.length - 1; i >= 0; i--) {
-            const turn = chatContext.history[i];
-            // Check if it's an assistant response (ChatResponseTurn)
-            if (turn.response && turn.response.length > 0) {
-                // Extract text from response parts
-                for (const part of turn.response) {
-                    if (part.value && typeof part.value === 'string') {
-                        previousResponse += part.value + '\n';
-                    } else if (part.value && part.value.value) {
-                        previousResponse += part.value.value + '\n';
+    // If piped, always use piped content regardless of /source
+    const usePipedContent = hasPipedContent;
+    
+    // Gather content based on sources
+    let historyContent = '';
+    let workspaceContent = '';
+    let attachmentContent = '';
+    let workspaceFiles = [];
+    let attachmentNames = [];
+    
+    // History (default unless llm or piped)
+    if ((sources.h || (!sources.llm && !usePipedContent)) && !usePipedContent) {
+        if (chatContext?.history?.length > 0) {
+            for (let i = chatContext.history.length - 1; i >= 0; i--) {
+                const turn = chatContext.history[i];
+                if (turn.response?.length > 0) {
+                    for (const part of turn.response) {
+                        if (part.value && typeof part.value === 'string') {
+                            historyContent += part.value + '\n';
+                        } else if (part.value?.value) {
+                            historyContent += part.value.value + '\n';
+                        }
                     }
+                    if (historyContent.length > 100) break;
                 }
-                if (previousResponse.length > 100) break; // Found substantial content
             }
         }
     }
     
-    // Combine piped content and chat history
-    const inputContent = hasPipedContent ? pipedContent : previousResponse;
-    const hasPreviousContext = hasPipedContent || previousResponse.length > 200;
-    
-    // Debug logging
-    if (outputChannel) {
-        outputChannel.appendLine(`[AstraCode] /gencode: isPiped=${isPiped}, hasPipedContent=${hasPipedContent}, pipedContent.length=${pipedContent.length}, hasPreviousContext=${hasPreviousContext}`);
+    // Workspace
+    if (sources.w && cleanQuery.trim()) {
+        response.progress('Searching workspace...');
+        const searchResult = await getWorkspaceContext(cleanQuery, {
+            maxFiles: 15,
+            maxLinesPerFile: 300
+        });
+        workspaceContent = searchResult.context || '';
+        workspaceFiles = searchResult.files || [];
     }
     
-    // Show help if no input available
-    if (!query.trim() && !hasPreviousContext) {
-        response.markdown(`**Usage:** \`@astra /gencode <requirements or feature>\`
+    // Attachments
+    if (sources.a && request?.references?.length > 0) {
+        response.progress('Reading attachments...');
+        for (const ref of request.references) {
+            try {
+                if (ref.id && typeof ref.id === 'string') {
+                    const uri = vscode.Uri.parse(ref.id);
+                    const data = await vscode.workspace.fs.readFile(uri);
+                    const content = Buffer.from(data).toString('utf8');
+                    const fileName = path.basename(uri.fsPath);
+                    attachmentContent += `\n### ${fileName}\n${content.slice(0, 30000)}\n`;
+                    attachmentNames.push(fileName);
+                }
+            } catch (e) {
+                outputChannel?.appendLine(`[AstraCode] Error reading attachment: ${e.message}`);
+            }
+        }
+    }
+    
+    // Determine what content we have
+    const hasHistory = historyContent.length > 100;
+    const hasWorkspace = workspaceContent.length > 100;
+    const hasAttachments = attachmentContent.length > 100;
+    const hasAnyContext = usePipedContent || hasHistory || hasWorkspace || hasAttachments;
+    
+    // Show help if no input
+    if (!cleanQuery.trim() && !hasAnyContext && !sources.llm) {
+        response.markdown(`**Usage:** \`@astra /gencode [/source <sources>] <description>\`
 
-Generates Java code from requirements.
+**Sources:**
+| Source | Meaning |
+|--------|---------|
+| \`llm\` | Pure LLM generation (no context) |
+| \`h\` | History (previous response) - **default** |
+| \`w\` | Workspace search |
+| \`a\` | Attachments |
 
 **Examples:**
-- \`@astra /gencode\` ← uses previous response as input
-- \`@astra /requirements OFAC screening /gencode\` ← piped
-- \`@astra /gencode payment validation service\`
+\`\`\`
+@astra /gencode /source llm pacs.008 credit transfer service
+@astra /gencode pacs.008 service                     ← uses previous response
+@astra /gencode /source h,w pacs.008 with MT103 patterns
+@astra /requirements OFAC /gencode                    ← piped
+\`\`\`
 
 **Current Settings:** (change in VS Code Settings → AstraCode)
 
@@ -185,17 +273,14 @@ Generates Java code from requirements.
 | Architecture | \`${settings.architecture}\` |
 | Deployment | \`${settings.deployment}\` |
 | Persistence | \`${settings.persistence}\` |
-| Java Version | \`${settings.javaVersion}\` |
 
 **Workflow:**
-1. Run \`@astra /requirements OFAC screening\`
-2. Then run \`@astra /gencode\` ← uses output from step 1
-
-**Or chain:** \`@astra /requirements OFAC /fediso /gencode\`
-
-${isPiped ? `\n⚠️ **Piped but no content received.** The previous command may not have produced output.` : ''}`);
-        
-        // Add configure sources button
+\`\`\`
+@astra /gencode /source llm pacs.008 service     ← Fresh generation
+@astra /augment add exception handling            ← Enhance iteratively
+@astra /augment /source h,w learn from MT103      ← Add workspace patterns
+\`\`\`
+`);
         response.button({
             command: 'astracode.configureSources',
             title: '⚙️ Configure Input Sources'
@@ -203,116 +288,35 @@ ${isPiped ? `\n⚠️ **Piped but no content received.** The previous command ma
         return;
     }
     
-    // Show current settings
-    response.markdown(`## ⚙️ Code Generation Settings
+    // Show settings and sources
+    response.markdown(`## ⚙️ Code Generation
 
 | Setting | Value |
 |---------|-------|
 | Framework | **${settings.framework}** |
-| Messaging | **${settings.messaging}** |
 | Architecture | **${settings.architecture}** |
-| Deployment | **${settings.deployment}** |
 | Persistence | **${settings.persistence}** |
 
 `);
     
-    // Note the source of input
-    if (hasPreviousContext && !query.trim()) {
-        response.markdown(`📋 *Using previous response as input...*\n\n`);
-    } else if (isPiped && previousOutput) {
-        response.markdown(`🔗 *Generating code from \`/${previousOutput.command}\` output...*\n\n`);
-    }
+    // Build sources summary
+    const sourcesUsed = [];
+    if (sources.llm) sourcesUsed.push('🤖 LLM only');
+    if (usePipedContent) sourcesUsed.push(`🔗 Piped${previousOutput ? ` from /${previousOutput.command}` : ''}`);
+    if (hasHistory && !usePipedContent) sourcesUsed.push('📜 History');
+    if (hasWorkspace) sourcesUsed.push(`🔍 Workspace (${workspaceFiles.length} files)`);
+    if (hasAttachments) sourcesUsed.push(`📎 Attachments (${attachmentNames.length})`);
     
-    // Check for attached documents
-    let attachedDocs = '';
-    let attachedDocNames = [];
+    response.markdown(`**📥 Sources:** ${sourcesUsed.join(', ') || 'None'}\n\n`);
     
-    if (request && request.references && request.references.length > 0) {
-        response.progress('Reading attached specifications...');
-        
-        for (const ref of request.references) {
-            try {
-                let content = '';
-                let fileName = '';
-                
-                if (ref.id && typeof ref.id === 'string') {
-                    const uri = vscode.Uri.parse(ref.id);
-                    const fileContent = await vscode.workspace.fs.readFile(uri);
-                    content = Buffer.from(fileContent).toString('utf8');
-                    fileName = path.basename(uri.fsPath);
-                } else if (ref.value && typeof ref.value === 'string') {
-                    content = ref.value;
-                    fileName = 'attached-spec';
-                }
-                
-                if (content) {
-                    attachedDocNames.push(fileName);
-                    const maxChars = 30000;
-                    if (content.length > maxChars) {
-                        content = content.slice(0, maxChars) + '\n... [truncated]';
-                    }
-                    attachedDocs += `\n### ${fileName}\n${content}\n`;
-                }
-            } catch (e) {
-                outputChannel?.appendLine(`[AstraCode] Error reading attachment: ${e.message}`);
-            }
+    // Show file details
+    if (workspaceFiles.length > 0) {
+        let details = `<details><summary>📂 Workspace files (${workspaceFiles.length})</summary>\n\n`;
+        for (const f of workspaceFiles.slice(0, 15)) {
+            details += `- \`${f.path}\`\n`;
         }
-    }
-    
-    // Search workspace for context only if we have a query
-    let context = '';
-    let files = [];
-    
-    if (query.trim()) {
-        response.progress('Analyzing requirements...');
-        const searchResult = await getWorkspaceContext(query, {
-            maxFiles: 10,
-            maxLinesPerFile: 200
-        });
-        context = searchResult.context;
-        files = searchResult.files;
-    }
-    
-    // Show all input sources
-    const fileCount = files?.length || 0;
-    const pipedFrom = hasPipedContent && previousOutput ? previousOutput.command : null;
-    
-    let sourcesUsed = '**📥 Input Sources:**\n\n';
-    let hasAnySources = false;
-    
-    if (hasPreviousContext) {
-        sourcesUsed += `- 🔗 **Piped content** ${pipedFrom ? `from \`/${pipedFrom}\`` : '(from previous response)'}\n`;
-        hasAnySources = true;
-    }
-    
-    if (fileCount > 0) {
-        sourcesUsed += `- 🔍 **Reference code** (${fileCount} files)\n`;
-        hasAnySources = true;
-    }
-    
-    if (attachedDocNames.length > 0) {
-        sourcesUsed += `- 📎 **Attached docs** (${attachedDocNames.length})\n`;
-        hasAnySources = true;
-    }
-    
-    if (hasAnySources) {
-        sourcesUsed += '\n';
-        
-        if (files && files.length > 0) {
-            sourcesUsed += `<details><summary>📂 Reference code (${files.length} files)</summary>\n\n`;
-            for (const f of files.slice(0, 15)) {
-                sourcesUsed += `- \`${f.path}\`\n`;
-            }
-            sourcesUsed += `\n</details>\n\n`;
-        }
-        if (attachedDocNames.length > 0) {
-            sourcesUsed += `<details><summary>📎 Attached docs (${attachedDocNames.length})</summary>\n\n`;
-            for (const name of attachedDocNames) {
-                sourcesUsed += `- \`${name}\`\n`;
-            }
-            sourcesUsed += `\n</details>\n\n`;
-        }
-        response.markdown(sourcesUsed);
+        details += `\n</details>\n\n`;
+        response.markdown(details);
     }
     
     response.markdown(`## 📝 Generated Code\n\n`);
@@ -320,34 +324,46 @@ ${isPiped ? `\n⚠️ **Piped but no content received.** The previous command ma
     // Build prompt
     let userPrompt = '';
     
-    // If using piped content or previous response as input
-    if (hasPreviousContext && !query.trim()) {
-        userPrompt = `Generate Java code based on these requirements:
+    if (sources.llm) {
+        // Pure LLM - just the instruction
+        userPrompt = `Generate Java code for: ${cleanQuery}
 
-## Input Content
-${inputContent.slice(0, 50000)}
-
+Generate complete, production-ready code with no external context.
 `;
     } else {
-        userPrompt = `Generate Java code for: ${query}
+        userPrompt = `Generate Java code for: ${cleanQuery || 'the following requirements'}
 
 `;
-    }
-
-    if (context) {
-        userPrompt += `## Legacy/Reference Code (for understanding business logic)
-${context}
-
-`;
-    }
-
-    if (attachedDocs) {
-        userPrompt += `## Additional Specifications
-${attachedDocs}
+        
+        if (usePipedContent) {
+            userPrompt += `## Requirements/Input (from pipeline)
+${pipedContent.slice(0, 50000)}
 
 `;
-    }
+        } else if (hasHistory) {
+            userPrompt += `## Requirements/Input (from previous response)
+${historyContent.slice(0, 50000)}
 
+`;
+        }
+        
+        if (hasWorkspace) {
+            userPrompt += `## Reference Code from Workspace
+${workspaceContent.slice(0, 30000)}
+
+Use the above as reference for patterns and business logic.
+
+`;
+        }
+        
+        if (hasAttachments) {
+            userPrompt += `## Reference from Attachments
+${attachmentContent}
+
+`;
+        }
+    }
+    
     userPrompt += `Generate complete, production-ready Java code following the configured stack.
 
 Include:
@@ -368,7 +384,20 @@ Ensure the code handles:
 - Transaction management where needed`;
 
     const systemPrompt = buildSystemPrompt(settings);
-    await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
+    const generatedContent = await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
+    
+    // Set for piping/augmenting
+    ctx.pipedContent = generatedContent;
+    
+    // Suggest next steps
+    response.markdown(`
+
+---
+**Next steps:**
+- \`@astra /augment add exception handling\`
+- \`@astra /augment /source h,w learn patterns from MT103\`
+- \`@astra /jira\` → Create ticket
+`);
 }
 
 module.exports = { handle };
