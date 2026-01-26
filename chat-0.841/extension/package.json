@@ -2,7 +2,7 @@
   "name": "astracode",
   "displayName": "AstraCode",
   "description": "AI-powered legacy modernization, ISO 20022 migration, and Java code generation",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "publisher": "astracode",
   "icon": "assets/icon.png",
   "engines": {
@@ -33,6 +33,7 @@
           { "name": "describe", "description": "Describe code functionality" },
           { "name": "find", "description": "Search for code" },
           { "name": "translate", "description": "Translate legacy code" },
+          { "name": "stats", "description": "Show workspace/attachment statistics" },
           { "name": "history", "description": "Use previous responses as context" },
           { "name": "sources", "description": "Configure input sources (Quick Pick)" },
           { "name": "clear", "description": "Clear context help" },
