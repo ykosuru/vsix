@@ -8,7 +8,8 @@ const path = require('path');
 
 const CODE_EXTENSIONS = new Set([
     '.c', '.h', '.cpp', '.hpp', '.java', '.py', '.js', '.ts', '.go', '.rs',
-    '.rb', '.php', '.swift', '.kt', '.scala', '.sql', '.sh', '.tal', '.cbl'
+    '.rb', '.php', '.swift', '.kt', '.scala', '.sql', '.sh', '.tal', '.cbl',
+    '.md', '.txt', '.json', '.yaml', '.yml', '.xml', '.html'  // Documentation files
 ]);
 
 const SKIP_DIRS = new Set([
