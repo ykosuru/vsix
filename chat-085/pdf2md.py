@@ -139,6 +139,7 @@ def convert_pdf_to_markdown(
     
     # Open PDF
     doc = fitz.open(pdf_path)
+    page_count = len(doc)
     
     markdown_content = []
     all_images = []
@@ -150,7 +151,7 @@ def convert_pdf_to_markdown(
     markdown_content.append("---\n")
     
     # Process each page
-    for page_num in range(len(doc)):
+    for page_num in range(page_count):
         page = doc[page_num]
         
         # Extract text
@@ -161,7 +162,7 @@ def convert_pdf_to_markdown(
             text = detect_headings(text)
         
         # Add page marker for long documents
-        if len(doc) > 5:
+        if page_count > 5:
             markdown_content.append(f"\n<!-- Page {page_num + 1} -->\n")
         
         markdown_content.append(text)
@@ -203,7 +204,7 @@ def convert_pdf_to_markdown(
         "output_path": str(output_path),
         "images_dir": str(images_dir) if all_images else None,
         "image_count": len(all_images),
-        "page_count": len(doc)
+        "page_count": page_count
     }
 
 
