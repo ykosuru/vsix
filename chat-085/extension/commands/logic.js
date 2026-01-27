@@ -189,11 +189,13 @@ Provide a query to search workspace, attach files, or pipe from another command.
 
 ${basePrompt}
 
-CRITICAL:
-- Extract EVERY piece of logic - be exhaustive
-- Include file:line references where possible
-- Organize by category (validations, conditions, calculations, etc.)
-- Note any external dependencies or integrations`;
+CRITICAL OUTPUT RULES:
+1. ONLY include sections that have actual content found in the code
+2. SKIP sections entirely if nothing was found - do NOT output empty sections
+3. Never write "None found", "N/A", or "No [X] detected" - just omit the section
+4. If a table would have zero rows, don't include the table or its header
+5. Include file:line references where possible
+6. Focus on meaningful, actionable logic`;
 
     // Build user prompt
     let userPrompt = `Extract ALL business logic for: ${cleanQuery || 'the provided code'}
@@ -228,7 +230,9 @@ ${attachmentContent}
 `;
     }
 
-    userPrompt += `Extract ALL business logic following the format in the system prompt. Be comprehensive.`;
+    userPrompt += `Extract ALL business logic following the format in the system prompt.
+
+REMEMBER: Only include sections with actual findings. Skip empty sections entirely.`;
 
     const generatedContent = await streamResponse(systemPrompt, userPrompt, response, outputChannel, token);
     
