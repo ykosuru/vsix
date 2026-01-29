@@ -1,0 +1,462 @@
+/**
+ * Workspace search - finds relevant files and loads content for prompts
+ */
+
+const vscode = require('vscode');
+const fs = require('fs');
+const path = require('path');
+
+const CODE_EXTENSIONS = new Set([
+    '.c', '.h', '.cpp', '.hpp', '.java', '.py', '.js', '.ts', '.go', '.rs',
+    '.rb', '.php', '.swift', '.kt', '.scala', '.sql', '.sh', '.tal', '.cbl',
+    '.md', '.txt', '.json', '.yaml', '.yml', '.xml', '.html'  // Documentation files
+]);
+
+const SKIP_DIRS = new Set([
+    'node_modules', '.git', 'dist', 'build', 'target', 'out', '.idea', 
+    '.vscode', '__pycache__', '.next', 'vendor', 'coverage', 'bin', 'obj'
+]);
+
+// Important pattern files for Java projects
+const PATTERN_FILES = [
+    'Service.java', 'ServiceImpl.java', 'Handler.java', 'Controller.java',
+    'Processor.java', 'Validator.java', 'Mapper.java', 'Repository.java',
+    'Entity.java', 'Model.java', 'Exception.java'
+];
+
+/**
+ * Check if folder should be included based on filter
+ * @param {string} folderName - Name of the folder
+ * @param {object} folderFilter - { include: [], exclude: [] }
+ * @returns {boolean} - true if folder should be included
+ */
+function shouldIncludeFolder(folderName, folderFilter) {
+    if (!folderFilter) return true;
+    
+    const nameLower = folderName.toLowerCase();
+    
+    // Check exclude first
+    if (folderFilter.exclude?.length) {
+        for (const excl of folderFilter.exclude) {
+            if (nameLower.includes(excl)) return false;
+        }
+    }
+    
+    // If include list is empty, include all (that passed exclude)
+    if (!folderFilter.include?.length) return true;
+    
+    // Check include
+    for (const incl of folderFilter.include) {
+        if (nameLower.includes(incl)) return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Format folder filter for logging
+ */
+function formatFolderFilter(folderFilter) {
+    if (!folderFilter) return '';
+    const parts = [];
+    if (folderFilter.include?.length) parts.push(`in: ${folderFilter.include.join(',')}`);
+    if (folderFilter.exclude?.length) parts.push(`excl: ${folderFilter.exclude.join(',')}`);
+    return parts.length ? ` [${parts.join(', ')}]` : '';
+}
+
+/**
+ * Search workspace and return context string for prompt
+ */
+async function getWorkspaceContext(query, options = {}) {
+    const maxFiles = options.maxFiles || 15;
+    const maxLinesPerFile = options.maxLinesPerFile || 400;
+    const maxTotalLines = options.maxTotalLines || 3000;
+    const folderFilter = options.folderFilter || null;  // { include: [], exclude: [] }
+    
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) {
+        return { context: '', files: [] };
+    }
+    
+    // Extract search terms
+    const terms = extractSearchTerms(query);
+    
+    console.log(`[AstraCode] Searching for: ${terms.join(', ')}${formatFolderFilter(folderFilter)}`);
+    
+    // Get directory structure first (important for understanding project)
+    const structure = getProjectStructure(workspaceRoot, 2, folderFilter);
+    
+    // Find matching files
+    const matches = await searchFiles(workspaceRoot, terms, maxFiles * 3, folderFilter);
+    
+    // Also find pattern files (services, models, etc.)
+    const patternFiles = await findPatternFiles(workspaceRoot, terms, folderFilter);
+    
+    // Merge and dedupe
+    const allMatches = [...matches];
+    for (const pf of patternFiles) {
+        if (!allMatches.find(m => m.path === pf.path)) {
+            allMatches.push(pf);
+        }
+    }
+    
+    console.log(`[AstraCode] Found ${allMatches.length} matching files (${patternFiles.length} pattern files)`);
+    
+    // Score and sort files
+    const scoredFiles = scoreFiles(allMatches, terms, folderFilter);
+    const topFiles = scoredFiles.slice(0, maxFiles);
+    
+    // Build context string with structure first
+    let context = '';
+    let totalLines = 0;
+    const includedFiles = [];
+    
+    // Add project structure overview
+    if (structure.length > 0) {
+        context += `## Project Structure${folderFilter ? ` (filtered: ${folderFilter.join(', ')})` : ''}\n\`\`\`\n${structure.join('\n')}\n\`\`\`\n\n`;
+    }
+    
+    context += `## Relevant Source Files\n\n`;
+    
+    for (const file of topFiles) {
+        if (totalLines >= maxTotalLines) break;
+        
+        try {
+            const content = fs.readFileSync(file.path, 'utf8');
+            const lines = content.split('\n');
+            const linesToInclude = Math.min(lines.length, maxLinesPerFile);
+            
+            const relativePath = path.relative(workspaceRoot, file.path);
+            const ext = path.extname(file.path).slice(1) || 'txt';
+            
+            // Number lines for reference
+            const numberedLines = lines.slice(0, linesToInclude)
+                .map((line, i) => `${i + 1}: ${line}`)
+                .join('\n');
+            
+            context += `\n### File: ${relativePath}\n\`\`\`${ext}\n${numberedLines}\n\`\`\`\n`;
+            
+            totalLines += linesToInclude;
+            includedFiles.push({
+                path: relativePath,
+                lines: linesToInclude,
+                score: file.score
+            });
+            
+        } catch (e) {
+            // Skip unreadable files
+        }
+    }
+    
+    console.log(`[AstraCode] Loaded ${includedFiles.length} files, ${totalLines} lines`);
+    
+    return {
+        context,
+        files: includedFiles,
+        totalLines,
+        searchTerms: terms
+    };
+}
+
+/**
+ * Get project directory structure (key folders)
+ */
+function getProjectStructure(rootPath, depth = 2, folderFilter = null) {
+    const result = [];
+    
+    function scan(dirPath, currentDepth, prefix = '') {
+        if (currentDepth > depth) return;
+        
+        let entries;
+        try {
+            entries = fs.readdirSync(dirPath, { withFileTypes: true })
+                .filter(e => !e.name.startsWith('.') && !SKIP_DIRS.has(e.name))
+                .sort((a, b) => {
+                    // Directories first
+                    if (a.isDirectory() && !b.isDirectory()) return -1;
+                    if (!a.isDirectory() && b.isDirectory()) return 1;
+                    return a.name.localeCompare(b.name);
+                });
+        } catch (e) {
+            return;
+        }
+        
+        // At root level, filter to only specified folders if folderFilter is set
+        if (currentDepth === 0 && folderFilter) {
+            entries = entries.filter(e => 
+                e.isDirectory() && shouldIncludeFolder(e.name, folderFilter)
+            );
+        }
+        
+        for (const entry of entries.slice(0, 20)) {
+            const isLast = entries.indexOf(entry) === entries.length - 1;
+            const connector = isLast ? '└── ' : '├── ';
+            const nextPrefix = prefix + (isLast ? '    ' : '│   ');
+            
+            if (entry.isDirectory()) {
+                result.push(`${prefix}${connector}${entry.name}/`);
+                scan(path.join(dirPath, entry.name), currentDepth + 1, nextPrefix);
+            } else {
+                result.push(`${prefix}${connector}${entry.name}`);
+            }
+        }
+    }
+    
+    scan(rootPath, 0);
+    return result.slice(0, 50); // Limit structure output
+}
+
+/**
+ * Find pattern files (services, models, controllers)
+ */
+async function findPatternFiles(rootPath, terms, folderFilter = null) {
+    const results = [];
+    const seenPaths = new Set();
+    
+    function scanForPatterns(dirPath, depth = 0, inFilteredFolder = false) {
+        if (depth > 6 || results.length >= 20) return;
+        
+        let entries;
+        try {
+            entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        } catch (e) {
+            return;
+        }
+        
+        for (const entry of entries) {
+            if (entry.name.startsWith('.')) continue;
+            
+            const fullPath = path.join(dirPath, entry.name);
+            
+            if (entry.isDirectory()) {
+                if (!SKIP_DIRS.has(entry.name)) {
+                    // Check folder filter at root level
+                    let shouldEnter = true;
+                    let nowInFilteredFolder = inFilteredFolder;
+                    
+                    if (folderFilter && depth === 0) {
+                        // At root, use shouldIncludeFolder helper
+                        if (!shouldIncludeFolder(entry.name, folderFilter)) {
+                            shouldEnter = false;
+                        } else {
+                            nowInFilteredFolder = true;
+                        }
+                    }
+                    
+                    if (shouldEnter) {
+                        // Prioritize certain directories
+                        const dirName = entry.name.toLowerCase();
+                        if (['service', 'model', 'domain', 'handler', 'processor', 'api', 'controller'].includes(dirName)) {
+                            scanForPatterns(fullPath, depth, nowInFilteredFolder); // Don't increment depth
+                        } else {
+                            scanForPatterns(fullPath, depth + 1, nowInFilteredFolder);
+                        }
+                    }
+                }
+            } else if (entry.isFile() && !seenPaths.has(fullPath)) {
+                const name = entry.name;
+                
+                // Check if it's a pattern file
+                for (const pattern of PATTERN_FILES) {
+                    if (name.endsWith(pattern)) {
+                        seenPaths.add(fullPath);
+                        results.push({ 
+                            path: fullPath, 
+                            matchedTerm: pattern.replace('.java', ''),
+                            isPattern: true,
+                            inFilteredFolder
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    scanForPatterns(rootPath);
+    return results;
+}
+
+/**
+ * Extract search terms from query
+ */
+function extractSearchTerms(query) {
+    const words = query.toLowerCase()
+        .split(/\s+/)
+        .filter(w => w.length >= 3)
+        .map(w => w.replace(/[^a-z0-9_]/g, ''));
+    
+    // Create compound terms for C-style naming
+    const compounds = [];
+    for (let i = 0; i < words.length - 1; i++) {
+        // "partition pruning" → "partprune", "partition_pruning"
+        compounds.push(words[i].slice(0, 4) + words[i + 1].slice(0, 5));
+        compounds.push(words[i] + '_' + words[i + 1]);
+    }
+    
+    // Add root forms (remove common suffixes)
+    const roots = words.map(w => 
+        w.replace(/(ing|tion|tions|ness|ment|s)$/, '').replace(/e$/, '')
+    ).filter(w => w.length >= 3);
+    
+    return [...new Set([...compounds, ...words, ...roots])];
+}
+
+/**
+ * Search files in workspace
+ */
+async function searchFiles(rootPath, terms, maxResults, folderFilter = null) {
+    const results = [];
+    const seenPaths = new Set();
+    
+    function scanDir(dirPath, depth = 0, inFilteredFolder = false) {
+        if (depth > 8 || results.length >= maxResults) return;
+        
+        let entries;
+        try {
+            entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        } catch (e) {
+            return;
+        }
+        
+        for (const entry of entries) {
+            if (results.length >= maxResults) return;
+            if (entry.name.startsWith('.')) continue;
+            
+            const fullPath = path.join(dirPath, entry.name);
+            
+            if (entry.isDirectory()) {
+                if (!SKIP_DIRS.has(entry.name)) {
+                    // Check folder filter at root level
+                    let shouldEnter = true;
+                    let nowInFilteredFolder = inFilteredFolder;
+                    
+                    if (folderFilter && depth === 0) {
+                        // At root, use shouldIncludeFolder helper
+                        if (!shouldIncludeFolder(entry.name, folderFilter)) {
+                            shouldEnter = false;
+                        } else {
+                            nowInFilteredFolder = true;
+                        }
+                    }
+                    
+                    if (shouldEnter) {
+                        scanDir(fullPath, depth + 1, nowInFilteredFolder);
+                    }
+                }
+            } else if (entry.isFile()) {
+                const ext = path.extname(entry.name).toLowerCase();
+                if (!CODE_EXTENSIONS.has(ext)) continue;
+                
+                // Check if filename matches any term
+                const nameLower = entry.name.toLowerCase();
+                const pathLower = fullPath.toLowerCase();
+                
+                for (const term of terms) {
+                    if (nameLower.includes(term) || pathLower.includes(term)) {
+                        if (!seenPaths.has(fullPath)) {
+                            seenPaths.add(fullPath);
+                            results.push({ path: fullPath, matchedTerm: term, inFilteredFolder });
+                        }
+                        break;
+                    }
+                }
+                
+                // Also check file content for first few terms
+                if (!seenPaths.has(fullPath) && terms.length > 0) {
+                    try {
+                        const stat = fs.statSync(fullPath);
+                        if (stat.size > 500000) continue; // Skip large files
+                        
+                        const content = fs.readFileSync(fullPath, 'utf8');
+                        for (const term of terms.slice(0, 3)) {
+                            if (content.toLowerCase().includes(term)) {
+                                seenPaths.add(fullPath);
+                                results.push({ path: fullPath, matchedTerm: term, inFilteredFolder });
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        // Skip unreadable
+                    }
+                }
+            }
+        }
+    }
+    
+    scanDir(rootPath);
+    return results;
+}
+
+/**
+ * Score files by relevance
+ */
+function scoreFiles(files, terms, folderFilter = null) {
+    return files.map(file => {
+        let score = 10;
+        const pathLower = file.path.toLowerCase();
+        const name = path.basename(file.path).toLowerCase();
+        const ext = path.extname(file.path).toLowerCase();
+        
+        // Boost for filename match
+        for (const term of terms) {
+            if (name.includes(term)) score += 30;
+            if (pathLower.includes(term)) score += 10;
+        }
+        
+        // Boost source files
+        if (pathLower.includes('/src/')) score += 15;
+        if (!pathLower.includes('test')) score += 10;
+        
+        // Boost pattern files (services, models, etc.)
+        if (file.isPattern) score += 25;
+        
+        // Boost key directories
+        if (pathLower.includes('/service/')) score += 20;
+        if (pathLower.includes('/model/')) score += 20;
+        if (pathLower.includes('/domain/')) score += 20;
+        if (pathLower.includes('/handler/')) score += 15;
+        if (pathLower.includes('/api/')) score += 15;
+        
+        // Boost implementations and interfaces
+        if (name.endsWith('impl.java')) score += 15;
+        if (name.endsWith('service.java')) score += 15;
+        
+        // Boost code files over documentation
+        const codeExts = ['.java', '.py', '.js', '.ts', '.go', '.c', '.cpp', '.rs'];
+        const docExts = ['.md', '.txt', '.html'];
+        
+        if (codeExts.includes(ext)) {
+            score += 20;  // Boost code files
+        }
+        if (docExts.includes(ext)) {
+            score -= 15;  // Slightly penalize docs
+        }
+        
+        // Penalize docs folder more heavily
+        if (pathLower.includes('/docs/') || pathLower.includes('/documentation/')) {
+            score -= 30;
+        }
+        if (pathLower.includes('readme')) {
+            score -= 20;
+        }
+        
+        // Boost files in filtered folders when filter is active
+        if (folderFilter && file.inFilteredFolder) {
+            score += 50;  // Strong boost for files matching folder filter
+        }
+        
+        return { ...file, score };
+    }).sort((a, b) => b.score - a.score);
+}
+
+function getWorkspaceRoot() {
+    const folders = vscode.workspace.workspaceFolders;
+    return folders && folders.length > 0 ? folders[0].uri.fsPath : null;
+}
+
+module.exports = {
+    getWorkspaceContext,
+    extractSearchTerms,
+    getWorkspaceRoot
+};
